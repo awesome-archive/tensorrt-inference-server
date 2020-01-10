@@ -32,7 +32,15 @@
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
 
+#ifdef TRTIS_ENABLE_GPU
+#include <cuda_runtime_api.h>
+#endif  // TRTIS_ENABLE_GPU
+
 namespace nvidia { namespace inferenceserver {
+
+#ifndef TRTIS_ENABLE_GPU
+using cudaStream_t = void*;
+#endif  // TRTIS_ENABLE_GPU
 
 class InferenceServer;
 
@@ -45,22 +53,24 @@ struct EnsembleInfo {
 
     std::string model_name_;
     int64_t model_version_;
-    std::unordered_map<std::string, size_t> input_to_tensor_;
-    std::unordered_map<std::string, size_t> output_to_tensor_;
+    std::unordered_map<std::string, std::string> input_to_tensor_;
+    std::unordered_map<std::string, std::string> output_to_tensor_;
   };
 
   std::string ensemble_name_;
 
   bool allow_batching_;
 
-  std::unordered_map<std::string, size_t> ensemble_input_to_tensor_;
-  std::unordered_map<std::string, size_t> ensemble_output_to_tensor_;
+  // the ensemble output (re)shape expected by the ensemble
+  std::unordered_map<std::string, DimsList> ensemble_output_shape_;
 
   std::vector<StepInfo> steps_;
 
   // Only include a step if the ensemble tensor is used as input in that step
-  // Representing ensemble tensor with index (name doesn't matter at this point)
-  std::vector<std::set<size_t>> tensor_to_step_;
+  std::unordered_map<std::string, std::set<size_t>> tensor_to_step_;
+
+  // backward path, ensemble tensor to the step that provides its data
+  std::unordered_map<std::string, size_t> tensor_to_prev_step_;
 };
 
 // Scheduler that implements ensemble scheduling.
@@ -69,29 +79,28 @@ class EnsembleScheduler : public Scheduler {
   // Create a scheduler to process ensemble requests and
   // to dispatch requests to models in ensemble internally.
   static Status Create(
-      const ModelConfig& config, std::unique_ptr<Scheduler>* scheduler);
+      InferenceServer* const server, const ModelConfig& config,
+      std::unique_ptr<Scheduler>* scheduler);
+
+  ~EnsembleScheduler();
 
   // \see Scheduler::Enqueue()
   void Enqueue(
       const std::shared_ptr<ModelInferStats>& stats,
       const std::shared_ptr<InferRequestProvider>& request_provider,
       const std::shared_ptr<InferResponseProvider>& response_provider,
-      std::function<void(Status)> OnComplete) override;
-
-  // Set the inference server that the scheduler is communicating with
-  Status SetInferenceServer(void* inference_server)
-  {
-    is_ = (InferenceServer*)inference_server;
-    return Status::Success;
-  }
+      std::function<void(const Status&)> OnComplete) override;
 
  private:
-  EnsembleScheduler(const ModelConfig& config);
+  EnsembleScheduler(InferenceServer* const server, const ModelConfig& config);
 
-  InferenceServer* is_;
+  InferenceServer* const is_;
 
   // Ensemble information that is built from model config
   std::unique_ptr<EnsembleInfo> info_;
+
+  // The stream used for data transfer.
+  cudaStream_t stream_;
 };
 
 }}  // namespace nvidia::inferenceserver

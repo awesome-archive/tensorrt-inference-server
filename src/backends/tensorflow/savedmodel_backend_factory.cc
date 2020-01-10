@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "src/backends/tensorflow/savedmodel_backend.h"
+#include "src/backends/tensorflow/tf_virtual_device.h"
 #include "src/core/constants.h"
 #include "src/core/filesystem.h"
 #include "src/core/logging.h"
@@ -49,6 +50,10 @@ SavedModelBackendFactory::Create(
   auto savedmodel_backend_config =
       std::static_pointer_cast<GraphDefBackendFactory::Config>(backend_config);
   factory->reset(new SavedModelBackendFactory(savedmodel_backend_config));
+
+  // Initialize VGPUs if required
+  VirtualDeviceTracker::Init(savedmodel_backend_config->memory_limit_mb);
+
   return Status::Success;
 }
 
@@ -70,9 +75,10 @@ SavedModelBackendFactory::CreateBackend(
   }
 
   std::unique_ptr<SavedModelBackend> local_backend(new SavedModelBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
-  RETURN_IF_ERROR(local_backend->CreateExecutionContexts(
-      backend_config_, savedmodel_paths));
+  RETURN_IF_ERROR(local_backend->Init(
+      path, model_config, backend_config_.get(),
+      kTensorFlowSavedModelPlatform));
+  RETURN_IF_ERROR(local_backend->CreateExecutionContexts(savedmodel_paths));
 
   *backend = std::move(local_backend);
   return Status::Success;

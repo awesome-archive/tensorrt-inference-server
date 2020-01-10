@@ -25,8 +25,9 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-#include <core/session/onnxruntime_c_api.h>
+#include <onnxruntime_c_api.h>
 #include "src/core/backend.h"
+#include "src/core/backend_context.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
@@ -37,8 +38,6 @@ class OnnxBackend : public InferenceBackend {
  public:
   OnnxBackend() = default;
   OnnxBackend(OnnxBackend&&) = default;
-
-  Status Init(const std::string& path, const ModelConfig& config);
 
   // Create a context for execution for each instance for the
   // serialized plans specified in 'models'.
@@ -56,26 +55,12 @@ class OnnxBackend : public InferenceBackend {
       OrtSessionOptions* session_options,
       const std::unordered_map<std::string, std::string>& paths);
 
-  // Run model on the context associated with 'runner_idx' to
-  // execute for one or more requests.
-  void Run(
-      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-      std::function<void(Status)> OnCompleteQueuedPayloads);
-
  private:
   DISALLOW_COPY_AND_ASSIGN(OnnxBackend);
   friend std::ostream& operator<<(std::ostream&, const OnnxBackend&);
 
   // For each model instance there is a context.
-  struct Context {
-    // GPU device number that indicates that no gpu is available for a
-    // context (which is an invalid state since TensorRT requires a
-    // GPU).
-    static constexpr int NO_GPU_DEVICE = -1;
-
-    // Max batch size value that indicates batching is not supported.
-    static constexpr int NO_BATCHING = 0;
-
+  struct Context : BackendContext {
     Context(
         const std::string& name, const int gpu_device,
         const int max_batch_size);
@@ -91,18 +76,19 @@ class OnnxBackend : public InferenceBackend {
     Status ValidateOutputs(
         const std::string& model_name,
         const ::google::protobuf::RepeatedPtrField<ModelOutput>& ios);
-    Status ValidateSequenceControl(
+    Status ValidateBooleanSequenceControl(
         const std::string& model_name, const ModelSequenceBatching& batcher,
-        const ModelSequenceBatching::Control::Kind control_kind);
+        const ModelSequenceBatching::Control::Kind control_kind, bool required,
+        bool* have_control);
+    Status ValidateTypedSequenceControl(
+        const std::string& model_name, const ModelSequenceBatching& batcher,
+        const ModelSequenceBatching::Control::Kind control_kind, bool required,
+        bool* have_control);
 
-    // Run model to execute for one or more requests. This function
-    // assumes that it is only called by the single runner thread that
-    // is assigned to this context. A non-OK return status indicates
-    // an internal error that prevents any of the of requests from
-    // completing. If an error is isolate to a single request payload
-    // it will be reported in that payload.
+    // See BackendContext::Run()
     Status Run(
-        const OnnxBackend* base, std::vector<Scheduler::Payload>* payloads);
+        const InferenceBackend* base,
+        std::vector<Scheduler::Payload>* payloads);
 
     // Set an input tensor from one or more payloads.
     Status SetInputTensor(
@@ -110,11 +96,6 @@ class OnnxBackend : public InferenceBackend {
         size_t total_batch_size, std::vector<Scheduler::Payload>* payloads,
         std::vector<std::unique_ptr<char[]>>* input_buffers,
         std::vector<const char*>* input_names);
-
-    // Helper function to batch input data from payloads into one 'input_buffer'
-    void SetInputBuffer(
-        const std::string& name, const std::vector<size_t>& expected_byte_sizes,
-        std::vector<Scheduler::Payload>* payloads, char* input_buffer);
 
     // Helper function to modify 'input_buffer' into format needed for creating
     // Onnx String tensor and to set meta data 'string_data'
@@ -129,35 +110,20 @@ class OnnxBackend : public InferenceBackend {
 
     // Read output tensors into one or more payloads accordingly.
     Status ReadOutputTensors(
-        const OnnxBackend* base, const size_t total_batch_size,
+        const InferenceBackend* base, const size_t total_batch_size,
         const std::vector<const char*>& output_names,
         std::vector<Scheduler::Payload>* payloads);
 
-    // Helper function to set output buffer of fixed size data type to payloads
-    void SetFixedSizeOutputBuffer(
-        const std::string& name, const size_t batch1_byte_size,
-        const char* content, const std::vector<int64_t>& content_shape,
-        std::vector<Scheduler::Payload>* payloads);
-
-    // Helper function to set output buffer of string data type to payloads
-    void SetStringOutputBuffer(
+    // Helper function to set output buffer of string data type to payloads.
+    // Return true if cudaMemcpyAsync is called, and the caller should call
+    // cudaStreamSynchronize before using the data. Otherwise, return false.
+    bool SetStringOutputBuffer(
         const std::string& name, const size_t batch1_element_cnt,
         const char* content, const std::vector<int64_t>& content_shape,
         const size_t* offsets, std::vector<Scheduler::Payload>* payloads);
 
     // Release the Onnx Runtime resources allocated for the run, if any.
     void ReleaseOrtRunResources();
-
-    // Name of the model instance
-    std::string name_;
-
-    // The GPU index active when this context was created.
-    int gpu_device_;
-
-    // Maximum batch size to allow. This is the minimum of what is
-    // supported by the model and what is requested in the
-    // configuration.
-    int max_batch_size_;
 
     // Onnx Runtime variables that are used across runs
     OrtSession* session_;
@@ -167,8 +133,6 @@ class OnnxBackend : public InferenceBackend {
     std::vector<OrtValue*> input_tensors_;
     std::vector<OrtValue*> output_tensors_;
   };
-
-  std::vector<std::unique_ptr<Context>> contexts_;
 };
 
 std::ostream& operator<<(std::ostream& out, const OnnxBackend& pb);

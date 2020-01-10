@@ -104,7 +104,7 @@ extensions = [
 ]
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['templates']
+templates_path = ['_templates']
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
@@ -150,7 +150,7 @@ exhale_args = {
     "exhaleExecutesDoxygen": True,
     "exhaleDoxygenStdin": textwrap.dedent('''
         JAVADOC_AUTOBRIEF = YES
-    INPUT = ../src/core/request.h ../src/clients/c++/request_grpc.h ../src/clients/c++/request_http.h ../src/backends/custom/custom.h
+    INPUT = ../src/core/trtserver.h ../src/clients/c++/library/request.h ../src/clients/c++/library/request_grpc.h ../src/clients/c++/library/request_http.h ../src/backends/custom/custom.h ../src/custom/sdk/custom_instance.h
     ''')
 }
 
@@ -258,3 +258,10 @@ extlinks = {'issue': ('https://github.com/NVIDIA/tensorrt-inference-server/issue
                       'issue '),
             'fileref': ('https://github.com/NVIDIA/tensorrt-inference-server/tree/' +
                         (git_sha if git_sha != u'0000000' else "master") + '/%s', ''),}
+
+def setup(app):
+    # If envvar is set then the file is expected to contain a script
+    # that is added to every documentation page
+    visitor_script = os.getenv("VISITS_COUNTING_SCRIPT")
+    if visitor_script:
+        app.add_js_file(visitor_script)

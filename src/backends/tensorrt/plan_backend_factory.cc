@@ -73,7 +73,8 @@ PlanBackendFactory::CreateBackend(
     std::unique_ptr<InferenceBackend>* backend)
 {
   std::set<std::string> plan_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &plan_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &plan_files));
 
   std::unordered_map<std::string, std::vector<char>> models;
   for (const auto& filename : plan_files) {
@@ -87,7 +88,8 @@ PlanBackendFactory::CreateBackend(
   // Create the backend for the model and all the execution contexts
   // requested for this model.
   std::unique_ptr<PlanBackend> local_backend(new PlanBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
+  RETURN_IF_ERROR(
+      local_backend->Init(path, model_config, kTensorRTPlanPlatform));
   RETURN_IF_ERROR(local_backend->CreateExecutionContexts(models));
 
   *backend = std::move(local_backend);

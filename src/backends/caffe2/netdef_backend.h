@@ -27,6 +27,7 @@
 
 #include "src/backends/caffe2/netdef_backend_c2.h"
 #include "src/core/backend.h"
+#include "src/core/backend_context.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
@@ -38,8 +39,6 @@ class NetDefBackend : public InferenceBackend {
   NetDefBackend() = default;
   NetDefBackend(NetDefBackend&&) = default;
 
-  Status Init(const std::string& path, const ModelConfig& config);
-
   // Create a context for execution for each instance for the
   // serialized netdefs specified in 'models'.
   Status CreateExecutionContexts(
@@ -49,35 +48,25 @@ class NetDefBackend : public InferenceBackend {
       const std::unordered_map<std::string, std::vector<char>>& models);
 
  private:
-  Status ValidateSequenceControl(
+  Status ValidateBooleanSequenceControl(
       const ModelSequenceBatching::Control::Kind control_kind,
-      std::vector<std::string>* input_names);
-
-  // Run model on the context associated with 'runner_idx' to
-  // execute for one or more requests.
-  void Run(
-      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-      std::function<void(Status)> OnCompleteQueuedPayloads);
+      std::vector<std::string>* input_names, bool required);
+  Status ValidateTypedSequenceControl(
+      const ModelSequenceBatching::Control::Kind control_kind,
+      std::vector<std::string>* input_names, bool required);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(NetDefBackend);
   friend std::ostream& operator<<(std::ostream&, const NetDefBackend&);
 
   // For each model instance there is a context.
-  struct Context {
-    // GPU device number that indicates that no gpu is available for a
-    // context
-    static constexpr int NO_GPU_DEVICE = -1;
-
-    // Max batch size value that indicates batching is not supported.
-    static constexpr int NO_BATCHING = 0;
-
+  struct Context : BackendContext {
     Context(
         const std::string& name, const int gpu_device,
         const int max_batch_size);
-    Context(Context&& o);
     ~Context();
 
+    DISALLOW_MOVE(Context);
     DISALLOW_COPY_AND_ASSIGN(Context);
 
     Status ValidateInputs(
@@ -90,45 +79,30 @@ class NetDefBackend : public InferenceBackend {
         const std::string& name, const DataType datatype, const DimsList& dims,
         const size_t total_batch_size,
         std::vector<Scheduler::Payload>* payloads,
-        std::vector<std::unique_ptr<char[]>>* input_buffers);
+        std::vector<std::unique_ptr<char[]>>* input_buffers, bool* cuda_copy);
 
-    // Run model to execute for one or more requests. This function
-    // assumes that it is only called by the single runner thread that
-    // is assigned to this context. A non-OK return status indicates
-    // an internal error that prevents any of the of requests from
-    // completing. If an error is isolate to a single request payload
-    // it will be reported in that payload.
+    // See BackendContext::Run()
     Status Run(
-        const NetDefBackend* base, std::vector<Scheduler::Payload>* payloads);
+        const InferenceBackend* base,
+        std::vector<Scheduler::Payload>* payloads) override;
 
     // Set an input tensor from one or more payloads.
     Status SetFixedSizedInputTensor(
         const std::string& input_name, const std::vector<int64_t>& shape,
         const Caffe2Workspace::DataType dtype, const size_t batch1_byte_size,
         const size_t total_byte_size, std::vector<Scheduler::Payload>* payloads,
-        std::vector<std::unique_ptr<char[]>>* input_buffers);
+        std::vector<std::unique_ptr<char[]>>* input_buffers, bool* cuda_copy);
 
     // Read an output tensor into one or more payloads.
     Status ReadFixedSizedOutputTensor(
         const std::string& name, const Caffe2Workspace::DataType dtype,
         const size_t dtype_byte_size, const size_t total_batch_size,
-        std::vector<Scheduler::Payload>* payloads, const DimsList& dims);
-
-    // Name of the model instance
-    std::string name_;
-
-    // The GPU index active when this context was created.
-    int gpu_device_;
-
-    // Maximum batch size to allow. NO_BATCHING indicates that
-    // batching is not supported.
-    int max_batch_size_;
+        const DimsList& dims, std::vector<Scheduler::Payload>* payloads,
+        bool* cuda_copy);
 
     // Caffe2 workspace.
     std::unique_ptr<Caffe2Workspace> workspace_;
   };
-
-  std::vector<Context> contexts_;
 };
 
 std::ostream& operator<<(std::ostream& out, const NetDefBackend& pb);

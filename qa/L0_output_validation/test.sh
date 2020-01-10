@@ -25,18 +25,34 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+REPO_VERSION=${NVIDIA_TENSORRT_SERVER_VERSION}
+if [ "$#" -ge 1 ]; then
+    REPO_VERSION=$1
+fi
+if [ -z "$REPO_VERSION" ]; then
+    echo -e "Repository version must be specified"
+    echo -e "\n***\n*** Test Failed\n***"
+    exit 1
+fi
+
 LIBTORCH_OP_VAL_CLIENT=lt_op_val_client.py
 
-DATADIR=/data/inferenceserver/libtorch_validation_store
+DATADIR=/data/inferenceserver/${REPO_VERSION}/libtorch_model_store2
 
 SERVER=/opt/tensorrtserver/bin/trtserver
-SERVER_ARGS=--model-store=$DATADIR
+SERVER_ARGS="--model-repository=$DATADIR --exit-on-error=false"
 SERVER_LOG="./inference_server.log"
 source ../common/util.sh
 
-/opt/tensorrtserver/bin/trtserver --model-store=/data/inferenceserver/libtorch_validation_store &
-SERVER_PID=$!
-sleep 30
+run_server_tolive
+if [ "$SERVER_PID" == "0" ]; then
+    echo -e "\n***\n*** Failed to start $SERVER\n***"
+    cat $SERVER_LOG
+    exit 1
+fi
+
+# give plenty of time for model to load (and fail to load)
+wait_for_model_stable $SERVER_TIMEOUT
 
 RET=0
 CLIENT_LOG=client.log

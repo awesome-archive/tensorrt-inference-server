@@ -26,7 +26,7 @@
 #pragma once
 
 #include <stddef.h>
-#include "src/clients/c++/request.h"
+#include "src/clients/c++/library/request.h"
 
 namespace ni = nvidia::inferenceserver;
 namespace nic = nvidia::inferenceserver::client;
@@ -69,6 +69,51 @@ nic::Error* ServerStatusContextGetServerStatus(
     ServerStatusContextCtx* ctx, char** status, uint32_t* status_len);
 
 //==============================================================================
+// ModelRepositoryContext
+typedef struct ModelRepositoryContextCtx ModelRepositoryContextCtx;
+nic::Error* ModelRepositoryContextNew(
+    ModelRepositoryContextCtx** ctx, const char* url, int protocol_int,
+    const char** headers, int num_headers, bool verbose);
+void ModelRepositoryContextDelete(ModelRepositoryContextCtx* ctx);
+nic::Error* ModelRepositoryContextGetModelRepositoryIndex(
+    ModelRepositoryContextCtx* ctx, char** index, uint32_t* index_len);
+
+//==============================================================================
+// ModelControlContext
+typedef struct ModelControlContextCtx ModelControlContextCtx;
+nic::Error* ModelControlContextNew(
+    ModelControlContextCtx** ctx, const char* url, int protocol_int,
+    const char** headers, int num_headers, bool verbose);
+void ModelControlContextDelete(ModelControlContextCtx* ctx);
+nic::Error* ModelControlContextLoad(
+    ModelControlContextCtx* ctx, const char* model_name);
+nic::Error* ModelControlContextUnload(
+    ModelControlContextCtx* ctx, const char* model_name);
+
+//==============================================================================
+// SharedMemoryControlContext
+typedef struct SharedMemoryControlContextCtx SharedMemoryControlContextCtx;
+nic::Error* SharedMemoryControlContextNew(
+    SharedMemoryControlContextCtx** ctx, const char* url, int protocol_int,
+    const char** headers, int num_headers, bool verbose);
+void SharedMemoryControlContextDelete(SharedMemoryControlContextCtx* ctx);
+nic::Error* SharedMemoryControlContextRegister(
+    SharedMemoryControlContextCtx* ctx, void* shm_handle);
+nic::Error* SharedMemoryControlContextCudaRegister(
+    SharedMemoryControlContextCtx* ctx, void* cuda_shm_handle);
+nic::Error* SharedMemoryControlContextUnregister(
+    SharedMemoryControlContextCtx* ctx, void* shm_handle);
+nic::Error* SharedMemoryControlContextUnregisterAll(
+    SharedMemoryControlContextCtx* ctx);
+nic::Error* SharedMemoryControlContextGetStatus(
+    SharedMemoryControlContextCtx* ctx, char** status, uint32_t* status_len);
+nic::Error* SharedMemoryControlContextGetSharedMemoryHandle(
+    void* shm_handle, void** shm_addr, const char** shm_key, int* shm_fd,
+    size_t* offset, size_t* byte_size);
+nic::Error* SharedMemoryControlContextGetCudaSharedMemoryHandle(
+    void* cuda_shm_handle, void** shm_addr, size_t* byte_size, int* device_id);
+
+//==============================================================================
 // InferContext
 typedef struct InferContextCtx InferContextCtx;
 nic::Error* InferContextNew(
@@ -80,18 +125,16 @@ void InferContextDelete(InferContextCtx* ctx);
 nic::Error* InferContextSetOptions(
     InferContextCtx* ctx, nic::InferContext::Options* options);
 nic::Error* InferContextRun(InferContextCtx* ctx);
-nic::Error* InferContextAsyncRun(InferContextCtx* ctx, uint64_t* request_id);
-nic::Error* InferContextAsyncRunWithCallback(
+nic::Error* InferContextAsyncRun(
     InferContextCtx* ctx, void (*callback)(InferContextCtx*, uint64_t));
 nic::Error* InferContextGetAsyncRunResults(
-    InferContextCtx* ctx, bool* is_ready, uint64_t request_id, bool wait);
-nic::Error* InferContextGetReadyAsyncRequest(
-    InferContextCtx* ctx, bool* is_ready, uint64_t* request_id, bool wait);
+    InferContextCtx* ctx, uint64_t request_id);
 
 //==============================================================================
 // InferContext::Options
 nic::Error* InferContextOptionsNew(
-    nic::InferContext::Options** ctx, uint32_t flags, uint64_t batch_size);
+    nic::InferContext::Options** ctx, uint32_t flags, uint64_t batch_size,
+    ni::CorrelationID corr_id);
 void InferContextOptionsDelete(nic::InferContext::Options* ctx);
 nic::Error* InferContextOptionsAddRaw(
     InferContextCtx* infer_ctx, nic::InferContext::Options* ctx,
@@ -99,6 +142,13 @@ nic::Error* InferContextOptionsAddRaw(
 nic::Error* InferContextOptionsAddClass(
     InferContextCtx* infer_ctx, nic::InferContext::Options* ctx,
     const char* output_name, uint64_t count);
+nic::Error* InferContextOptionsAddSharedMemory(
+    InferContextCtx* infer_ctx, nic::InferContext::Options* ctx,
+    const char* output_name, void* shm_handle);
+nic::Error* InferContextOptionsAddCudaSharedMemory(
+    InferContextCtx* infer_ctx, nic::InferContext::Options* ctx,
+    const char* output_name, void* cuda_shm_handle);
+ni::CorrelationID CorrelationId(InferContextCtx* ctx);
 
 //==============================================================================
 // InferContext::Input
@@ -111,6 +161,8 @@ nic::Error* InferContextInputSetShape(
     InferContextInputCtx* ctx, const int64_t* dims, uint64_t size);
 nic::Error* InferContextInputSetRaw(
     InferContextInputCtx* ctx, const void* data, uint64_t byte_size);
+nic::Error* InferContextInputSetSharedMemory(
+    InferContextInputCtx* ctx, void* shm_handle);
 
 //==============================================================================
 // InferContext::Result
@@ -139,6 +191,13 @@ nic::Error* InferContextResultClassCount(
 nic::Error* InferContextResultNextClass(
     InferContextResultCtx* ctx, size_t batch_idx, uint64_t* idx, float* prob,
     const char** label);
+
+//==============================================================================
+// InferContext::Stat
+nic::Error* InferContextGetStat(
+    InferContextCtx* ctx, uint64_t* completed_request_count,
+    uint64_t* cumulative_total_request_time_ns,
+    uint64_t* cumulative_send_time_ns, uint64_t* cumulative_receive_time_ns);
 
 #ifdef __cplusplus
 }

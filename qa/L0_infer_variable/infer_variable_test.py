@@ -37,6 +37,9 @@ from tensorrtserver.api import *
 
 np_dtype_string = np.dtype(object)
 
+TEST_SYSTEM_SHARED_MEMORY = bool(int(os.environ.get('TEST_SYSTEM_SHARED_MEMORY', 0)))
+TEST_CUDA_SHARED_MEMORY = bool(int(os.environ.get('TEST_CUDA_SHARED_MEMORY', 0)))
+
 class InferVariableTest(unittest.TestCase):
     def _full_exact(self, input_dtype, output0_dtype, output1_dtype,
                     input_shape, output0_shape, output1_shape,
@@ -57,7 +60,9 @@ class InferVariableTest(unittest.TestCase):
                                     model_version, swap,
                                     outputs, use_http, use_grpc,
                                     skip_request_id_check, use_streaming,
-                                    correlation_id)
+                                    correlation_id,
+                                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
                 # model that supports batching
                 iu.infer_exact(tester, pf, tensor_shape, bs,
                                input_dtype, output0_dtype, output1_dtype,
@@ -65,7 +70,9 @@ class InferVariableTest(unittest.TestCase):
                                model_version, swap,
                                outputs, use_http, use_grpc,
                                skip_request_id_check, use_streaming,
-                               correlation_id)
+                               correlation_id,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
         all_ensemble_prefix = ["simple_", "sequence_", "fan_"]
         ensemble_prefix = [""]
@@ -80,6 +87,18 @@ class InferVariableTest(unittest.TestCase):
             for prefix in ensemble_prefix:
                 for pf in ["graphdef", "savedmodel"]:
                     _infer_exact_helper(self, prefix + pf, input_shape, 8,
+                                    input_dtype, output0_dtype, output1_dtype,
+                                    output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+
+        if tu.validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
+                                    input_shape, output0_shape, output1_shape):
+            for prefix in ensemble_prefix:
+                if input_dtype == np.int8:
+                    _infer_exact_helper(self, prefix + 'plan', input_shape + (1,1), 8,
+                                    input_dtype, output0_dtype, output1_dtype,
+                                    output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+                else:
+                    _infer_exact_helper(self, prefix + 'plan', input_shape, 8,
                                     input_dtype, output0_dtype, output1_dtype,
                                     output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
 

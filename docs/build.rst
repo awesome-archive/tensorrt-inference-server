@@ -30,6 +30,14 @@
 Building
 ========
 
+The TensorRT Inference Server, the client libraries and examples, and
+custom backends can each be built using either Docker or CMake. The
+procedure for each is different and is detailed in the corresponding
+sections below.
+
+Building the Server
+-------------------
+
 The TensorRT Inference Server can be built in two ways:
 
 * Build using Docker and the TensorFlow and PyTorch containers from
@@ -44,21 +52,21 @@ The TensorRT Inference Server can be built in two ways:
 .. _section-building-the-server-with-docker:
 
 Building the Server with Docker
--------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 To build a release version of the TensorRT Inference Server container,
 change directory to the root of the repo and checkout the release
 version of the branch that you want to build (or the master branch if
 you want to build the under-development version)::
 
-  $ git checkout r19.05
+  $ git checkout r19.12
 
 Then use docker to build::
 
   $ docker build --pull -t tensorrtserver .
 
 Incremental Builds with Docker
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..............................
 
 For typical development you will want to run the *build* container
 with your local repo’s source files mounted so that your local changes
@@ -79,10 +87,8 @@ with::
   # cd /workspace/builddir
   # make -j16 trtis
 
-The first build attempt may fail with a "protobuf_generate_cpp"
-error. If that happens simply run the make command again and the build
-should succeed. When the build completes the binary, libraries and
-headers can be found in trtis/install. To overwrite the existing versions::
+When the build completes the binary, libraries and headers can be
+found in trtis/install. To overwrite the existing versions::
 
   # cp trtis/install/bin/trtserver /opt/tensorrtserver/bin/.
   # cp trtis/install/lib/libtrtserver.so /opt/tensorrtserver/lib/.
@@ -93,14 +99,14 @@ You can reconfigure the build by running *cmake* as described in
 .. _section-building-the-server-with-cmake:
 
 Building the Server with CMake
-------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 To build a release version of the TensorRT Inference Server with
 CMake, change directory to the root of the repo and checkout the
 release version of the branch that you want to build (or the master
 branch if you want to build the under-development version)::
 
-  $ git checkout r19.05
+  $ git checkout r19.12
 
 Next you must build or install each framework backend you want to
 enable in the inference server, configure the inference server to
@@ -109,7 +115,7 @@ enable the desired features, and finally build the server.
 .. _section-cmake-dependencies:
 
 Dependencies
-^^^^^^^^^^^^
+............
 
 To include GPU support in the inference server you must install the
 necessary CUDA libraries. Similarly, to include support for a
@@ -119,7 +125,7 @@ build. In general, the Dockerfile build steps guide how each of these
 frameworks can be built for use in the interence server.
 
 CUDA, cuBLAS, cuDNN
-...................
+~~~~~~~~~~~~~~~~~~~
 
 For the inference server to support NVIDIA GPUs you must install CUDA,
 cuBLAS and cuDNN. These libraries must be installed on system include
@@ -136,7 +142,7 @@ Once you have CUDA, cuBLAS and cuDNN installed you can enable GPUs
 with the CMake option -DTRTIS_ENABLE_GPU=ON as described below.
 
 TensorRT
-........
+~~~~~~~~
 
 The TensorRT includes and libraries must be installed on system
 include and library paths so that they are available for the CMake
@@ -154,13 +160,13 @@ in the inference server with the CMake option
 -DTRTIS_ENABLE_GPU=ON because TensorRT requires GPU support.
 
 TensorFlow
-..........
+~~~~~~~~~~
 
 The version of TensorFlow used in the Dockerfile build can be found in
 the `Framework Containers Support Matrix
 <https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html>`_.
 The trtserver_tf section of the Dockerfile shows how to build the
-required TensorFlow libary from the `NGC <https://ngc.nvidia.com>`_
+required TensorFlow library from the `NGC <https://ngc.nvidia.com>`_
 TensorFlow container.
 
 You can build and install a different version of the TensorFlow
@@ -184,7 +190,7 @@ them with a semicolon, for example,
 -DTRTIS_EXTRA_LIB_PATHS="/path/a;/path/b".
 
 ONNX Runtime
-............
+~~~~~~~~~~~~
 
 The version of the ONNX Runtime used in the Dockerfile build can be
 found in the trtserver_onnx section of the Dockerfile. That section
@@ -194,7 +200,10 @@ different build process but you may have build or execution issues.
 
 Your build should produce the ONNX Runtime library, libonnxruntime.so.
 You can enable the ONNX Runtime backend in the inference server with
-the CMake option -DTRTIS_ENABLE_ONNXRUNTIME=ON as described below.
+the CMake option -DTRTIS_ENABLE_ONNXRUNTIME=ON as described below. If
+you want to enable OpenVino within the ONNX Runtime you must also
+specify the CMake option TRTIS_ENABLE_ONNXRUNTIME_OPENVINO=ON and
+provide the necessary OpenVino dependencies.
 
 You can install the library in a system library path or you can
 specify the path with the CMake option TRTIS_EXTRA_LIB_PATHS. Multiple
@@ -206,13 +215,13 @@ You must also provide the path to the ONNX Runtime headers using the
 specified by separating them with a semicolon.
 
 PyTorch and Caffe2
-..................
+~~~~~~~~~~~~~~~~~~
 
 The version of PyTorch and Caffe2 used in the Dockerfile build can be
 found in the `Framework Containers Support Matrix
 <https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html>`_.
 The trtserver_caffe2 section of the Dockerfile shows how to build the
-required PyTorch and Caffe2 libaries from the `NGC
+required PyTorch and Caffe2 libraries from the `NGC
 <https://ngc.nvidia.com>`_ PyTorch container.
 
 You can build and install a different version of the libraries but if
@@ -236,7 +245,7 @@ headers using the -DTRTIS_PYTORCH_INCLUDE_PATHS option. Multiple paths
 can be specified by separating them with a semicolon.
 
 Configure Inference Server
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+..........................
 
 Use cmake to configure the TensorRT Inference Server::
 
@@ -283,27 +292,56 @@ additional requirements for enabling a backend.
 
 These additional options may be specified:
 
+* **TRTIS_ENABLE_GRPC**: By default the inference server accepts
+  inference, status, health and other requests via the GRPC
+  protocol. Use -DTRTIS_ENABLE_GRPC=OFF to disable.
+
+* **TRTIS_ENABLE_HTTP**: By default the inference server accepts
+  inference, status, health and other requests via the HTTP
+  protocol. Use -DTRTIS_ENABLE_HTTP=OFF to disable.
+
 * **TRTIS_ENABLE_METRICS**: By default the inference server reports
   :ref:`Prometheus metrics<section-metrics>` on an HTTP endpoint. Use
   -DTRTIS_ENABLE_METRICS=OFF to disable.
 
+* **TRTIS_ENABLE_TRACING**: By default the inference server does not
+  enable detailed :ref:`tracing of individual inference requests
+  <section-trace>`. Use -DTRTIS_ENABLE_TRACING=ON to enable.
+
+* **TRTIS_ENABLE_GCS**: Use -DTRTIS_ENABLE_GCS=ON to enable the
+  inference server to read model repositories from Google Cloud
+  Storage.
+
+* **TRTIS_ENABLE_S3**: Use -DTRTIS_ENABLE_S3=ON to enable the
+  inference server to read model repositories from Amazon S3.
+
 * **TRTIS_ENABLE_GPU**: By default the inference server supports
   NVIDIA GPUs. Use -DTRTIS_ENABLE_GPU=OFF to disable GPU support. When
   GPUs are disable the inference server will :ref:`run models on CPU
-  when possible<section-running-the-inference-server-without-gpu>`.
+  when possible <section-running-the-inference-server-without-gpu>`.
+
+* **TRTIS_MIN_COMPUTE_CAPABILITY**: By default, the inference server
+  supports NVIDIA GPUs with CUDA compute capability 6.0 or higher. If
+  all framework backends included in the inference server are built to
+  support a lower compute capability, then TRTIS can be built to support
+  that lower compute capability by setting -DTRTIS_MIN_COMPUTE_CAPABILITY
+  appropriately. The setting is ignored if -DTRTIS_ENABLE_GPU=OFF.
+
+* **TRTIS_EXTRA_LIB_PATHS**: Extra paths that are searched for
+  framework libraries as described above. Multiple paths can be
+  specified by separating them with a semicolon, for example,
+  -DTRTIS_EXTRA_LIB_PATHS="/path/a;/path/b".
 
 Build Inference Server
-^^^^^^^^^^^^^^^^^^^^^^
+......................
 
 After configuring, build the inference server with make::
 
   $ cd builddir
   $ make -j16 trtis
 
-The first build attempt may fail with a "protobuf_generate_cpp"
-error. If that happens simply run the make command again and the build
-should succeed. When the build completes the binary, libraries and
-headers can be found in trtis/install.
+When the build completes the binary, libraries and headers can be
+found in trtis/install.
 
 .. _section-building-a-custom-backend:
 
@@ -320,16 +358,14 @@ These custom backends are built using CMake::
   $ cmake ../build
   $ make -j16 trtis-custom-backends
 
-The first build attempt may fail with a "protobuf_generate_cpp"
-error. If that happens simply run the make command again and the build
-should succeed. When the build completes the custom backend libraries
-can be found in trtis-custom-backends/install.
+When the build completes the custom backend libraries can be found in
+trtis-custom-backends/install.
 
-A custom backend is not built-into the inference server. Instead if is
+A custom backend is not built-into the inference server. Instead it is
 built as a separate shared library that the inference server
 dynamically loads when the model repository contains a model that uses
 that custom backend. There are a couple of ways you can build your
-custom backend into a shared libary, as described in the following
+custom backend into a shared library, as described in the following
 sections.
 
 Build Using CMake
@@ -368,6 +404,17 @@ the following command::
 
   g++ -fpic -shared -std=c++11 -o libparam.so custom-backend-sdk/src/param.cc -Icustom-backend-sdk/include custom-backend-sdk/lib/libcustombackend.a
 
+Using the Custom Instance Wrapper Class
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The custom backend SDK provides a `CustomInstance Class
+<https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/custom/sdk/custom_instance.h>`_.
+The CustomInstance class is a C++ wrapper class that abstracts away the
+backend C-API for ease of use. All of the example custom backends in
+`src/custom directory
+<https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/custom>`_
+derive from the CustomInstance class and can be referenced for usage.
+
 Building the Client Libraries and Examples
 ------------------------------------------
 
@@ -390,13 +437,18 @@ docuementation.
 To build the docs install the required dependencies::
 
   $ apt-get update
-  $ apt-get install -y --no-install-recommends doxygen
-  $ pip install --upgrade sphinx sphinx-rtd-theme nbsphinx exhale
+  $ apt-get install -y --no-install-recommends python3-pip doxygen
+  $ pip3 install --upgrade setuptools
+  $ pip3 install --upgrade sphinx sphinx-rtd-theme nbsphinx exhale
 
 To get the Python client library API docs the TensorRT Inference
-Server Python package must be installed::
+Server Python package must be installed and a couple of files must be copied::
 
   $ pip install --upgrade tensorrtserver-*.whl
+  $ cd src/clients/c++/library
+  $ cp -f request.h.in request.h
+  $ cp -f request_grpc.h.in request_grpc.h
+  $ cp -f request_http.h.in request_http.h
 
 Then use Sphinx to build the documentation into the build/html
 directory::

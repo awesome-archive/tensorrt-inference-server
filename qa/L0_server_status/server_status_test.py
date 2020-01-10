@@ -1,4 +1,4 @@
-# Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -32,6 +32,9 @@ from future.utils import iteritems
 import os
 import infer_util as iu
 import unittest
+from google.protobuf import text_format
+import json
+import requests
 from tensorrtserver.api import *
 import tensorrtserver.api.server_status_pb2 as server_status
 
@@ -68,7 +71,7 @@ class ServerStatusTest(unittest.TestCase):
                                 "expected status for model " + model_name1)
 
                 self.assertGreater(uptime1, uptime0)
-                self.assertEqual(req_id1, req_id0 + 1)
+                self.assertNotEqual(req_id0, req_id1)
 
                 server_status2, req_id2 = _get_server_status(pair[0], pair[1])
                 self.assertEqual(os.environ["TENSORRT_SERVER_VERSION"],
@@ -163,7 +166,7 @@ class ServerStatusTest(unittest.TestCase):
         # There are 3 versions of *_float32_float32_float32 but only
         # versions 1 and 3 should be available.
         for platform in ('graphdef', 'netdef', 'plan'):
-            tensor_shape = (input_size, 1, 1) if platform == 'plan' else (input_size,)
+            tensor_shape = (input_size,)
             model_name = platform + "_float32_float32_float32"
 
             # Initially there should be no version status...
@@ -217,6 +220,38 @@ class ServerStatusTest(unittest.TestCase):
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
 
+    def test_json_format_header(self):
+        # get server status as json
+        model_name = "graphdef_float32_float32_float32"
+        url = "http://localhost:8000/api/status/" + model_name + "?format=json"
+        r = requests.get(url, headers = {"Accept": "application/json"})
+        tmp_data = json.loads(r.content)
+        self.assertEqual(tmp_data['modelStatus']['graphdef_float32_float32_float32']['config']['platform'],'tensorflow_graphdef')
+
+    def test_json_format(self):
+        # get server status as json
+        model_name = "graphdef_float32_float32_float32"
+        url = "http://localhost:8000/api/status/" + model_name + "?format=json"
+        r = requests.get(url)
+        tmp_data = json.loads(r.content)
+        self.assertEqual(tmp_data['modelStatus']['graphdef_float32_float32_float32']['config']['platform'],'tensorflow_graphdef')
+
+    def test_json_header(self):
+        # get server status as json
+        model_name = "graphdef_float32_float32_float32"
+        url = "http://localhost:8000/api/status/" + model_name
+        r = requests.get(url, headers = {"Accept": "application/json"})
+        tmp_data = json.loads(r.content)
+        self.assertEqual(tmp_data['modelStatus']['graphdef_float32_float32_float32']['config']['platform'],'tensorflow_graphdef')
+
+    def test_text_format(self):
+        # get server status as json
+        model_name = "graphdef_float32_float32_float32"
+        url = "http://localhost:8000/api/status/" + model_name + "?format=text"
+        r = requests.get(url)
+        server_status1 = ServerStatus()
+        text_format.Parse(r.content, server_status1)
+        self.assertTrue(model_name in server_status1.model_status,"expected status for model " + model_name)
 
 class ModelStatusTest(unittest.TestCase):
     '''
@@ -226,7 +261,7 @@ class ModelStatusTest(unittest.TestCase):
     def test_model_versions_deleted(self):
         # Originally There were 3 versions of *_int32_int32_int32 and
         # version 3 was executed once. Version 2 and 3 models were
-        # deleted from the model store so now only expect version 1 to
+        # deleted from the model repository so now only expect version 1 to
         # be ready and version 3 to show stats but not be ready.
         for platform in ('graphdef', 'netdef'):
             model_name = platform + "_int32_int32_int32"

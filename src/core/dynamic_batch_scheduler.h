@@ -30,8 +30,10 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <set>
 #include <thread>
 #include "src/core/api.pb.h"
+#include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
@@ -44,8 +46,12 @@ class DynamicBatchScheduler : public Scheduler {
   // Create a scheduler to support a given number of runners and a run
   // function to call when a request is scheduled.
   static Status Create(
-      const ModelConfig& config, const uint32_t runner_cnt,
-      StandardInitFunc OnInit, StandardRunFunc OnSchedule,
+      const uint32_t runner_id_start, const uint32_t runner_cnt, const int nice,
+      StandardInitFunc OnInit, StandardWarmupFunc OnWarmup,
+      StandardRunFunc OnSchedule, const bool dynamic_batching_enabled,
+      const bool enforce_equal_shape_batch, const bool preserve_ordering,
+      const std::set<int32_t>& preferred_batch_sizes,
+      const uint64_t max_queue_delay_microseconds,
       std::unique_ptr<Scheduler>* scheduler);
 
   ~DynamicBatchScheduler();
@@ -55,14 +61,19 @@ class DynamicBatchScheduler : public Scheduler {
       const std::shared_ptr<ModelInferStats>& stats,
       const std::shared_ptr<InferRequestProvider>& request_provider,
       const std::shared_ptr<InferResponseProvider>& response_provider,
-      std::function<void(Status)> OnComplete) override;
+      std::function<void(const Status&)> OnComplete) override;
 
  private:
   DynamicBatchScheduler(
-      const ModelConfig& config, const uint32_t runner_cnt,
-      StandardInitFunc OnInit, StandardRunFunc OnSchedule);
+      const uint32_t runner_id_start, const uint32_t runner_cnt,
+      StandardInitFunc OnInit, StandardWarmupFunc OnWarmup,
+      StandardRunFunc OnSchedule, const bool dynamic_batching_enabled,
+      const bool enforce_equal_shape_batch, const bool preserve_ordering,
+      const std::set<int32_t>& preferred_batch_sizes,
+      const uint64_t max_queue_delay_microseconds);
   void SchedulerThread(
       const uint32_t runner_id, const int nice,
+      const std::shared_ptr<std::atomic<bool>>& rthread_exit,
       std::promise<bool>* is_initialized);
   void InitPendingShape(const InferRequestHeader& request);
   bool CompareWithPendingShape(const InferRequestHeader& request) const;
@@ -71,18 +82,21 @@ class DynamicBatchScheduler : public Scheduler {
   // Function the scheduler will call to initialize a runner.
   const StandardInitFunc OnInit_;
 
+  // Function the scheduler will call to warmup a runner.
+  const StandardWarmupFunc OnWarmup_;
+
   // Function the scheduler will call to schedule a payload(s) for
   // execution.
   const StandardRunFunc OnSchedule_;
+
+  // True if dynamic batching is enabled.
+  const bool dynamic_batching_enabled_;
 
   // The number of scheduler threads.
   const uint32_t scheduler_thread_cnt_;
 
   // The number of scheduler threads currently idle.
   uint32_t idle_scheduler_thread_cnt_;
-
-  // True if dynamic batching is enabled.
-  bool dynamic_batching_enabled_;
 
   // Mutex and condvar protecting the scheduling queue.
   std::mutex mu_;
@@ -93,7 +107,7 @@ class DynamicBatchScheduler : public Scheduler {
   std::deque<Scheduler::Payload> queue_;
 
   std::vector<std::unique_ptr<std::thread>> scheduler_threads_;
-  std::atomic<bool> scheduler_threads_exit_;
+  std::vector<std::shared_ptr<std::atomic<bool>>> scheduler_threads_exit_;
 
   size_t max_preferred_batch_size_;
   std::set<int32_t> preferred_batch_sizes_;
@@ -101,8 +115,19 @@ class DynamicBatchScheduler : public Scheduler {
   size_t pending_batch_size_;
   size_t pending_batch_queue_cnt_;
 
-  bool need_pending_shape_;
+  size_t queued_batch_size_;
+  size_t next_preferred_batch_size_;
+
+  const bool enforce_equal_shape_batch_;
   std::unordered_map<std::string, DimsList> pending_batch_shapes_;
+
+  const bool preserve_ordering_;
+  // the runner that is currently processing payloads
+  int64_t last_processing_runner_id_;
+
+  // per runner parameters to inform and wait for completion of the particular
+  // runner
+  std::vector<std::shared_ptr<std::promise<void>>> completion_promises_;
 };
 
 }}  // namespace nvidia::inferenceserver

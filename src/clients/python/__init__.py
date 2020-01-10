@@ -33,8 +33,11 @@ import numpy as np
 from numpy.ctypeslib import ndpointer
 import pkg_resources
 import struct
+import threading
 import tensorrtserver.api.model_config_pb2
+from tensorrtserver.api.server_status_pb2 import ModelRepositoryIndex
 from tensorrtserver.api.server_status_pb2 import ServerStatus
+from tensorrtserver.api.server_status_pb2 import SharedMemoryStatus
 from tensorrtserver.api.api_pb2 import *
 
 class _utf8(object):
@@ -96,6 +99,50 @@ _crequest_status_ctx_get = _crequest.ServerStatusContextGetServerStatus
 _crequest_status_ctx_get.restype = c_void_p
 _crequest_status_ctx_get.argtypes = [c_void_p, POINTER(c_char_p), POINTER(c_uint32)]
 
+_crequest_repository_ctx_new = _crequest.ModelRepositoryContextNew
+_crequest_repository_ctx_new.restype = c_void_p
+_crequest_repository_ctx_new.argtypes = [POINTER(c_void_p), _utf8, c_int,
+                                         POINTER(c_char_p), c_int, c_bool]
+_crequest_repository_ctx_del = _crequest.ModelRepositoryContextDelete
+_crequest_repository_ctx_del.argtypes = [c_void_p]
+_crequest_repository_ctx_get = _crequest.ModelRepositoryContextGetModelRepositoryIndex
+_crequest_repository_ctx_get.restype = c_void_p
+_crequest_repository_ctx_get.argtypes = [c_void_p, POINTER(c_char_p), POINTER(c_uint32)]
+
+_crequest_model_control_ctx_new = _crequest.ModelControlContextNew
+_crequest_model_control_ctx_new.restype = c_void_p
+_crequest_model_control_ctx_new.argtypes = [POINTER(c_void_p), _utf8, c_int,
+                                     POINTER(c_char_p), c_int, c_bool]
+_crequest_model_control_ctx_del = _crequest.ModelControlContextDelete
+_crequest_model_control_ctx_del.argtypes = [c_void_p]
+_crequest_model_control_ctx_load = _crequest.ModelControlContextLoad
+_crequest_model_control_ctx_load.restype = c_void_p
+_crequest_model_control_ctx_load.argtypes = [c_void_p, _utf8]
+_crequest_model_control_ctx_unload = _crequest.ModelControlContextUnload
+_crequest_model_control_ctx_unload.restype = c_void_p
+_crequest_model_control_ctx_unload.argtypes = [c_void_p, _utf8]
+
+_crequest_shm_control_ctx_new = _crequest.SharedMemoryControlContextNew
+_crequest_shm_control_ctx_new.restype = c_void_p
+_crequest_shm_control_ctx_new.argtypes = [POINTER(c_void_p), _utf8, c_int, c_bool]
+_crequest_shm_control_ctx_del = _crequest.SharedMemoryControlContextDelete
+_crequest_shm_control_ctx_del.argtypes = [c_void_p]
+_crequest_shm_control_ctx_register = _crequest.SharedMemoryControlContextRegister
+_crequest_shm_control_ctx_register.restype = c_void_p
+_crequest_shm_control_ctx_register.argtypes = [c_void_p, c_void_p]
+_crequest_shm_control_ctx_cuda_register = _crequest.SharedMemoryControlContextCudaRegister
+_crequest_shm_control_ctx_cuda_register.restype = c_void_p
+_crequest_shm_control_ctx_cuda_register.argtypes = [c_void_p, c_void_p]
+_crequest_shm_control_ctx_unregister = _crequest.SharedMemoryControlContextUnregister
+_crequest_shm_control_ctx_unregister.restype = c_void_p
+_crequest_shm_control_ctx_unregister.argtypes = [c_void_p, c_void_p]
+_crequest_shm_control_ctx_unregister_all = _crequest.SharedMemoryControlContextUnregisterAll
+_crequest_shm_control_ctx_unregister_all.restype = c_void_p
+_crequest_shm_control_ctx_unregister_all.argtypes = [c_void_p]
+_crequest_shm_control_ctx_get_status = _crequest.SharedMemoryControlContextGetStatus
+_crequest_shm_control_ctx_get_status.restype = c_void_p
+_crequest_shm_control_ctx_get_status.argtypes =  [c_void_p, POINTER(c_char_p), POINTER(c_uint32)]
+
 _crequest_infer_ctx_new = _crequest.InferContextNew
 _crequest_infer_ctx_new.restype = c_void_p
 _crequest_infer_ctx_new.argtypes = [POINTER(c_void_p), _utf8, c_int,
@@ -109,23 +156,17 @@ _crequest_infer_ctx_set_options.argtypes = [c_void_p, c_void_p]
 _crequest_infer_ctx_run = _crequest.InferContextRun
 _crequest_infer_ctx_run.restype = c_void_p
 _crequest_infer_ctx_run.argtypes = [c_void_p]
+_async_run_callback_prototype = CFUNCTYPE(None, c_void_p, c_uint64)
 _crequest_infer_ctx_async_run = _crequest.InferContextAsyncRun
 _crequest_infer_ctx_async_run.restype = c_void_p
-_crequest_infer_ctx_async_run.argtypes = [c_void_p, POINTER(c_uint64)]
-_async_run_callback_prototype = CFUNCTYPE(None, c_void_p, c_uint64)
-_crequest_infer_ctx_async_run_with_cb = _crequest.InferContextAsyncRunWithCallback
-_crequest_infer_ctx_async_run_with_cb.restype = c_void_p
-_crequest_infer_ctx_async_run_with_cb.argtypes = [c_void_p, _async_run_callback_prototype]
+_crequest_infer_ctx_async_run.argtypes = [c_void_p, _async_run_callback_prototype]
 _crequest_infer_ctx_get_async_run_results = _crequest.InferContextGetAsyncRunResults
 _crequest_infer_ctx_get_async_run_results.restype = c_void_p
-_crequest_infer_ctx_get_async_run_results.argtypes = [c_void_p, POINTER(c_bool), c_uint64, c_bool]
-_crequest_infer_ctx_get_ready_async_request = _crequest.InferContextGetReadyAsyncRequest
-_crequest_infer_ctx_get_ready_async_request.restype = c_void_p
-_crequest_infer_ctx_get_ready_async_request.argtypes = [c_void_p, POINTER(c_bool), POINTER(c_uint64), c_bool]
+_crequest_infer_ctx_get_async_run_results.argtypes = [c_void_p, c_uint64]
 
 _crequest_infer_ctx_options_new = _crequest.InferContextOptionsNew
 _crequest_infer_ctx_options_new.restype = c_void_p
-_crequest_infer_ctx_options_new.argtypes = [POINTER(c_void_p), c_uint32, c_uint64]
+_crequest_infer_ctx_options_new.argtypes = [POINTER(c_void_p), c_uint32, c_uint64, c_uint64]
 _crequest_infer_ctx_options_del = _crequest.InferContextOptionsDelete
 _crequest_infer_ctx_options_del.argtypes = [c_void_p]
 _crequest_infer_ctx_options_add_raw = _crequest.InferContextOptionsAddRaw
@@ -134,6 +175,15 @@ _crequest_infer_ctx_options_add_raw.argtypes = [c_void_p, c_void_p, _utf8]
 _crequest_infer_ctx_options_add_class = _crequest.InferContextOptionsAddClass
 _crequest_infer_ctx_options_add_class.restype = c_void_p
 _crequest_infer_ctx_options_add_class.argtypes = [c_void_p, c_void_p, _utf8, c_uint64]
+_crequest_infer_ctx_options_add_shared_memory = _crequest.InferContextOptionsAddSharedMemory
+_crequest_infer_ctx_options_add_shared_memory.restype = c_void_p
+_crequest_infer_ctx_options_add_shared_memory.argtypes = [c_void_p, c_void_p, _utf8, c_void_p]
+_crequest_infer_ctx_options_add_cuda_shared_memory = _crequest.InferContextOptionsAddCudaSharedMemory
+_crequest_infer_ctx_options_add_cuda_shared_memory.restype = c_void_p
+_crequest_infer_ctx_options_add_cuda_shared_memory.argtypes = [c_void_p, c_void_p, _utf8, c_void_p]
+_crequest_correlation_id = _crequest.CorrelationId
+_crequest_correlation_id.restype = c_uint64
+_crequest_correlation_id.argtypes = [c_void_p]
 
 _crequest_infer_ctx_input_new = _crequest.InferContextInputNew
 _crequest_infer_ctx_input_new.restype = c_void_p
@@ -148,6 +198,10 @@ _crequest_infer_ctx_input_set_shape.argtypes = [c_void_p,
 _crequest_infer_ctx_input_set_raw = _crequest.InferContextInputSetRaw
 _crequest_infer_ctx_input_set_raw.restype = c_void_p
 _crequest_infer_ctx_input_set_raw.argtypes = [c_void_p, c_void_p, c_uint64]
+
+_crequest_infer_ctx_input_set_shared_memory = _crequest.InferContextInputSetSharedMemory
+_crequest_infer_ctx_input_set_shared_memory.restype = c_void_p
+_crequest_infer_ctx_input_set_shared_memory.argtypes = [c_void_p, c_void_p]
 
 _crequest_infer_ctx_result_new = _crequest.InferContextResultNew
 _crequest_infer_ctx_result_new.restype = c_void_p
@@ -182,7 +236,14 @@ _crequest_infer_ctx_result_next_class = _crequest.InferContextResultNextClass
 _crequest_infer_ctx_result_next_class.restype = c_void_p
 _crequest_infer_ctx_result_next_class.argtypes = [c_void_p, c_uint64, POINTER(c_uint64),
                                                   POINTER(c_float), POINTER(c_char_p)]
+_crequest_get_shared_memory_handle_info = _crequest.SharedMemoryControlContextGetSharedMemoryHandle
+_crequest_get_shared_memory_handle_info.restype = c_void_p
+_crequest_get_shared_memory_handle_info.argtypes = [c_void_p, POINTER(c_void_p), POINTER(c_char_p), POINTER(c_int), POINTER(c_uint64), POINTER(c_uint64)]
 
+_crequest_infer_ctx_get_stat = _crequest.InferContextGetStat
+_crequest_infer_ctx_get_stat.restype = c_void_p
+_crequest_infer_ctx_get_stat.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_uint64),
+                                        POINTER(c_uint64), POINTER(c_uint64)]
 
 def _raise_if_error(err):
     """
@@ -204,6 +265,58 @@ def _raise_error(msg):
     _crequest_error_del(err)
     raise ex
 
+
+def serialize_string_tensor(input_tensor):
+    """
+    Serializes a string tensor into a flat numpy array of length prepend strings.
+    Can pass string tensor as numpy array of bytes with dtype of np.bytes_,
+    numpy strings with dtype of np.str_ or python strings with dtype of np.object.
+
+    Parameters
+    ----------
+    input_tensor : np.array
+        The string tensor to serialize.
+
+    Returns
+    -------
+    serialized_string_tensor : np.array
+        The 1-D numpy array of type uint8 containing the serialized string in 'C' order.
+
+    Raises
+    ------
+    InferenceServerException
+        If unable to serialize the given tensor.
+    """
+
+    if not isinstance(input_tensor, (np.ndarray,)):
+        _raise_error("input must be a numpy array")
+
+    if input_tensor.size == 0:
+        _raise_error("input cannot be empty")
+
+    # If the input is a tensor of string objects, then must flatten those into
+    # a 1-dimensional array containing the 4-byte string length followed by the
+    # actual string characters. All strings are concatenated together in "C"
+    # order.
+    if (input_tensor.dtype == np.object) or (input_tensor.dtype.type == np.bytes_):
+        flattened = bytes()
+        for obj in np.nditer(input_tensor, flags=["refs_ok"], order='C'):
+            # If directly passing bytes to STRING type,
+            # don't convert it to str as Python will encode the
+            # bytes which may distort the meaning
+            if obj.dtype.type == np.bytes_:
+                if type(obj.item()) == bytes:
+                    s = obj.item()
+                else:
+                    s = bytes(obj)
+            else:
+                s = str(obj).encode('utf-8')
+            flattened += struct.pack("<I", len(s))
+            flattened += s
+        return np.asarray(flattened)
+    else:
+        _raise_error("cannot serialize string tensor: invalid datatype")
+    return None
 
 class ProtocolType(IntEnum):
     """Protocol types supported by the client API
@@ -527,6 +640,396 @@ class ServerStatusContext:
         return self._last_request_id
 
 
+class ModelRepositoryContext:
+    """Performs a model repository request to an inference server.
+
+    A request can be made to get model repository information of the server
+
+    Parameters
+    ----------
+    url : str
+        The inference server URL, e.g. localhost:8000.
+
+    protocol : ProtocolType
+        The protocol used to communicate with the server.
+
+    verbose : bool
+        If True generate verbose output.
+
+    http_headers : list of strings
+        HTTP headers to send with request. Ignored for GRPC
+        protocol. Each header must be specified as "Header:Value".
+
+    """
+    def __init__(self, url, protocol, verbose=False, http_headers=[]):
+        self._last_request_id = 0
+        self._ctx = c_void_p()
+
+        if http_headers is None:
+            http_headers = list()
+
+        http_headers_arr = (c_char_p * len(http_headers))()
+        http_headers_arr[:] = http_headers
+
+        _raise_if_error(
+            c_void_p(
+                _crequest_repository_ctx_new(
+                    byref(self._ctx), url, int(protocol), http_headers_arr, len(http_headers), verbose)))
+
+    def __del__(self):
+        # when module is unloading may get called after
+        # _crequest_status_ctx_del has been released
+        if _crequest_repository_ctx_del is not None:
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def close(self):
+        """Close the context. Any future calls to get_model_repository_index()
+        will result in an Error.
+
+        """
+        _crequest_status_ctx_del(self._ctx)
+        self._ctx = None
+
+    def get_model_repository_index(self):
+        """Contact the inference server and get the index of the model repository.
+
+        Returns
+        -------
+        ModelRepositoryIndex
+            The ModelRepositoryIndex protobuf containing the index.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to get index.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("ModelRepositoryContext is closed")
+
+        cindex = c_char_p()
+        cindex_len = c_uint32()
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_repository_ctx_get(
+                self._ctx, byref(cindex), byref(cindex_len))))
+        index_buf = cast(cindex, POINTER(c_byte * cindex_len.value))[0]
+
+        index = ModelRepositoryIndex()
+        index.ParseFromString(index_buf)
+        return index
+
+    def get_last_request_id(self):
+        """Get the request ID of the most recent get_model_repository_index() request.
+
+        Returns
+        -------
+        int
+            The request ID, or None if a request has not yet been made
+            or if the last request was not successful.
+
+        """
+        return self._last_request_id
+
+
+class ModelControlContext:
+    """Performs a model control request to an inference server.
+
+    Parameters
+    ----------
+    url : str
+        The inference server URL, e.g. localhost:8000.
+
+    protocol : ProtocolType
+        The protocol used to communicate with the server.
+
+    verbose : bool
+        If True generate verbose output.
+
+    http_headers : list of strings
+        HTTP headers to send with request. Ignored for GRPC
+        protocol. Each header must be specified as "Header:Value".
+
+    """
+    def __init__(self, url, protocol, verbose=False, http_headers=[]):
+        self._last_request_id = 0
+        self._ctx = c_void_p()
+
+        if http_headers is None:
+            http_headers = list()
+
+        http_headers_arr = (c_char_p * len(http_headers))()
+        http_headers_arr[:] = http_headers
+
+        _raise_if_error(
+            c_void_p(
+                _crequest_model_control_ctx_new(
+                    byref(self._ctx), url, int(protocol),
+                    http_headers_arr, len(http_headers), verbose)))
+
+    def __del__(self):
+        # when module is unloading may get called after
+        # _crequest_model_control_ctx_del has been released
+        if _crequest_model_control_ctx_del is not None:
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def close(self):
+        """Close the context. Any future calls to load() or unload() will
+        result in an Error.
+
+        """
+        _crequest_model_control_ctx_del(self._ctx)
+        self._ctx = None
+
+    def load(self, model_name):
+        """Request the inference server to load specified model.
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to be loaded.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to load the model.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("ModelControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_model_control_ctx_load(self._ctx, model_name)))
+        return
+
+    def unload(self, model_name):
+        """Request the inference server to unload specified model.
+
+        Parameters
+        ----------
+        model_name : str
+            The name of the model to be unloaded.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to unload the model.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("ModelControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_model_control_ctx_unload(self._ctx, model_name)))
+        return
+
+    def get_last_request_id(self):
+        """Get the request ID of the most recent load() or unload()
+        request.
+
+        Returns
+        -------
+        int
+            The request ID, or None if a request has not yet been made
+            or if the last request was not successful.
+
+        """
+        return self._last_request_id
+
+
+class SharedMemoryControlContext:
+    """Performs a shared memory control request to an inference server.
+
+    Parameters
+    ----------
+    url : str
+        The inference server URL, e.g. localhost:8000.
+
+    protocol : ProtocolType
+        The protocol used to communicate with the server.
+
+    verbose : bool
+        If True generate verbose output.
+
+    http_headers : list of strings
+        HTTP headers to send with request. Ignored for GRPC
+        protocol. Each header must be specified as "Header:Value".
+
+    """
+    def __init__(self, url, protocol, verbose=False, http_headers=[]):
+        self._last_request_id = 0
+        self._ctx = c_void_p()
+
+        if http_headers is None:
+            http_headers = list()
+
+        http_headers_arr = (c_char_p * len(http_headers))()
+        http_headers_arr[:] = http_headers
+
+        _raise_if_error(
+            c_void_p(
+                _crequest_shm_control_ctx_new(
+                    byref(self._ctx), url, int(protocol),
+                    http_headers_arr, len(http_headers), verbose)))
+
+    def __del__(self):
+        if _crequest_shm_control_ctx_del is not None:
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def close(self):
+        """Close the context. Any future calls to register() or unregister()
+        will result in an Error.
+
+        """
+        _crequest_shm_control_ctx_del(self._ctx)
+        self._ctx = None
+
+    def register(self, shm_handle):
+        """Request the inference server to register specified shared memory region.
+
+        Parameters
+        ----------
+        shm_handle : c_void_p
+            The handle for the shared memory region.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to register the shared memory region.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("SharedMemoryControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_shm_control_ctx_register(self._ctx, shm_handle)))
+        return
+
+    def cuda_register(self, cuda_shm_handle):
+        """Request the inference server to register specified shared memory region.
+
+        Parameters
+        ----------
+        cuda_shm_handle : c_void_p
+            The handle for the CUDA shared memory region.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to register the shared memory region.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("SharedMemoryControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_shm_control_ctx_cuda_register(self._ctx, cuda_shm_handle)))
+        return
+
+    def unregister(self, shm_handle):
+        """Request the inference server to unregister specified shared memory region.
+
+        Parameters
+        ----------
+        shm_handle : c_void_p
+            The handle for the shared memory region.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to unregister the shared memory region.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("SharedMemoryControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_shm_control_ctx_unregister(self._ctx, shm_handle)))
+        return
+
+    def unregister_all(self):
+        """Request the inference server to unregister all shared memory regions.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to unregister any shared memory regions.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("SharedMemoryControlContext is closed")
+
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_shm_control_ctx_unregister_all(self._ctx)))
+        return
+
+    def get_shared_memory_status(self):
+        """Contact the inference server and get status.
+
+        Returns
+        -------
+        SharedMemoryStatus
+            The SharedMemoryStatus protobuf containing the status.
+
+        Raises
+        ------
+        InferenceServerException
+            If unable to get status.
+
+        """
+        self._last_request_id = None
+        if self._ctx is None:
+            _raise_error("SharedMemoryControlContext is closed")
+
+        cstatus = c_char_p()
+        cstatus_len = c_uint32()
+        self._last_request_id = _raise_if_error(
+            c_void_p(_crequest_shm_control_ctx_get_status(
+                self._ctx, byref(cstatus), byref(cstatus_len))))
+        status_buf = cast(cstatus, POINTER(c_byte * cstatus_len.value))[0]
+
+        status = SharedMemoryStatus()
+        status.ParseFromString(status_buf)
+        return status
+
+    def get_last_request_id(self):
+        """Get the request ID of the most recent register() or unregister()
+        request.
+
+        Returns
+        -------
+        int
+            The request ID, or None if a request has not yet been made
+            or if the last request was not successful.
+
+        """
+        return self._last_request_id
+
+
 class InferContext:
     """An InferContext object is used to run inference on an inference
     server for a specific model.
@@ -593,6 +1096,8 @@ class InferContext:
         self._callback_resources_dict = dict()
         self._callback_resources_dict_id = 0
         self._ctx = c_void_p()
+        # Lock for the thread-safety across asynchronous requests
+        self._lock = threading.Lock()
 
         if http_headers is None:
             http_headers = list()
@@ -663,24 +1168,52 @@ class InferContext:
         _raise_error("unknown result datatype " + ctype.value)
 
     def _prepare_request(self, inputs, outputs,
-                         flags, batch_size, contiguous_input_values):
+                         flags, batch_size, corr_id, contiguous_input_values):
         # Make sure each input is given as a list (one entry per
         # batch). It is a common error when using batch-size 1 to
         # specify an input directly as an array instead of as a list
         # containing one array.
+        # An input's data may be specified as a list of numpy arrays,
+        # or as a shared memory handle or as a tuple of a shared memory
+        # handle and the shape of the input tensor.
         for inp_name, inp in inputs.items():
-            if not isinstance(inp, (list, tuple)):
+            if (not isinstance(inp, (list, tuple))) and (type(inp) != c_void_p):
                 _raise_error("input '" + inp_name +
-                             "' values must be specified as a list of numpy arrays")
-
+                             "' values must be specified as a list of numpy arrays" \
+                             " or as a single c_void_p (representing the shared memory handle)" \
+                             " or as a tuple of c_void_p (representing the shared memory handle)" \
+                             " and list (representing the shape of the input tensor)")
+            if type(inp) != c_void_p:
+                # Skip further checks for this input if it is a tuple of shared memory and shape
+                # of the form (c_void_p, list)
+                if (len(inp) == 2) and (type(inp[0]) == c_void_p) and (isinstance(inp[1], (list, tuple))):
+                    continue
+                for ip in inp:
+                    if not isinstance(ip, (np.ndarray, tuple)):
+                        _raise_error("input '" + inp_name +
+                                     "' values must be specified as a list of numpy arrays" \
+                             " or as a single c_void_p (representing the shared memory handle)" \
+                             " or as a tuple of c_void_p (representing the shared memory handle)" \
+                             " and list (representing the shape of the input tensor)")
         # Set run options using formats specified in 'outputs'
+        # An output format may be may be specified as a RAW or (CLASS, cnt)
+        # or as a (RAW, shared_memory_handle).
         options = c_void_p()
         try:
             _raise_if_error(c_void_p(
-                _crequest_infer_ctx_options_new(byref(options), flags, batch_size)))
+                _crequest_infer_ctx_options_new(byref(options), flags, batch_size, corr_id)))
 
             for (output_name, output_format) in iteritems(outputs):
-                if output_format == InferContext.ResultFormat.RAW:
+                if len(output_format) == 2 and isinstance(output_format, (list, tuple)) \
+                    and output_format[0] == InferContext.ResultFormat.RAW:
+                    if type(output_format[1]) != c_void_p:
+                        _raise_error("shared memory requires tuple of size 2" \
+                                    " - output_format(RAW), shared_memory_handle(c_void_p)")
+                    _raise_if_error(
+                        c_void_p(
+                            _crequest_infer_ctx_options_add_shared_memory(
+                                self._ctx, options, output_name, output_format[1])))
+                elif output_format == InferContext.ResultFormat.RAW:
                     _raise_if_error(
                         c_void_p(
                             _crequest_infer_ctx_options_add_raw(self._ctx, options, output_name)))
@@ -706,51 +1239,62 @@ class InferContext:
                     c_void_p(_crequest_infer_ctx_input_new(byref(input), self._ctx, input_name)))
 
                 # Set the input shape
-                if len(input_values) > 0:
-                    shape_value = np.asarray(input_values[0].shape, dtype=np.int64)
+                if isinstance(input_values, (list, tuple)):
+                    if len(input_values) > 0:
+                        if isinstance(input_values[0], (np.ndarray,)):
+                            shape_value = np.asarray(input_values[0].shape, dtype=np.int64)
+                            _raise_if_error(
+                                c_void_p(
+                                    _crequest_infer_ctx_input_set_shape(
+                                           input, shape_value, c_uint64(shape_value.size))))
+
+                    # use values if numpy array, reference if shared memory
+                    if isinstance(input_values[0], (np.ndarray,)):
+                        for input_value in input_values:
+                            # If the input tensor is empty then avoid going
+                            # through the more complicated logic since
+                            # creating the buffer for string objects results
+                            # is a size-1 array instead of 0.
+                            if input_value.size == 0:
+                                _raise_if_error(
+                                    c_void_p(
+                                        _crequest_infer_ctx_input_set_raw(input, 0, 0)))
+                            else:
+                                # If the input is a tensor of string objects,
+                                # then must flatten those into a 1-dimensional
+                                # array containing the 4-byte string length
+                                # followed by the actual string characters.
+                                # All strings are concatenated together in "C"
+                                # order.
+                                if (input_value.dtype == np.object) or (input_value.dtype.type == np.bytes_):
+                                    input_value = serialize_string_tensor(input_value)
+
+                                if not input_value.flags['C_CONTIGUOUS']:
+                                    input_value = np.ascontiguousarray(input_value)
+                                contiguous_input_values.append(input_value)
+                                _raise_if_error(
+                                    c_void_p(
+                                        _crequest_infer_ctx_input_set_raw(
+                                            input, input_value.ctypes.data_as(c_void_p),
+                                            c_uint64(input_value.size * input_value.itemsize))))
+                    # For variable size tensors, need the shape as well as the
+                    # shared memory handle
+                    elif isinstance(input_values[1], (list, tuple)) and (type(input_values[0]) == c_void_p):
+                        shape_value = np.asarray(input_values[1], dtype=np.int64)
+                        _raise_if_error(
+                            c_void_p(
+                                _crequest_infer_ctx_input_set_shape(
+                                       input, shape_value, c_uint64(shape_value.size))))
+                        _raise_if_error(
+                            c_void_p(
+                                _crequest_infer_ctx_input_set_shared_memory(
+                                    input, input_values[0])))
+                else:
                     _raise_if_error(
                         c_void_p(
-                            _crequest_infer_ctx_input_set_shape(
-                                input, shape_value, c_uint64(shape_value.size))))
+                            _crequest_infer_ctx_input_set_shared_memory(
+                                input, input_values)))
 
-                for input_value in input_values:
-                    # If the input tensor is empty then avoid going
-                    # through the more complicated logic since
-                    # creating the buffer for string objects results
-                    # is a size-1 array instead of 0.
-                    if input_value.size == 0:
-                        _raise_if_error(
-                            c_void_p(
-                                _crequest_infer_ctx_input_set_raw(input, 0, 0)))
-                    else:
-                        # If the input is a tensor of string objects,
-                        # then must flatten those into a 1-dimensional
-                        # array containing the 4-byte string length
-                        # followed by the actual string characters.
-                        # All strings are concatenated together in "C"
-                        # order.
-                        if input_value.dtype == np.object or input_value.dtype.type == np.bytes_:
-                            flattened = bytes()
-                            for obj in np.nditer(input_value, flags=["refs_ok"], order='C'):
-                                # If directly passing bytes to STRING type,
-                                # don't convert it to str as Python will encode the
-                                # bytes which may distort the meaning
-                                if obj.dtype.type == np.bytes_:
-                                    s = bytes(obj)
-                                else:
-                                    s = str(obj).encode('utf-8')
-                                flattened += struct.pack("<I", len(s))
-                                flattened += s
-                            input_value = np.asarray(flattened)
-
-                        if not input_value.flags['C_CONTIGUOUS']:
-                            input_value = np.ascontiguousarray(input_value)
-                        contiguous_input_values.append(input_value)
-                        _raise_if_error(
-                            c_void_p(
-                                _crequest_infer_ctx_input_set_raw(
-                                    input, input_value.ctypes.data_as(c_void_p),
-                                    c_uint64(input_value.size * input_value.itemsize))))
             finally:
                 _crequest_infer_ctx_input_del(input)
 
@@ -855,6 +1399,70 @@ class InferContext:
                             label = None if clabel.value is None else clabel.value.decode('utf-8')
                             classes.append((cidx.value, cprob.value, label))
                         results[output_name].append(classes)
+                elif (isinstance(output_format, (list, tuple)) and
+                    (output_format[0] == InferContext.ResultFormat.RAW) and (len(output_format) == 2)):
+                    # Get the shape of each result tensor
+                    max_shape_dims = 16
+                    shape_array = np.zeros(max_shape_dims, dtype=np.int64)
+                    shape_len = c_uint64()
+                    _raise_if_error(
+                        c_void_p(
+                            _crequest_infer_ctx_result_shape(
+                                result, c_uint64(max_shape_dims),
+                                shape_array, byref(shape_len))))
+                    shape = np.resize(shape_array, shape_len.value).tolist()
+
+                    # get info for shared memory regions and read results
+                    shm_fd = c_int()
+                    offset = c_uint64()
+                    byte_size = c_uint64()
+                    shm_addr = c_void_p()
+                    shm_key = c_char_p()
+                    _raise_if_error(
+                        c_void_p(_crequest_get_shared_memory_handle_info(output_format[1], \
+                                byref(shm_addr), byref(shm_key), byref(shm_fd), \
+                                byref(offset), byref(byte_size))))
+                    if (np.prod(shape) * np.dtype(result_dtype).itemsize) < int(byte_size.value/batch_size):
+                        element_byte_size = np.prod(shape) * np.dtype(result_dtype).itemsize
+                    else:
+                        element_byte_size = int(byte_size.value/batch_size)
+                    start_pos = offset.value
+                    if result_dtype != np.object:
+                        cval = shm_addr
+                        for b in range(batch_size):
+                            cval_len = start_pos + element_byte_size
+                            if cval_len == 0:
+                                val = np.empty(shape, dtype=result_dtype)
+                                results[output_name].append(val)
+                            else:
+                                val_buf = cast(cval, POINTER(c_byte * cval_len))[0]
+                                val = np.frombuffer(val_buf, dtype=result_dtype, offset=start_pos)
+
+                            # Reshape the result to the appropriate shape
+                            start_pos += element_byte_size
+                            shaped = np.reshape(val, shape)
+                            results[output_name].append(shaped)
+                    else:
+                        cval = shm_addr
+                        str_offset = start_pos
+                        val_buf = cast(cval, POINTER(c_byte * byte_size.value))[0]
+                        b = 0
+                        while b < batch_size:
+                            ii = 0
+                            strs = list()
+                            while (ii % np.prod(shape) != 0) or (ii == 0):
+                                l = struct.unpack_from("<I", val_buf, str_offset)[0]
+                                str_offset += 4
+                                sb = struct.unpack_from("<{}s".format(l), val_buf, str_offset)[0]
+                                str_offset += l
+                                strs.append(sb)
+                                ii+=1
+                            b+=1
+
+                            # Reshape the result to the appropriate shape
+                            val = np.array(strs, dtype=object)
+                            shaped = np.reshape(val, shape)
+                            results[output_name].append(shaped)
                 else:
                     _raise_error("unrecognized output format")
             finally:
@@ -879,9 +1487,9 @@ class InferContext:
             The correlation ID.
 
         """
-        return self._correlation_id
+        return _crequest_correlation_id(self._ctx)
 
-    def run(self, inputs, outputs, batch_size=1, flags=0):
+    def run(self, inputs, outputs, batch_size=1, flags=0, corr_id=0):
         """Run inference using the supplied 'inputs' to calculate the outputs
         specified by 'outputs'.
 
@@ -909,6 +1517,10 @@ class InferContext:
         flags : int
             The flags to use for the inference. The bitwise-or of
             InferRequestHeader.Flag values.
+
+        corr_id : int
+            The correlation id of the inference. Used to differentiate
+            sequences.
 
         Returns
         -------
@@ -940,92 +1552,22 @@ class InferContext:
         contiguous_input = list()
 
         # Set run option and input values
-        self._prepare_request(inputs, outputs, flags, batch_size, contiguous_input)
+        self._prepare_request(inputs, outputs, flags, batch_size, corr_id, contiguous_input)
 
         # Run inference...
         self._last_request_id = _raise_if_error(c_void_p(_crequest_infer_ctx_run(self._ctx)))
 
         return self._get_results(outputs, batch_size)
 
-    def async_run(self, inputs, outputs, batch_size=1, flags=0):
-        """DEPRECATED: This function is deprecated and will be removed in
-        a future version of this API. Instead use async_run_with_cb().
-
-        Run inference using the supplied 'inputs' to calculate the outputs
-        specified by 'outputs'.
-
-        Unlike run(), async_run() returns immediately after sending
-        the inference request to the server. The returned integer
-        identifier must be used subsequently to wait on and retrieve
-        the actual inference results.
-
-        Parameters
-        ----------
-        inputs : dict
-            Dictionary from input name to the value(s) for that
-            input. An input value is specified as a numpy array. Each
-            input in the dictionary maps to a list of values (i.e. a
-            list of numpy array objects), where the length of the list
-            must equal the 'batch_size'.
-
-        outputs : dict
-            Dictionary from output name to a value indicating the
-            ResultFormat that should be used for that output. For RAW
-            the value should be ResultFormat.RAW. For CLASS the value
-            should be a tuple (ResultFormat.CLASS, k), where 'k'
-            indicates how many classification results should be
-            returned for the output.
-
-        batch_size : int
-            The batch size of the inference. Each input must provide
-            an appropriately sized batch of inputs.
-
-        flags : int
-            The flags to use for the inference. The bitwise-or of
-            InferRequestHeader.Flag values.
-
-        Returns
-        -------
-        int
-            Integer identifier which must be passed to
-            get_async_run_results() to wait on and retrieve the
-            inference results.
-
-        Raises
-        ------
-        InferenceServerException
-            If all inputs are not specified, if the size of input data
-            does not match expectations, if unknown output names are
-            specified or if server fails to perform inference.
-
-        """
-        # Same situation as in run(), but the list will be kept inside
-        # the object given that the request is asynchronous
-        contiguous_input = list()
-
-        # Set run option and input values
-        self._prepare_request(inputs, outputs, flags, batch_size, contiguous_input)
-
-        # Run asynchronous inference...
-        c_request_id = c_uint64()
-        _raise_if_error(
-            c_void_p(
-                _crequest_infer_ctx_async_run(self._ctx, byref(c_request_id))))
-
-        self._requested_outputs_dict[c_request_id.value] = (outputs, batch_size, contiguous_input)
-
-        return c_request_id.value
-
-    def async_run_with_cb(self, callback, inputs, outputs, batch_size=1, flags=0):
+    def async_run(self, callback, inputs, outputs, batch_size=1, flags=0, corr_id=0):
         """Run inference using the supplied 'inputs' to calculate the outputs
         specified by 'outputs'.
 
-        Similar to AsyncRun() above. However, this function does not return the
-        integer identifier. Instead, once the request is completed, the InferContext
-        object and the integer identifier will be passed to the provided 'callback'
-        function. It is the function caller's choice on either retrieving the results
-        inside the callback function or deferring it to a different thread so that
-        the InferContext is unblocked.
+        Once the request is completed, the InferContext object and the integer
+        identifier will be passed to the provided 'callback' function. It is the
+        function caller's choice on either retrieving the results inside the
+        callback function or deferring it to a different thread so that the
+        InferContext is unblocked.
 
         Parameters
         ----------
@@ -1053,16 +1595,15 @@ class InferContext:
             The batch size of the inference. Each input must provide
             an appropriately sized batch of inputs.
 
+        corr_id : int
+            The correlation id of the inference. If non-zero this
+            correlation ID overrides the context's correlation ID for
+            all subsequent inference requests, else the inference
+            request uses the context's correlation ID.
+
         flags : int
             The flags to use for the inference. The bitwise-or of
             InferRequestHeader.Flag values.
-
-        Returns
-        -------
-        int
-            Integer identifier which must be passed to
-            get_async_run_results() to wait on and retrieve the
-            inference results.
 
         Raises
         ------
@@ -1077,39 +1618,36 @@ class InferContext:
         contiguous_input = list()
 
         # Set run option and input values
-        self._prepare_request(inputs, outputs, flags, batch_size, contiguous_input)
+        self._prepare_request(inputs, outputs, flags, batch_size, corr_id, contiguous_input)
 
         # Wrap over the provided callback
         wrapped_cb = partial(self._async_callback_wrapper, self._callback_resources_dict_id, callback)
         c_cb = _async_run_callback_prototype(wrapped_cb)
 
-        # Run asynchronous inference...
-        _raise_if_error(
-            c_void_p(
-                _crequest_infer_ctx_async_run_with_cb(self._ctx, c_cb)))
+        with self._lock:
+            # Run asynchronous inference...
+            _raise_if_error(
+                c_void_p(
+                    _crequest_infer_ctx_async_run(self._ctx, c_cb)))
 
-        self._callback_resources_dict[self._callback_resources_dict_id] = \
-            (outputs, batch_size, contiguous_input, c_cb, wrapped_cb)
-        self._callback_resources_dict_id += 1
+            self._callback_resources_dict[self._callback_resources_dict_id] = \
+                (outputs, batch_size, contiguous_input, c_cb, wrapped_cb)
+            self._callback_resources_dict_id += 1
 
-    def get_async_run_results(self, request_id, wait):
+    def get_async_run_results(self, request_id):
         """Retrieve the results of a previous async_run() using the supplied
         'request_id'
 
         Parameters
         ----------
         request_id : int
-            The integer ID of the asynchronous request returned by async_run().
-
-        wait : bool
-            If True block until the request results are ready. If False return
-            immediately even if results are not ready.
+            The integer ID of the asynchronous request exposed in the
+            callback function of the async_run.
 
         Returns
         -------
         dict
-            None if the results are not ready and 'wait' is False. A
-            dictionary from output name to the list of values for that
+            A dictionary from output name to the list of values for that
             output (one list element for each entry of the batch). The
             format of a value returned for an output depends on the
             output format specified in 'outputs'. For format RAW a
@@ -1126,65 +1664,20 @@ class InferContext:
 
         """
         # Get async run results
-        c_is_ready = c_bool()
         err = c_void_p(_crequest_infer_ctx_get_async_run_results(
-            self._ctx, byref(c_is_ready), request_id, wait))
-
+            self._ctx, request_id))
 
         self._last_request_id = _raise_if_error(err)
 
-        if not c_is_ready.value:
-            return None
-
-        requested_outputs = self._requested_outputs_dict[request_id]
-        if isinstance(requested_outputs, int):
-            idx = requested_outputs
-            requested_outputs = self._callback_resources_dict[idx]
-            del self._callback_resources_dict[idx]
-        del self._requested_outputs_dict[request_id]
+        with self._lock:
+            requested_outputs = self._requested_outputs_dict[request_id]
+            if isinstance(requested_outputs, int):
+                idx = requested_outputs
+                requested_outputs = self._callback_resources_dict[idx]
+                del self._callback_resources_dict[idx]
+            del self._requested_outputs_dict[request_id]
 
         return self._get_results(requested_outputs[0], requested_outputs[1], request_id)
-
-    def get_ready_async_request(self, wait):
-        """DEPRECATED: This function is deprecated and will be removed in
-        a future version of this API. This function is only useful with
-        the deprecated version of async_run(). Instead use async_run_with_cb().
-
-        Get the request ID of an async_run() request that has completed but
-        not yet had results read with get_async_run_results().
-
-        Parameters
-        ----------
-        wait : bool
-            If True block until an async request is ready. If False return
-            immediately even if results are not ready.
-
-        Returns
-        -------
-        int
-            None if no asynchronous results are ready and 'wait' is
-            False. An integer identifier which must be passed to
-            get_async_run_results() to wait on and retrieve the
-            inference results.
-
-        Raises
-        ------
-        InferenceServerException
-            If no asynchronous request is in flight or completed.
-
-        """
-        # Get async run results
-        c_is_ready = c_bool()
-        c_request_id = c_uint64()
-        err = c_void_p(_crequest_infer_ctx_get_ready_async_request(
-            self._ctx, byref(c_is_ready), byref(c_request_id), wait))
-
-        _raise_if_error(err)
-
-        if not c_is_ready.value:
-            return None
-
-        return c_request_id.value
 
     def get_last_request_id(self):
         """Get the request ID of the most recent run() request.
@@ -1221,3 +1714,37 @@ class InferContext:
 
         """
         return self._last_request_model_version
+
+    def get_stat(self):
+        """Get the current statistics of the InferContext.
+
+        Returns
+        -------
+        dict
+            Containing the completed_request_count,
+            cumulative_total_request_time_ns, cumulative_send_time_ns
+            and cumulative_receive_time_ns with their respective keys.
+
+        Raises
+        ------
+        InferenceServerException
+            If fails to retrieve the statistics.
+
+        """
+        stat = dict()
+        completed_request_count = c_uint64()
+        cumulative_total_request_time_ns = c_uint64()
+        cumulative_send_time_ns = c_uint64()
+        cumulative_receive_time_ns = c_uint64()
+        _raise_if_error(c_void_p(_crequest_infer_ctx_get_stat(
+                self._ctx, byref(completed_request_count),
+                byref(cumulative_total_request_time_ns),
+                byref(cumulative_send_time_ns),
+                byref(cumulative_receive_time_ns))))
+        # Populate the dictionary with the values
+        stat["completed_request_count"] = completed_request_count.value
+        stat["cumulative_total_request_time_ns"] = cumulative_total_request_time_ns.value
+        stat["cumulative_send_time_ns"] = cumulative_send_time_ns.value
+        stat["cumulative_receive_time_ns"] = cumulative_receive_time_ns.value
+
+        return stat

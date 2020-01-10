@@ -1,4 +1,4 @@
-# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019-2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -34,7 +34,9 @@ protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${proto-srcs})
 protobuf_generate_python(PROTO_PY ${proto-srcs})
 
 set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
-set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
+if(${TRTIS_ENABLE_GRPC})
+  set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
+endif()
 
 add_library(
   proto-library EXCLUDE_FROM_ALL OBJECT
@@ -115,10 +117,17 @@ if(${TRTIS_ENABLE_GCS})
   set_source_files_properties(filesystem.cc PROPERTIES COMPILE_FLAGS -Wno-missing-field-initializers)
 endif() # TRTIS_ENABLE_GCS
 
+if(${TRTIS_ENABLE_S3})
+  find_package(AWSSDK REQUIRED COMPONENTS s3)
+  message(STATUS "Using aws-sdk-cpp ${AWSSDK_VERSION}")
+endif()
+
 set(
   SERVER_SRCS
   autofill.cc
   backend.cc
+  backend_context.cc
+  cuda_utils.cc
   dynamic_batch_scheduler.cc
   ensemble_scheduler.cc
   ensemble_utils.cc
@@ -129,13 +138,14 @@ set(
   metrics.cc
   model_config_utils.cc
   model_repository_manager.cc
-  profile.cc
+  tracing.cc
+  pinned_memory_manager.cc
   provider.cc
   provider_utils.cc
-  request_status.cc
   sequence_batch_scheduler.cc
   server.cc
   server_status.cc
+  shared_memory_manager.cc
   status.cc
   trtserver.cc
 )
@@ -144,7 +154,9 @@ set(
   SERVER_HDRS
   autofill.h
   backend.h
+  backend_context.h
   constants.h
+  cuda_utils.h
   dynamic_batch_scheduler.h
   ensemble_scheduler.h
   ensemble_utils.h
@@ -155,14 +167,16 @@ set(
   metrics.h
   model_config_utils.h
   model_repository_manager.h
-  profile.h
+  tracing.h
+  pinned_memory_manager.h
   provider.h
   provider_utils.h
-  request_status.h
+  sync_queue.h
   scheduler.h
   sequence_batch_scheduler.h
   server.h
   server_status.h
+  shared_memory_manager.h
   status.h
   trtserver.h
 )
@@ -193,3 +207,10 @@ if(${TRTIS_ENABLE_GCS})
     PRIVATE $<TARGET_PROPERTY:storage_client,INTERFACE_INCLUDE_DIRECTORIES>
   )
 endif() # TRTIS_ENABLE_GCS
+
+if(${TRTIS_ENABLE_S3})
+  target_include_directories(
+    server-library
+    PRIVATE $<TARGET_PROPERTY:aws-cpp-sdk-s3,INTERFACE_INCLUDE_DIRECTORIES>
+  )
+endif() # TRTIS_ENABLE_S3

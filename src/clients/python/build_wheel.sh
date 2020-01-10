@@ -56,7 +56,7 @@ function main() {
   if [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
     cp libcrequest.so \
       "${WHLDIR}/tensorrtserver/api/."
-    cp ../c++/librequest.so \
+    cp ../c++/library/librequest.so \
       "${WHLDIR}/tensorrtserver/api/."
   else
     cp Release/crequest.dll \
@@ -67,6 +67,22 @@ function main() {
 
   cp __init__.py \
     "${WHLDIR}/tensorrtserver/api/."
+
+  if [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
+    mkdir -p ${WHLDIR}/tensorrtserver/shared_memory
+    cp libcshm.so \
+      "${WHLDIR}/tensorrtserver/shared_memory/."
+    cp shared_memory/__init__.py \
+      "${WHLDIR}/tensorrtserver/shared_memory/."
+
+    if [ -f libccudashm.so ] && [ -f cuda_shared_memory/__init__.py ]; then
+      mkdir -p ${WHLDIR}/tensorrtserver/cuda_shared_memory
+      cp libccudashm.so \
+        "${WHLDIR}/tensorrtserver/cuda_shared_memory/."
+      cp cuda_shared_memory/__init__.py \
+        "${WHLDIR}/tensorrtserver/cuda_shared_memory/."
+    fi
+  fi
 
   cp setup.py "${WHLDIR}"
 	touch ${WHLDIR}/tensorrtserver/__init__.py
@@ -80,7 +96,7 @@ function main() {
 
   pushd "${WHLDIR}"
   echo $(date) : "=== Building wheel"
-  VERSION=$VERSION python setup.py bdist_wheel
+  VERSION=$VERSION python${PYVER} setup.py bdist_wheel
   mkdir -p "${DEST}"
   cp dist/* "${DEST}"
   popd

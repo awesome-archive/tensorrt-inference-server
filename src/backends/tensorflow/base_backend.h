@@ -28,6 +28,7 @@
 #include "src/backends/tensorflow/graphdef_backend_factory.h"
 #include "src/backends/tensorflow/tensorflow_backend_tf.h"
 #include "src/core/backend.h"
+#include "src/core/backend_context.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
@@ -40,17 +41,18 @@ class BaseBackend : public InferenceBackend {
   BaseBackend() = default;
   BaseBackend(BaseBackend&&) = default;
 
-  Status Init(const std::string& path, const ModelConfig& config);
+  Status Init(
+      const std::string& path, const ModelConfig& model_config,
+      const GraphDefBackendFactory::Config* backend_config,
+      const std::string& platform);
 
   // Create a context for execution for each instance of the
   // tensorflow model specified in 'paths'. The model can be either a
   // graphdef or savedmodel
   Status CreateExecutionContexts(
-      const std::shared_ptr<GraphDefBackendFactory::Config>& backend_config,
       const std::unordered_map<std::string, std::string>& paths);
   Status CreateExecutionContext(
       const std::string& instance_name, const int gpu_device,
-      const std::shared_ptr<GraphDefBackendFactory::Config>& backend_config,
       const std::unordered_map<std::string, std::string>& paths);
 
  protected:
@@ -60,19 +62,17 @@ class BaseBackend : public InferenceBackend {
 
   // Load model and create a corresponding TRTISTF model object.
   virtual Status CreateTRTISTFModel(
-      const std::shared_ptr<GraphDefBackendFactory::Config>& backend_config,
+      const GraphDefBackendFactory::Config* backend_config,
       const int gpu_device, const bool has_graph_level, const int graph_level,
       const std::string& model_path, TRTISTFModelHandle* trtistf_model,
-      IONameMap* input_name_map, IONameMap* output_name_map) = 0;
+      IONameMap* input_name_map, IONameMap* output_name_map,
+      const TRTISTF_TFTRTConfig* tftrt_config) = 0;
 
   // For each model instance there is a context.
-  struct Context {
-    // GPU device number that indicates that no gpu is available for a
-    // context.
-    static constexpr int NO_GPU_DEVICE = -1;
-
-    // Max batch size value that indicates batching is not supported.
-    static constexpr int NO_BATCHING = 0;
+  struct Context : BackendContext {
+    // GPU device number that indicates model will be loaded on GPUs
+    // as specified in model graph
+    static constexpr int MODEL_DEVICE = -2;
 
     Context(
         const std::string& name, const int gpu_device,
@@ -92,7 +92,31 @@ class BaseBackend : public InferenceBackend {
         const std::string& name, const DataType datatype, const DimsList& dims,
         const size_t total_batch_size,
         std::vector<Scheduler::Payload>* payloads,
-        TRTISTF_TensorList** input_tensors);
+        TRTISTF_TensorList** input_tensors, bool* cuda_copy);
+
+    // Helper function to set the input for fixed-sized data type
+    void SetFixedSizedInputTensor(
+        TRTISTF_Tensor* tensor, const std::string& input_name,
+        const size_t batch1_byte_size,
+        std::vector<Scheduler::Payload>* payloads, bool* cuda_copy);
+
+    // Helper function to set the input for String data type
+    void SetStringInputTensor(
+        TRTISTF_Tensor* tensor, const std::string& input_name,
+        const size_t batch1_element_cnt,
+        std::vector<Scheduler::Payload>* payloads);
+
+    // Helper function to set the output with fixed-sized data type in payload
+    void ReadFixedSizedOutputTensor(
+        TRTISTF_Tensor* tensor, const std::string& output_name,
+        const std::vector<int64_t>& shape, const size_t batch1_byte_size,
+        std::vector<Scheduler::Payload>* payloads, bool* cuda_copy);
+
+    // Helper function to set the output with String data type in payload
+    void ReadStringOutputTensor(
+        TRTISTF_Tensor* tensor, const std::string& output_name,
+        const std::vector<int64_t>& shape, const size_t batch1_element_cnt,
+        std::vector<Scheduler::Payload>* payloads, bool* cuda_copy);
 
     // Run model to execute for one or more requests. This function
     // assumes that it is only called by the single runner thread that
@@ -100,18 +124,10 @@ class BaseBackend : public InferenceBackend {
     // an internal error that prevents any of the of requests from
     // completing. If an error is isolate to a single request payload
     // it will be reported in that payload.
+    // See BackendContext::Run()
     Status Run(
-        const BaseBackend* base, std::vector<Scheduler::Payload>* payloads);
-
-    // Name of the model instance
-    std::string name_;
-
-    // The GPU index active when this context was created.
-    int gpu_device_;
-
-    // Maximum batch size to allow. NO_BATCHING indicates that
-    // batching is not supported.
-    int max_batch_size_;
+        const InferenceBackend* base,
+        std::vector<Scheduler::Payload>* payloads) override;
 
     // Map from configuration name for an input to tensor name for
     // that input in the model.
@@ -123,21 +139,16 @@ class BaseBackend : public InferenceBackend {
 
     // TRTISTFModel for this context.
     TRTISTFModelHandle trtistf_model_;
-  };
 
- private:
-  // Run model on the context associated with 'runner_idx' to
-  // execute for one or more requests.
-  void Run(
-      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-      std::function<void(Status)> OnCompleteQueuedPayloads);
+    // use for GPU allocator
+    int input_device_id_;
+  };
 
  private:
   DISALLOW_COPY_AND_ASSIGN(BaseBackend);
   friend std::ostream& operator<<(std::ostream&, const BaseBackend&);
 
-  // The contexts for this backend.
-  std::vector<std::unique_ptr<Context>> contexts_;
+  const GraphDefBackendFactory::Config* backend_config_;
 };
 
 std::ostream& operator<<(std::ostream& out, const BaseBackend& pb);

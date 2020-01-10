@@ -29,14 +29,20 @@
 
 #include <algorithm>
 #include <deque>
+#include <future>
 #include <stdexcept>
 #include <thread>
 #include "src/core/backend.h"
 #include "src/core/constants.h"
+#include "src/core/ensemble_utils.h"
 #include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
 #include "src/core/server_status.h"
+
+#ifdef TRTIS_ENABLE_GPU
+#include <cuda_runtime_api.h>
+#endif
 
 #ifdef TRTIS_ENABLE_CAFFE2
 #include "src/backends/caffe2/netdef_backend_factory.h"
@@ -65,9 +71,10 @@ namespace {
 
 void
 BuildBackendConfigMap(
-    const std::string& version, const std::string& model_store_path,
-    const bool strict_model_config, const float tf_gpu_memory_fraction,
-    const bool tf_allow_soft_placement, BackendConfigMap* backend_configs)
+    const std::string& version, const bool strict_model_config,
+    const float tf_gpu_memory_fraction, const bool tf_allow_soft_placement,
+    const std::map<int, std::pair<int, uint64_t>> tf_vgpu_memory_limit_mb,
+    BackendConfigMap* backend_configs)
 {
 #ifdef TRTIS_ENABLE_TENSORFLOW
   //// Tensorflow GraphDef and SavedModel
@@ -81,6 +88,33 @@ BuildBackendConfigMap(
       graphdef_config->allow_gpu_memory_growth = false;
       graphdef_config->per_process_gpu_memory_fraction = tf_gpu_memory_fraction;
     }
+
+#ifdef TRTIS_ENABLE_GPU
+    int device_cnt = 0;
+    cudaError_t cuerr = cudaGetDeviceCount(&device_cnt);
+    if ((cuerr == cudaErrorNoDevice) ||
+        (cuerr == cudaErrorInsufficientDriver)) {
+      device_cnt = 0;
+    } else if (cuerr != cudaSuccess) {
+      LOG_ERROR << "unable to get number of CUDA devices while building "
+                   "BackendConfigMap: ("
+                << cuerr << ") " << cudaGetErrorString(cuerr);
+      device_cnt = 0;
+    }
+
+    if (!tf_vgpu_memory_limit_mb.empty()) {
+      for (int device = 0; device < device_cnt; device++) {
+        auto device_mapping = tf_vgpu_memory_limit_mb.find(device);
+        if (device_mapping != tf_vgpu_memory_limit_mb.end()) {
+          graphdef_config->memory_limit_mb[device] = std::vector<float>(
+              device_mapping->second.first, device_mapping->second.second);
+        } else {
+          graphdef_config->memory_limit_mb[device] = {};
+        }
+      }
+      graphdef_config->per_process_gpu_memory_fraction = 0.0;
+    }
+#endif  // TRTIS_ENABLE_GPU
 
     graphdef_config->allow_soft_placement = tf_allow_soft_placement;
 
@@ -130,7 +164,6 @@ BuildBackendConfigMap(
   {
     auto custom_config = std::make_shared<CustomBackendFactory::Config>();
     custom_config->inference_server_version = version;
-    custom_config->model_repository_path = model_store_path;
     (*backend_configs)[kCustomPlatform] = custom_config;
   }
 #endif  // TRTIS_ENABLE_CUSTOM
@@ -199,46 +232,23 @@ IsModified(const std::string& path, int64_t* last_ns)
   return modified;
 }
 
-// The implementation of backend handle, which provides callback hooks that
-// will be triggered in different phase of the BackendHandle life cycle
-class BackendHandleImpl : public ModelRepositoryManager::BackendHandle {
- public:
-  BackendHandleImpl(
-      std::unique_ptr<InferenceBackend> is,
-      std::function<void(std::unique_ptr<InferenceBackend>)> OnDestroyBackend);
+// Use smart pointer with custom deleter so that model state will be updated
+// to UNAVAILABLE if all smart pointer copies are out of scope
+struct BackendDeleter {
+  BackendDeleter(std::function<void()> OnDestroyBackend)
+      : OnDestroyBackend_(std::move(OnDestroyBackend))
+  {
+  }
 
-  ~BackendHandleImpl();
-
-  InferenceBackend* GetInferenceBackend() override { return is_.get(); }
-
- private:
-  std::unique_ptr<InferenceBackend> is_;
+  void operator()(InferenceBackend* backend)
+  {
+    delete backend;
+    OnDestroyBackend_();
+  }
 
   // Use to inform the BackendLifeCycle that the backend handle is destroyed
-  std::function<void(std::unique_ptr<InferenceBackend>)> OnDestroyBackend_;
+  std::function<void()> OnDestroyBackend_;
 };
-
-BackendHandleImpl::BackendHandleImpl(
-    std::unique_ptr<InferenceBackend> is,
-    std::function<void(std::unique_ptr<InferenceBackend>)> OnDestroyBackend)
-    : is_(std::move(is)), OnDestroyBackend_(std::move(OnDestroyBackend))
-{
-}
-
-BackendHandleImpl::~BackendHandleImpl()
-{
-  // [TODO] fix InferenceBackend destructor
-  // The expectation is that the InferenceBackend can be released directly when
-  // ~BackendHandleImpl() is called. But in fact, it is not "ready" to be
-  // released if it just finished a request (Resource Deadlock error in
-  // Scheduler's destructor). Now we have to defer InferenceBackend destruction.
-
-  // Call callback with separate thread because the callback will try to acquire
-  // the mutex of the corresponding backend_info. And this destructor is likely
-  // to to be called within BackendLifeCycle class where the mutex is being hold
-  std::thread worker(std::move(OnDestroyBackend_), std::move(is_));
-  worker.detach();
-}
 
 }  // namespace
 
@@ -249,29 +259,35 @@ struct ModelRepositoryManager::ModelInfo {
   int64_t mtime_nsec_;
   ModelConfig model_config_;
   Platform platform_;
+  std::string model_repository_path_;
 };
 
 class ModelRepositoryManager::BackendLifeCycle {
  public:
   static Status Create(
-      const BackendConfigMap& backend_map, const std::string& repository_path,
+      InferenceServer* server,
+      const std::shared_ptr<ServerStatusManager>& status_manager,
+      const BackendConfigMap& backend_map,
       std::unique_ptr<BackendLifeCycle>* life_cycle);
 
-  ~BackendLifeCycle();
+  ~BackendLifeCycle() = default;
 
   // Start loading model backends with specified versions asynchronously.
   // If 'force_unload', all versions that are being served will
   // be unloaded before loading the specified versions.
   Status AsyncLoad(
-      const std::string& model_name, const std::vector<int64_t>& versions,
-      const ModelConfig& model_config, bool force_unload = true);
+      const std::string& repository_path, const std::string& model_name,
+      const std::set<int64_t>& versions, const ModelConfig& model_config,
+      bool force_unload = true,
+      std::function<void(int64_t, ModelReadyState, size_t)> OnComplete =
+          nullptr);
 
-  // Get specified model version's backend handle. Latest ready version will
+  // Get specified model version's backend. Latest ready version will
   // be retrieved if 'version' is -1. Return error if the version specified is
   // not found or it is not ready.
-  Status GetBackendHandle(
+  Status GetInferenceBackend(
       const std::string& model_name, const int64_t version,
-      std::shared_ptr<BackendHandle>* handle);
+      std::shared_ptr<InferenceBackend>* backend);
 
   // Get the ModelStateMap representation of the live backends. A backend is
   // live if at least one of the versions is not unknown nor unavailable.
@@ -283,45 +299,52 @@ class ModelRepositoryManager::BackendLifeCycle {
  private:
   struct BackendInfo {
     BackendInfo(
-        const ModelReadyState state, const ActionType next_action,
-        const ModelConfig& model_config)
-        : platform_(GetPlatform(model_config.platform())), state_(state),
+        const std::string& repository_path, const ModelReadyState state,
+        const ActionType next_action, const ModelConfig& model_config)
+        : repository_path_(repository_path),
+          platform_(GetPlatform(model_config.platform())), state_(state),
           next_action_(next_action), model_config_(model_config)
     {
     }
 
+    std::string repository_path_;
     Platform platform_;
 
-    std::mutex mtx_;
+    std::recursive_mutex mtx_;
     ModelReadyState state_;
     // next_action will be set in the case where a load / unload is requested
     // while the backend is already in loading / unloading state. Then the new
     // load / unload will be postponed as next action.
     ActionType next_action_;
+    // callback function that will be triggered when there is no next action
+    std::function<void()> OnComplete_;
     ModelConfig model_config_;
 
-    std::shared_ptr<BackendHandle> handle_;
+    std::shared_ptr<InferenceBackend> backend_;
   };
 
-  BackendLifeCycle(const std::string& repository_path);
+  BackendLifeCycle(const std::shared_ptr<ServerStatusManager>& status_manager)
+      : status_manager_(status_manager)
+  {
+  }
 
+  // Function called after backend state / next action is updated.
   // Caller must obtain the mutex of 'backend_info' before calling this function
+  Status TriggerNextAction(
+      const std::string& model_name, const int64_t version,
+      BackendInfo* backend_info);
+
+  // Helper function called by TriggerNextAction()
   Status Load(
       const std::string& model_name, const int64_t version,
       BackendInfo* backend_info);
 
-  // Caller must obtain the mutex of 'backend_info' before calling this function
+  // Helper function called by TriggerNextAction()
   Status Unload(
       const std::string& model_name, const int64_t version,
       BackendInfo* backend_info);
 
-  Status CreateBackendHandle(
-      const std::string& model_name, const int64_t version,
-      BackendInfo* backend_info);
-
-  // Function called after model load / unload.
-  // Caller must obtain the mutex of 'backend_info' before calling this function
-  Status TriggerNextAction(
+  Status CreateInferenceBackend(
       const std::string& model_name, const int64_t version,
       BackendInfo* backend_info);
 
@@ -330,13 +353,8 @@ class ModelRepositoryManager::BackendLifeCycle {
   BackendMap map_;
   std::mutex map_mtx_;
 
-  // Variables as workaround to issue mentioned in ~BackendHandleImpl()
-  bool exiting_;
-  std::thread release_thread_;
-  std::mutex release_queue_mtx_;
-  std::deque<std::unique_ptr<InferenceBackend>> release_queue_;
+  std::shared_ptr<ServerStatusManager> status_manager_;
 
-  const std::string& repository_path_;
 #ifdef TRTIS_ENABLE_CAFFE2
   std::unique_ptr<NetDefBackendFactory> netdef_factory_;
 #endif  // TRTIS_ENABLE_CAFFE2
@@ -359,49 +377,15 @@ class ModelRepositoryManager::BackendLifeCycle {
   std::unique_ptr<EnsembleBackendFactory> ensemble_factory_;
 };
 
-ModelRepositoryManager::BackendLifeCycle::BackendLifeCycle(
-    const std::string& repository_path)
-    : exiting_(false), repository_path_(repository_path)
-{
-  release_thread_ = std::thread([this]() {
-    {
-      std::vector<std::unique_ptr<InferenceBackend>> releasing_backend;
-      {
-        std::lock_guard<std::mutex> lock(this->release_queue_mtx_);
-        if (this->exiting_ && this->release_queue_.empty()) {
-          return;
-        }
-        while (!this->release_queue_.empty()) {
-          releasing_backend.emplace_back(
-              std::move(this->release_queue_.front()));
-          this->release_queue_.pop_front();
-        }
-      }
-      // Give some time so that the backend should be "ready" to be released
-      std::this_thread::sleep_for(std::chrono::milliseconds(5000));
-      releasing_backend.clear();
-    }
-  });
-}
-
-ModelRepositoryManager::BackendLifeCycle::~BackendLifeCycle()
-{
-  {
-    std::lock_guard<std::mutex> lock(release_queue_mtx_);
-    exiting_ = true;
-  }
-  if (release_thread_.joinable()) {
-    release_thread_.join();
-  }
-}
-
 Status
 ModelRepositoryManager::BackendLifeCycle::Create(
-    const BackendConfigMap& backend_map, const std::string& repository_path,
+    InferenceServer* server,
+    const std::shared_ptr<ServerStatusManager>& status_manager,
+    const BackendConfigMap& backend_map,
     std::unique_ptr<BackendLifeCycle>* life_cycle)
 {
   std::unique_ptr<BackendLifeCycle> local_life_cycle(
-      new BackendLifeCycle(repository_path));
+      new BackendLifeCycle(status_manager));
 
 #ifdef TRTIS_ENABLE_TENSORFLOW
   {
@@ -461,7 +445,7 @@ ModelRepositoryManager::BackendLifeCycle::Create(
     const std::shared_ptr<BackendConfig>& config =
         backend_map.find(kEnsemblePlatform)->second;
     RETURN_IF_ERROR(EnsembleBackendFactory::Create(
-        config, &(local_life_cycle->ensemble_factory_)));
+        server, config, &(local_life_cycle->ensemble_factory_)));
   }
 
   *life_cycle = std::move(local_life_cycle);
@@ -479,7 +463,7 @@ ModelRepositoryManager::BackendLifeCycle::GetLiveBackendStates()
     VersionStateMap version_map;
 
     for (auto& version_backend : model_version.second) {
-      std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+      std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
       // At lease one version is live (ready / loading / unloading)
       if ((version_backend.second->state_ != ModelReadyState::MODEL_UNKNOWN) &&
           (version_backend.second->state_ !=
@@ -506,7 +490,7 @@ ModelRepositoryManager::BackendLifeCycle::GetVersionStates(
   auto mit = map_.find(model_name);
   if (mit != map_.end()) {
     for (auto& version_backend : mit->second) {
-      std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+      std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
       version_map[version_backend.first] = version_backend.second->state_;
     }
   }
@@ -515,11 +499,11 @@ ModelRepositoryManager::BackendLifeCycle::GetVersionStates(
 }
 
 Status
-ModelRepositoryManager::BackendLifeCycle::GetBackendHandle(
+ModelRepositoryManager::BackendLifeCycle::GetInferenceBackend(
     const std::string& model_name, const int64_t version,
-    std::shared_ptr<BackendHandle>* handle)
+    std::shared_ptr<InferenceBackend>* backend)
 {
-  LOG_VERBOSE(1) << "GetBackendHandle() '" << model_name << "' version "
+  LOG_VERBOSE(1) << "GetInferenceBackend() '" << model_name << "' version "
                  << version;
   std::lock_guard<std::mutex> map_lock(map_mtx_);
   auto mit = map_.find(model_name);
@@ -536,14 +520,15 @@ ModelRepositoryManager::BackendLifeCycle::GetBackendHandle(
     if (version == -1) {
       for (auto& version_backend : mit->second) {
         if (version_backend.first > latest) {
-          std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+          std::lock_guard<std::recursive_mutex> lock(
+              version_backend.second->mtx_);
           if (version_backend.second->state_ == ModelReadyState::MODEL_READY) {
             latest = version_backend.first;
             // Tedious, but have to set handle for any "latest" version
             // at the moment to avoid edge case like the following:
             // "versions : 1 3 2", version 3 is latest but is requested
             // to be unloaded when the iterator is examining version 2.
-            *handle = version_backend.second->handle_;
+            *backend = version_backend.second->backend_;
           }
         }
       }
@@ -555,9 +540,9 @@ ModelRepositoryManager::BackendLifeCycle::GetBackendHandle(
                                             " is not found");
     }
   } else {
-    std::lock_guard<std::mutex> lock(vit->second->mtx_);
+    std::lock_guard<std::recursive_mutex> lock(vit->second->mtx_);
     if (vit->second->state_ == ModelReadyState::MODEL_READY) {
-      *handle = vit->second->handle_;
+      *backend = vit->second->backend_;
     } else {
       return Status(
           RequestStatusCode::UNAVAILABLE,
@@ -570,8 +555,10 @@ ModelRepositoryManager::BackendLifeCycle::GetBackendHandle(
 
 Status
 ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
-    const std::string& model_name, const std::vector<int64_t>& versions,
-    const ModelConfig& model_config, bool force_unload)
+    const std::string& repository_path, const std::string& model_name,
+    const std::set<int64_t>& versions, const ModelConfig& model_config,
+    bool force_unload,
+    std::function<void(int64_t, ModelReadyState, size_t)> OnComplete)
 {
   LOG_VERBOSE(1) << "AsyncLoad() '" << model_name << "'";
   std::lock_guard<std::mutex> map_lock(map_mtx_);
@@ -580,32 +567,84 @@ ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     it = map_.emplace(std::make_pair(model_name, VersionMap())).first;
   }
 
-  if (force_unload) {
-    for (auto& version_backend : it->second) {
-      std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
-      Unload(model_name, version_backend.first, version_backend.second.get());
-    }
-  }
-
   for (const auto& version : versions) {
-    auto vit = it->second.find(version);
-    if (vit == it->second.end()) {
-      vit =
-          it->second
-              .emplace(std::make_pair(version, std::unique_ptr<BackendInfo>()))
-              .first;
-      vit->second.reset(new BackendInfo(
-          ModelReadyState::MODEL_UNKNOWN, ActionType::NO_ACTION, model_config));
+    auto res = it->second.emplace(
+        std::make_pair(version, std::unique_ptr<BackendInfo>()));
+    if (res.second) {
+      res.first->second.reset(new BackendInfo(
+          repository_path, ModelReadyState::MODEL_UNKNOWN,
+          ActionType::NO_ACTION, model_config));
     }
-
-    // Update model config and reload model if it is being served
-    std::lock_guard<std::mutex> lock(vit->second->mtx_);
-    vit->second->model_config_ = model_config;
-    Unload(model_name, version, vit->second.get());
-    RETURN_IF_ERROR(Load(model_name, version, vit->second.get()));
   }
 
-  return Status::Success;
+  Status status = Status::Success;
+  size_t affected_version_cnt =
+      force_unload ? it->second.size() : versions.size();
+  for (auto& version_backend : it->second) {
+    std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
+    if (versions.find(version_backend.first) != versions.end()) {
+      version_backend.second->repository_path_ = repository_path;
+      version_backend.second->model_config_ = model_config;
+      version_backend.second->next_action_ = ActionType::LOAD;
+    } else if (force_unload) {
+      version_backend.second->next_action_ = ActionType::UNLOAD;
+    }
+
+    auto version = version_backend.first;
+    auto backend_info = version_backend.second.get();
+    // set version-wise callback before triggering next action
+    if (OnComplete != nullptr) {
+      version_backend.second->OnComplete_ =
+          [version, backend_info, affected_version_cnt, OnComplete]() {
+            OnComplete(version, backend_info->state_, affected_version_cnt);
+          };
+    }
+    Status action_status = TriggerNextAction(model_name, version, backend_info);
+    // Only care about status on unloading case
+    if (!action_status.IsOk() && versions.empty()) {
+      status = action_status;
+    }
+  }
+
+  return status;
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
+    const std::string& model_name, const int64_t version,
+    BackendInfo* backend_info)
+{
+  LOG_VERBOSE(1) << "TriggerNextAction() '" << model_name << "' version "
+                 << version << ": "
+                 << std::to_string(backend_info->next_action_);
+  ActionType next_action = backend_info->next_action_;
+  backend_info->next_action_ = ActionType::NO_ACTION;
+  Status status = Status::Success;
+  switch (next_action) {
+    case ActionType::LOAD:
+      status = Load(model_name, version, backend_info);
+      break;
+    case ActionType::UNLOAD:
+      status = Unload(model_name, version, backend_info);
+      break;
+    default:
+      if (backend_info->OnComplete_ != nullptr) {
+        LOG_VERBOSE(1) << "no next action, trigger OnComplete()";
+        backend_info->OnComplete_();
+        backend_info->OnComplete_ = nullptr;
+      }
+      break;
+  }
+
+  // If status is not ok, "next action" path ends here and thus need to
+  // invoke callback by this point
+  if ((!status.IsOk()) && (backend_info->OnComplete_ != nullptr)) {
+    LOG_VERBOSE(1) << "failed to execute next action, trigger OnComplete()";
+    backend_info->OnComplete_();
+    backend_info->OnComplete_ = nullptr;
+  }
+
+  return status;
 }
 
 Status
@@ -620,10 +659,13 @@ ModelRepositoryManager::BackendLifeCycle::Load(
 
   switch (backend_info->state_) {
     case ModelReadyState::MODEL_READY:
-      status = Status(
-          RequestStatusCode::ALREADY_EXISTS,
-          "tried to load model '" + model_name + "' version " +
-              std::to_string(version) + " which is being served");
+      LOG_INFO << "re-loading: " << model_name << ":" << version;
+      backend_info->state_ = ModelReadyState::MODEL_UNLOADING;
+      status_manager_->SetModelVersionReadyState(
+          model_name, version, backend_info->state_, ModelReadyStateReason());
+      backend_info->next_action_ = ActionType::LOAD;
+      // The load will be triggered once the unload is done (deleter is called)
+      backend_info->backend_.reset();
       break;
     case ModelReadyState::MODEL_LOADING:
     case ModelReadyState::MODEL_UNLOADING:
@@ -632,9 +674,11 @@ ModelRepositoryManager::BackendLifeCycle::Load(
     default:
       LOG_INFO << "loading: " << model_name << ":" << version;
       backend_info->state_ = ModelReadyState::MODEL_LOADING;
+      status_manager_->SetModelVersionReadyState(
+          model_name, version, backend_info->state_, ModelReadyStateReason());
       {
         std::thread worker(
-            &ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle,
+            &ModelRepositoryManager::BackendLifeCycle::CreateInferenceBackend,
             this, model_name, version, backend_info);
         worker.detach();
       }
@@ -658,7 +702,9 @@ ModelRepositoryManager::BackendLifeCycle::Unload(
     case ModelReadyState::MODEL_READY:
       LOG_INFO << "unloading: " << model_name << ":" << version;
       backend_info->state_ = ModelReadyState::MODEL_UNLOADING;
-      backend_info->handle_.reset();
+      status_manager_->SetModelVersionReadyState(
+          model_name, version, backend_info->state_, ModelReadyStateReason());
+      backend_info->backend_.reset();
       break;
     case ModelReadyState::MODEL_LOADING:
     case ModelReadyState::MODEL_UNLOADING:
@@ -677,19 +723,19 @@ ModelRepositoryManager::BackendLifeCycle::Unload(
 }
 
 Status
-ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle(
+ModelRepositoryManager::BackendLifeCycle::CreateInferenceBackend(
     const std::string& model_name, const int64_t version,
     BackendInfo* backend_info)
 {
-  LOG_VERBOSE(1) << "CreateBackendHandle() '" << model_name << "' version "
+  LOG_VERBOSE(1) << "CreateInferenceBackend() '" << model_name << "' version "
                  << version;
-  const auto version_path =
-      JoinPath({repository_path_, model_name, std::to_string(version)});
+  const auto version_path = JoinPath(
+      {backend_info->repository_path_, model_name, std::to_string(version)});
   // make copy of the current model config in case model config in backend info
   // is updated (another poll) during the creation of backend handle
   ModelConfig model_config;
   {
-    std::lock_guard<std::mutex> lock(backend_info->mtx_);
+    std::lock_guard<std::recursive_mutex> lock(backend_info->mtx_);
     model_config = backend_info->model_config_;
   }
 
@@ -730,7 +776,9 @@ ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle(
 #endif  // TRTIS_ENABLE_PYTORCH
 #ifdef TRTIS_ENABLE_CUSTOM
     case Platform::PLATFORM_CUSTOM:
-      status = custom_factory_->CreateBackend(version_path, model_config, &is);
+      status = custom_factory_->CreateBackend(
+          backend_info->repository_path_, model_name, version, model_config,
+          &is);
       break;
 #endif  // TRTIS_ENABLE_CUSTOM
     case Platform::PLATFORM_ENSEMBLE:
@@ -742,43 +790,52 @@ ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle(
   }
 
   // Update backend state
-  std::lock_guard<std::mutex> lock(backend_info->mtx_);
+  std::lock_guard<std::recursive_mutex> lock(backend_info->mtx_);
   // Sanity check
-  if (backend_info->handle_ != nullptr) {
+  if (backend_info->backend_ != nullptr) {
     LOG_ERROR << "trying to load model '" << model_name << "' version "
               << version << " while it is being served";
   } else {
     if (status.IsOk()) {
-      backend_info->state_ = ModelReadyState::MODEL_READY;
       // Unless the handle is nullptr, always reset handle out of the mutex,
       // otherwise the handle's destructor will try to acquire the mutex and
       // cause deadlock.
-      backend_info->handle_.reset(new BackendHandleImpl(
-          std::move(is), [this, model_name, version, backend_info](
-                             std::unique_ptr<InferenceBackend> is) mutable {
+      backend_info->backend_.reset(
+          is.release(),
+          BackendDeleter([this, model_name, version, backend_info]() mutable {
             LOG_VERBOSE(1) << "OnDestroy callback() '" << model_name
                            << "' version " << version;
             LOG_INFO << "successfully unloaded '" << model_name << "' version "
                      << version;
+            // Use recursive mutex as this deleter is likely to to be called
+            // within BackendLifeCycle class where the same mutex is being hold.
+            // However, mutex acquisition is needed here for the case where
+            // the backend is requested to be unloaded while there are inflight
+            // requests, then the deleter will be called from the request thread
             {
-              std::lock_guard<std::mutex> lock(backend_info->mtx_);
+              std::lock_guard<std::recursive_mutex> lock(backend_info->mtx_);
               backend_info->state_ = ModelReadyState::MODEL_UNAVAILABLE;
+              ModelReadyStateReason state_reason;
+              state_reason.set_message("unloaded");
+              status_manager_->SetModelVersionReadyState(
+                  model_name, version, backend_info->state_, state_reason);
               // Check if next action is requested
               this->TriggerNextAction(model_name, version, backend_info);
             }
-
-            // workaround for issue mentioned in ~BackendHandle()
-            {
-              std::lock_guard<std::mutex> lock(this->release_queue_mtx_);
-              this->release_queue_.emplace_back(std::move(is));
-            }
           }));
+      backend_info->state_ = ModelReadyState::MODEL_READY;
+      status_manager_->SetModelVersionReadyState(
+          model_name, version, backend_info->state_, ModelReadyStateReason());
       LOG_INFO << "successfully loaded '" << model_name << "' version "
                << version;
     } else {
       LOG_ERROR << "failed to load '" << model_name << "' version " << version
                 << ": " << status.AsString();
       backend_info->state_ = ModelReadyState::MODEL_UNAVAILABLE;
+      ModelReadyStateReason state_reason;
+      state_reason.set_message(status.AsString());
+      status_manager_->SetModelVersionReadyState(
+          model_name, version, backend_info->state_, state_reason);
     }
   }
 
@@ -786,39 +843,17 @@ ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle(
   return TriggerNextAction(model_name, version, backend_info);
 }
 
-Status
-ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
-    const std::string& model_name, const int64_t version,
-    BackendInfo* backend_info)
-{
-  LOG_VERBOSE(1) << "TriggerNextAction() '" << model_name << "' version "
-                 << version << ": "
-                 << std::to_string(backend_info->next_action_);
-  ActionType next_action = backend_info->next_action_;
-  backend_info->next_action_ = ActionType::NO_ACTION;
-  switch (next_action) {
-    case ActionType::LOAD:
-      Unload(model_name, version, backend_info);
-      RETURN_IF_ERROR(Load(model_name, version, backend_info));
-      break;
-    case ActionType::UNLOAD:
-      RETURN_IF_ERROR(Unload(model_name, version, backend_info));
-      break;
-    default:
-      break;
-  }
-
-  return Status::Success;
-}
-
 ModelRepositoryManager::ModelRepositoryManager(
     const std::shared_ptr<ServerStatusManager>& status_manager,
-    const std::string& repository_path,
+    const std::set<std::string>& repository_paths,
     const BackendConfigMap& backend_config_map, const bool autofill,
-    const bool polling_enabled, std::unique_ptr<BackendLifeCycle> life_cycle)
-    : repository_path_(repository_path),
+    const bool polling_enabled, const bool model_control_enabled,
+    std::unique_ptr<BackendLifeCycle> life_cycle)
+    : repository_paths_(repository_paths),
       backend_config_map_(backend_config_map), autofill_(autofill),
-      polling_enabled_(polling_enabled), status_manager_(status_manager),
+      polling_enabled_(polling_enabled),
+      model_control_enabled_(model_control_enabled),
+      status_manager_(status_manager),
       backend_life_cycle_(std::move(life_cycle))
 {
 }
@@ -827,141 +862,436 @@ ModelRepositoryManager::~ModelRepositoryManager() {}
 
 Status
 ModelRepositoryManager::Create(
-    const std::string& server_version,
+    InferenceServer* server, const std::string& server_version,
     const std::shared_ptr<ServerStatusManager>& status_manager,
-    const std::string& repository_path, const bool strict_model_config,
+    const std::set<std::string>& repository_paths,
+    const std::set<std::string>& startup_models, const bool strict_model_config,
     const float tf_gpu_memory_fraction, const bool tf_allow_soft_placement,
-    const uint32_t repository_poll_secs, const bool polling_enabled,
+    const std::map<int, std::pair<int, uint64_t>> tf_memory_limit_mb,
+    const bool polling_enabled, const bool model_control_enabled,
     std::unique_ptr<ModelRepositoryManager>* model_repository_manager)
 {
   // The rest only matters if repository path is valid directory
-  bool path_is_dir;
-  RETURN_IF_ERROR(IsDirectory(repository_path, &path_is_dir));
-  if (!path_is_dir) {
+  for (const auto& path : repository_paths) {
+    bool path_is_dir;
+    RETURN_IF_ERROR(IsDirectory(path, &path_is_dir));
+    if (!path_is_dir) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "repository path is not a valid directory");
+    }
+  }
+
+  if (polling_enabled && model_control_enabled) {
     return Status(
         RequestStatusCode::INVALID_ARG,
-        "repository path is not a valid directory");
+        "cannot enable both polling and explicit model control");
   }
 
   BackendConfigMap backend_config_map;
 
   BuildBackendConfigMap(
-      server_version, repository_path, strict_model_config,
-      tf_gpu_memory_fraction, tf_allow_soft_placement, &backend_config_map);
+      server_version, strict_model_config, tf_gpu_memory_fraction,
+      tf_allow_soft_placement, tf_memory_limit_mb, &backend_config_map);
 
   std::unique_ptr<BackendLifeCycle> life_cycle;
   RETURN_IF_ERROR(BackendLifeCycle::Create(
-      backend_config_map, repository_path, &life_cycle));
+      server, status_manager, backend_config_map, &life_cycle));
 
   // Not setting the smart pointer directly to simplify clean up
   std::unique_ptr<ModelRepositoryManager> local_manager(
       new ModelRepositoryManager(
-          status_manager, repository_path, backend_config_map,
-          !strict_model_config, polling_enabled, std::move(life_cycle)));
+          status_manager, repository_paths, backend_config_map,
+          !strict_model_config, polling_enabled, model_control_enabled,
+          std::move(life_cycle)));
 
-  // Similar to PollAndUpdate(), but simplier
-  std::set<std::string> added, deleted, modified, unmodified;
-  if (polling_enabled) {
-    RETURN_IF_ERROR(
-        local_manager->Poll(&added, &deleted, &modified, &unmodified));
-  }
-  if (!deleted.empty() || !modified.empty() || !unmodified.empty()) {
-    return Status(
-        RequestStatusCode::INTERNAL,
-        "Unexpected initial state for model repository");
-  }
-
-  Status status = Status::Success;
-  for (const auto& name : added) {
-    // If there is error on model loading, just report it and move to next model
-    Status update_status = local_manager->Update(name, true);
-    if (!update_status.IsOk()) {
-      LOG_ERROR << "failed to load model '" << name
-                << "': " << update_status.Message();
-      status = update_status;
-    }
+  bool all_models_polled = true;
+  if (!model_control_enabled) {
+    // only error happens before model load / unload will be return
+    // model loading / unloading error will be printed but ignored
+    RETURN_IF_ERROR(local_manager->PollAndUpdateInternal(&all_models_polled));
+  } else {
+    RETURN_IF_ERROR(local_manager->LoadUnloadModels(
+        startup_models, ActionType::LOAD, &all_models_polled));
   }
 
   *model_repository_manager = std::move(local_manager);
 
-  return status;
+  if (!all_models_polled) {
+    return Status(RequestStatusCode::INTERNAL, "failed to load all models");
+  }
+  // Some models may failed to be loaded after model manager is created,
+  // return proper error and let function caller decide whether to proceed.
+  for (const auto& model : (*model_repository_manager)->infos_) {
+    const auto version_states =
+        (*model_repository_manager)
+            ->backend_life_cycle_->GetVersionStates(model.first);
+    // Return general error message, detail of each model's loading state
+    // is logged separately.
+    if (version_states.empty()) {
+      return Status(RequestStatusCode::INTERNAL, "failed to load all models");
+    }
+    for (const auto& state : version_states) {
+      if (state.second != ModelReadyState::MODEL_READY) {
+        return Status(RequestStatusCode::INTERNAL, "failed to load all models");
+      }
+    }
+  }
+
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::GetModelRepositoryIndex(
+    ModelRepositoryIndex* repository_index)
+{
+  std::set<std::string> duplicated_models;
+  std::set<std::string> models;
+  for (const auto& repository_path : repository_paths_) {
+    std::set<std::string> subdirs;
+    RETURN_IF_ERROR(GetDirectorySubdirs(repository_path, &subdirs));
+
+    for (const auto& subdir : subdirs) {
+      if (!models.emplace(subdir).second) {
+        duplicated_models.insert(subdir);
+      }
+    }
+  }
+
+  // If the model is not unique, ignore it as the model can't be loaded anyway.
+  for (const auto& duplicated_model : duplicated_models) {
+    models.erase(duplicated_model);
+  }
+
+  repository_index->Clear();
+  for (const auto& model : models) {
+    auto entry = repository_index->add_models();
+    entry->set_name(model);
+  }
+
+  return Status::Success;
 }
 
 Status
 ModelRepositoryManager::PollAndUpdate()
 {
   if (!polling_enabled_) {
-    return Status(RequestStatusCode::INVALID, "polling is disabled");
+    return Status(RequestStatusCode::UNAVAILABLE, "polling is disabled");
   }
+
+  bool all_models_polled;
+  return PollAndUpdateInternal(&all_models_polled);
+}
+
+Status
+ModelRepositoryManager::PollAndUpdateInternal(bool* all_models_polled)
+{
+  // Serialize all operations that change model state
+  std::lock_guard<std::mutex> lock(poll_mu_);
+
   std::set<std::string> added, deleted, modified, unmodified;
-  RETURN_IF_ERROR(Poll(&added, &deleted, &modified, &unmodified));
+
+  // We don't modify 'infos_' in place to minimize how long we need to
+  // hold the lock and also prevent any partial changes to do an error
+  // during processing.
+  ModelInfoMap new_infos;
+
+  // Each subdirectory of repository path is a model directory from
+  // which we read the model configuration.
+  std::set<std::string> subdirs;
+  RETURN_IF_ERROR(Poll(
+      subdirs, &added, &deleted, &modified, &unmodified, &new_infos,
+      all_models_polled));
+
+  // Anything in 'infos_' that is not in "added", "modified", or
+  // "unmodified" is deleted.
+  for (const auto& pr : infos_) {
+    if ((added.find(pr.first) == added.end()) &&
+        (modified.find(pr.first) == modified.end()) &&
+        (unmodified.find(pr.first) == unmodified.end())) {
+      deleted.insert(pr.first);
+    }
+  }
+
   // Nothing to do if no model adds, deletes or modifies.
   if (added.empty() && deleted.empty() && modified.empty()) {
     return Status::Success;
   }
 
-  // Added models should be loaded
-  for (const auto& name : added) {
-    Status status = Update(name, true);
-    if (!status.IsOk()) {
-      LOG_ERROR << "failed to load model '" << name
-                << "': " << status.Message();
-    }
-  }
+  infos_.swap(new_infos);
 
-  // If there are any modified model, (re)load them to pick up
-  // the changes.
-  for (const auto& name : modified) {
-    Status status = Update(name, false);
-    if (!status.IsOk()) {
-      LOG_ERROR << "failed to reload model '" << name
-                << "': " << status.Message();
-    }
-  }
+  Update(added, deleted, modified);
 
   for (const auto& name : deleted) {
     ModelConfig model_config;
-    std::vector<int64_t> versions;
+    std::set<int64_t> versions;
+    std::string empty_path;
     // Utilize "force_unload" of AsyncLoad()
-    backend_life_cycle_->AsyncLoad(name, versions, model_config);
+    backend_life_cycle_->AsyncLoad(empty_path, name, versions, model_config);
+  }
+
+  // model loading / unloading error will be printed but ignored
+  LoadModelByDependency();
+
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::Update(
+    const std::set<std::string>& added, const std::set<std::string>& deleted,
+    const std::set<std::string>& modified)
+{
+  RETURN_IF_ERROR(UpdateDependencyGraph(added, deleted, modified));
+
+  // Added model should be initialized for status reporting. Otherwise,
+  // we want to keep the current status information so don't re-init it.
+  for (const auto& model_name : added) {
+    const auto& model_config =
+        dependency_graph_.find(model_name)->second->model_config_;
+    RETURN_IF_ERROR(status_manager_->InitForModel(model_name, model_config));
+  }
+  for (const auto& model_name : modified) {
+    const auto& model_config =
+        dependency_graph_.find(model_name)->second->model_config_;
+    RETURN_IF_ERROR(
+        status_manager_->UpdateConfigForModel(model_name, model_config));
   }
 
   return Status::Success;
 }
 
 Status
-ModelRepositoryManager::Update(const std::string& model_name, bool is_added)
+ModelRepositoryManager::LoadModelByDependency()
 {
-  ModelConfig model_config;
-  std::vector<int64_t> versions;
-  RETURN_IF_ERROR(GetModelConfig(model_name, &model_config));
-  // Added model should be initialized for status reporting. Otherwise,
-  // we want to keep the current status information so don't re-init it.
-  if (is_added) {
-    RETURN_IF_ERROR(status_manager_->InitForModel(model_name, model_config));
-  } else {
-    RETURN_IF_ERROR(
-        status_manager_->UpdateConfigForModel(model_name, model_config));
+  struct ModelState {
+    ModelState(DependencyNode* node) : node_(node) {}
+    DependencyNode* node_;
+    std::set<int64_t> loaded_versions_;
+    std::set<int64_t> unloaded_versions_;
+    std::mutex mtx_;
+    std::promise<void> ready_;
+  };
+  NodeSet loaded_models;
+  auto set_pair = ModelsToLoadUnload(loaded_models);
+  // Loop until all model are loaded / unloaded
+  while ((!set_pair.first.empty()) || (!set_pair.second.empty())) {
+    loaded_models.clear();
+    // Unload invalid models first
+    for (auto& invalid_model : set_pair.second) {
+      ModelConfig model_config;
+      std::set<int64_t> versions;
+      std::string empty_path;
+      // Utilize "force_unload" of AsyncLoad()
+      backend_life_cycle_->AsyncLoad(
+          empty_path, invalid_model->model_name_, versions, model_config);
+      LOG_ERROR << invalid_model->status_.AsString();
+      invalid_model->loaded_versions_ = std::set<int64_t>();
+      loaded_models.emplace(invalid_model);
+    }
+    // load valid models and wait for load results
+    std::vector<std::unique_ptr<ModelState>> model_states;
+    for (auto& valid_model : set_pair.first) {
+      std::string repository_path;
+      const auto itr = infos_.find(valid_model->model_name_);
+      repository_path = itr->second->model_repository_path_;
+
+      model_states.emplace_back(new ModelState(valid_model));
+      auto model_state = model_states.back().get();
+      std::set<int64_t> versions;
+      Status status;
+      status = VersionsToLoad(
+          repository_path, valid_model->model_name_, valid_model->model_config_,
+          &versions);
+      if (status.IsOk()) {
+        status = backend_life_cycle_->AsyncLoad(
+            repository_path, valid_model->model_name_, versions,
+            valid_model->model_config_, true,
+            [model_state](
+                int64_t version, ModelReadyState state,
+                size_t total_version_cnt) {
+              std::lock_guard<std::mutex> lk(model_state->mtx_);
+              if (state == ModelReadyState::MODEL_READY) {
+                model_state->loaded_versions_.emplace(version);
+              } else {
+                model_state->unloaded_versions_.emplace(version);
+              }
+              if ((model_state->loaded_versions_.size() +
+                   model_state->unloaded_versions_.size()) ==
+                  total_version_cnt) {
+                model_state->ready_.set_value();
+              }
+            });
+      }
+      if (!status.IsOk()) {
+        model_states.pop_back();
+        LOG_ERROR << "failed to load model '" << valid_model->model_name_
+                  << "': " << status.Message();
+        valid_model->status_ = status;
+        valid_model->loaded_versions_ = std::set<int64_t>();
+      }
+      loaded_models.emplace(valid_model);
+    }
+    for (auto& model_state : model_states) {
+      model_state->ready_.get_future().wait();
+      model_state->node_->loaded_versions_ = model_state->loaded_versions_;
+    }
+    set_pair = ModelsToLoadUnload(loaded_models);
   }
-  RETURN_IF_ERROR(VersionsToLoad(model_name, model_config, versions));
-  RETURN_IF_ERROR(
-      backend_life_cycle_->AsyncLoad(model_name, versions, model_config));
   return Status::Success;
 }
 
 Status
 ModelRepositoryManager::LoadUnloadModel(
-    const std::string& model_name, ActionType type,
-    std::function<void(Status)> OnCompleteUpdate)
+    const std::string& model_name, ActionType type)
 {
-  if (polling_enabled_) {
+  if (!model_control_enabled_) {
     return Status(
-        RequestStatusCode::INVALID,
+        RequestStatusCode::UNAVAILABLE,
         "explicit model load / unload is not allowed if polling is enabled");
   }
-  Status status = Status(RequestStatusCode::UNSUPPORTED, "not implemented");
-  OnCompleteUpdate(status);
-  return status;
+
+  // Serialize all operations that change model state
+  std::lock_guard<std::mutex> lock(poll_mu_);
+
+  bool polled = true;
+  RETURN_IF_ERROR(LoadUnloadModels({model_name}, type, &polled));
+
+  // Check if model is loaded / unloaded properly
+  const auto version_states = backend_life_cycle_->GetVersionStates(model_name);
+  if (type == ActionType::LOAD) {
+    if (version_states.empty()) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "failed to load '" + model_name + "', no version is available");
+    }
+    auto it = infos_.find(model_name);
+    if (it == infos_.end()) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "failed to load '" + model_name +
+              "', failed to poll from model repository");
+    }
+
+    const auto& info = it->second;
+    const auto& config = info->model_config_;
+    const auto& repository = info->model_repository_path_;
+    std::set<int64_t> expected_versions;
+    RETURN_IF_ERROR(
+        VersionsToLoad(repository, model_name, config, &expected_versions));
+
+    std::string not_ready_version_str;
+    for (const auto version : expected_versions) {
+      const auto it = version_states.find(version);
+      if ((it == version_states.end()) ||
+          (it->second != ModelReadyState::MODEL_READY)) {
+        not_ready_version_str += std::to_string(version);
+        not_ready_version_str += ",";
+      }
+    }
+    if (!not_ready_version_str.empty()) {
+      not_ready_version_str.pop_back();
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "failed to load '" + model_name +
+              "', versions that are not available: " + not_ready_version_str);
+    }
+  } else {
+    std::string ready_version_str;
+    for (const auto& version_state : version_states) {
+      if (version_state.second == ModelReadyState::MODEL_READY) {
+        ready_version_str += std::to_string(version_state.first);
+        ready_version_str += ",";
+      }
+    }
+    if (!ready_version_str.empty()) {
+      ready_version_str.pop_back();
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "failed to unload '" + model_name +
+              "', versions that are still available: " + ready_version_str);
+    }
+  }
+
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::LoadUnloadModels(
+    const std::set<std::string>& model_names, ActionType type,
+    bool* all_models_polled)
+{
+  *all_models_polled = true;
+  // Update ModelInfo related to file system accordingly
+  std::set<std::string> added, deleted, modified, unmodified;
+  {
+    if (type == ActionType::UNLOAD) {
+      for (const auto& model_name : model_names) {
+        deleted.insert(model_name);
+      }
+    } else {
+      std::set<std::string> checked_modes = model_names;
+      std::set<std::string> models = model_names;
+
+      ModelInfoMap new_infos;
+      while (!models.empty()) {
+        bool polled = true;
+        RETURN_IF_ERROR(Poll(
+            models, &added, &deleted, &modified, &unmodified, &new_infos,
+            &polled));
+        *all_models_polled &= polled;
+
+        // More models should be polled is the polled models are ensembles
+        std::set<std::string> next_models;
+        for (const auto& model : models) {
+          auto it = new_infos.find(model);
+          // Some models may be marked as deleted and not in 'new_infos'
+          if (it != new_infos.end()) {
+            const auto& config = it->second->model_config_;
+            if (config.has_ensemble_scheduling()) {
+              for (const auto& step : config.ensemble_scheduling().step()) {
+                bool need_poll =
+                    checked_modes.emplace(step.model_name()).second;
+                if (need_poll) {
+                  next_models.emplace(step.model_name());
+                }
+              }
+            }
+          }
+        }
+        models.swap(next_models);
+      }
+
+      // Only update the infos when all validation is completed
+      for (const auto& model_name : added) {
+        auto nitr = new_infos.find(model_name);
+        infos_.emplace(model_name, std::move(nitr->second));
+      }
+      for (const auto& model_name : modified) {
+        auto nitr = new_infos.find(model_name);
+        auto itr = infos_.find(model_name);
+        itr->second = std::move(nitr->second);
+      }
+    }
+  }
+  // The models are in 'deleted' either when they are asked to be unloaded or
+  // they are not found / are duplicated across all model repositories.
+  // In all cases, should unload them and remove from 'infos_' explicitly.
+  for (const auto& name : deleted) {
+    infos_.erase(name);
+    ModelConfig model_config;
+    std::set<int64_t> versions;
+    std::string empty_path;
+    // Utilize "force_unload" of AsyncLoad()
+    backend_life_cycle_->AsyncLoad(empty_path, name, versions, model_config);
+  }
+
+  // Update dependency graph and load
+  Update(added, deleted, modified);
+
+  // model loading / unloading error will be printed but ignored
+  LoadModelByDependency();
+
+  return Status::Success;
 }
 
 Status
@@ -970,10 +1300,11 @@ ModelRepositoryManager::UnloadAllModels()
   Status status;
   // Reload an empty version list to cause the model to unload.
   ModelConfig model_config;
-  std::vector<int64_t> versions;
+  std::set<int64_t> versions;
+  std::string empty_path;
   for (const auto& name_info : infos_) {
-    Status unload_status =
-        backend_life_cycle_->AsyncLoad(name_info.first, versions, model_config);
+    Status unload_status = backend_life_cycle_->AsyncLoad(
+        empty_path, name_info.first, versions, model_config);
     if (!unload_status.IsOk()) {
       status = Status(
           RequestStatusCode::INTERNAL,
@@ -989,21 +1320,15 @@ ModelRepositoryManager::GetLiveBackendStates()
   return backend_life_cycle_->GetLiveBackendStates();
 }
 
-const ModelRepositoryManager::VersionStateMap
-ModelRepositoryManager::GetVersionStates(const std::string& model_name)
-{
-  return backend_life_cycle_->GetVersionStates(model_name);
-}
-
 Status
-ModelRepositoryManager::GetBackendHandle(
+ModelRepositoryManager::GetInferenceBackend(
     const std::string& model_name, const int64_t model_version,
-    std::shared_ptr<BackendHandle>* handle)
+    std::shared_ptr<InferenceBackend>* backend)
 {
-  Status status =
-      backend_life_cycle_->GetBackendHandle(model_name, model_version, handle);
+  Status status = backend_life_cycle_->GetInferenceBackend(
+      model_name, model_version, backend);
   if (!status.IsOk()) {
-    handle->reset();
+    backend->reset();
     status = Status(
         RequestStatusCode::UNAVAILABLE,
         "Inference request for unknown model '" + model_name + "'");
@@ -1013,123 +1338,331 @@ ModelRepositoryManager::GetBackendHandle(
 
 Status
 ModelRepositoryManager::Poll(
-    std::set<std::string>* added, std::set<std::string>* deleted,
-    std::set<std::string>* modified, std::set<std::string>* unmodified)
+    const std::set<std::string>& models, std::set<std::string>* added,
+    std::set<std::string>* deleted, std::set<std::string>* modified,
+    std::set<std::string>* unmodified, ModelInfoMap* updated_infos,
+    bool* all_models_polled)
 {
-  // Serialize all polling operation...
-  std::lock_guard<std::mutex> lock(poll_mu_);
+  *all_models_polled = true;
+  std::map<std::string, std::string> model_to_repository;
 
-  added->clear();
-  deleted->clear();
-  modified->clear();
-  unmodified->clear();
+  // If no model is specified, poll all models in all model repositories.
+  // Otherwise, only poll the specified models
+  if (models.empty()) {
+    std::set<std::string> duplicated_models;
+    for (const auto& repository_path : repository_paths_) {
+      std::set<std::string> subdirs;
+      Status status = GetDirectorySubdirs(repository_path, &subdirs);
+      if (!status.IsOk()) {
+        LOG_ERROR << "failed to poll model repository '" << repository_path
+                  << "': " << status.Message();
+        *all_models_polled = false;
+      } else {
+        for (const auto& subdir : subdirs) {
+          if (!model_to_repository.emplace(subdir, repository_path).second) {
+            duplicated_models.insert(subdir);
+            *all_models_polled = false;
+          }
+        }
+      }
+    }
+    // If the model is not unique, mark as deleted to unload it
+    for (const auto& model : duplicated_models) {
+      model_to_repository.erase(model);
+      deleted->insert(model);
+      LOG_ERROR << "failed to poll model '" << model
+                << "': not unique across all model repositories";
+    }
+  } else {
+    for (const auto& model : models) {
+      bool exists = false;
+      for (const auto repository_path : repository_paths_) {
+        bool exists_in_this_repo = false;
+        const auto full_path = JoinPath({repository_path, model});
+        Status status = FileExists(full_path, &exists_in_this_repo);
+        if (!status.IsOk()) {
+          LOG_ERROR << "failed to poll model repository '" << repository_path
+                    << "' for model '" << model << "': " << status.Message();
+          *all_models_polled = false;
+        } else if (exists_in_this_repo) {
+          auto res = model_to_repository.emplace(model, repository_path);
+          if (res.second) {
+            exists = true;
+          } else {
+            exists = false;
+            model_to_repository.erase(res.first);
+            LOG_ERROR << "failed to poll model '" << model
+                      << "': not unique across all model repositories";
+            *all_models_polled = false;
+            break;
+          }
+        }
+      }
+      if (!exists) {
+        deleted->insert(model);
+      }
+    }
+  }
 
-  // We don't modify 'infos_' in place to minimize how long we need to
-  // hold the lock and also prevent any partial changes to do an error
-  // during processing.
-  ModelInfoMap new_infos;
+  // State of the model in terms of polling. If error happens during polling
+  // an individual model, its state will fallback to different states to be
+  // ignored from the polling. i.e. STATE_ADDED -> STATE_INVALID,
+  // STATE_MODIFIED -> STATE_UNMODIFIED.
+  enum ModelPollState {
+    STATE_ADDED,
+    STATE_MODIFIED,
+    STATE_UNMODIFIED,
+    STATE_INVALID
+  };
 
-  // Each subdirectory of repository path is a model directory from
-  // which we read the model configuration.
-  std::set<std::string> subdirs;
-  RETURN_IF_ERROR(GetDirectorySubdirs(repository_path_, &subdirs));
+  for (const auto& pair : model_to_repository) {
+    const auto& child = pair.first;
+    const auto& repository = pair.second;
 
-  for (const auto& child : subdirs) {
-    const auto full_path = JoinPath({repository_path_, child});
+    auto model_poll_state = STATE_UNMODIFIED;
+    const auto full_path = JoinPath({repository, child});
 
+
+    std::unique_ptr<ModelInfo> model_info;
+    const auto iitr = infos_.find(child);
     // If 'child' is a new model or an existing model that has been
     // modified since the last time it was polled, then need to
     // (re)load, normalize and validate the configuration.
-    bool need_load = false;
     int64_t mtime_ns;
-    const auto iitr = infos_.find(child);
     if (iitr == infos_.end()) {
-      added->insert(child);
       mtime_ns = GetModifiedTime(std::string(full_path));
-      need_load = true;
+      model_poll_state = STATE_ADDED;
     } else {
       mtime_ns = iitr->second->mtime_nsec_;
       if (IsModified(std::string(full_path), &mtime_ns)) {
-        modified->insert(child);
-        need_load = true;
-      } else {
-        unmodified->insert(child);
-        const auto& ret = new_infos.emplace(child, nullptr);
-        if (!ret.second) {
-          return Status(
-              RequestStatusCode::ALREADY_EXISTS,
-              "unexpected model info for model '" + child + "'");
-        }
-
-        std::unique_ptr<ModelInfo>& model_info = ret.first->second;
-        model_info.reset(new ModelInfo(*iitr->second));
+        model_poll_state = STATE_MODIFIED;
       }
     }
 
-    if (need_load) {
-      const auto& ret = new_infos.emplace(child, nullptr);
+    Status status = Status::Success;
+    if (model_poll_state != STATE_UNMODIFIED) {
+      model_info.reset(new ModelInfo());
+      ModelConfig& model_config = model_info->model_config_;
+      model_info->mtime_nsec_ = mtime_ns;
+      model_info->model_repository_path_ = repository;
+
+      // If enabled, try to automatically generate missing parts of
+      // the model configuration (autofill) from the model
+      // definition. In all cases normalize and validate the config.
+      status = GetNormalizedModelConfig(
+          full_path, backend_config_map_, autofill_, &model_config);
+      if (status.IsOk()) {
+        status = ValidateModelConfig(model_config, std::string());
+      }
+      if (status.IsOk()) {
+        model_info->platform_ = GetPlatform(model_config.platform());
+
+        // Make sure the name of the model matches the name of the
+        // directory. This is a somewhat arbitrary requirement but seems
+        // like good practice to require it of the user. It also acts as a
+        // check to make sure we don't have two different models with the
+        // same name.
+        if (model_config.name() != child) {
+          status = Status(
+              RequestStatusCode::INVALID_ARG,
+              "unexpected directory name '" + child + "' for model '" +
+                  model_config.name() +
+                  "', directory name must equal model name");
+        }
+      }
+
+      if (!status.IsOk()) {
+        if (model_poll_state == STATE_MODIFIED) {
+          model_poll_state = STATE_UNMODIFIED;
+        } else {
+          model_poll_state = STATE_INVALID;
+        }
+      }
+    }
+
+    if (model_poll_state != STATE_INVALID) {
+      const auto& ret = updated_infos->emplace(child, nullptr);
       if (!ret.second) {
         return Status(
             RequestStatusCode::ALREADY_EXISTS,
             "unexpected model info for model '" + child + "'");
       }
 
-      std::unique_ptr<ModelInfo>& model_info = ret.first->second;
-      model_info.reset(new ModelInfo());
-      ModelConfig& model_config = model_info->model_config_;
-      model_info->mtime_nsec_ = mtime_ns;
-
-      // If enabled, try to automatically generate missing parts of
-      // the model configuration (autofill) from the model
-      // definition. In all cases normalize and validate the config.
-      RETURN_IF_ERROR(GetNormalizedModelConfig(
-          full_path, backend_config_map_, autofill_, &model_config));
-      RETURN_IF_ERROR(ValidateModelConfig(model_config, std::string()));
-
-      model_info->platform_ = GetPlatform(model_config.platform());
-
-      // Make sure the name of the model matches the name of the
-      // directory. This is a somewhat arbitrary requirement but seems
-      // like good practice to require it of the user. It also acts as a
-      // check to make sure we don't have two different models with the
-      // same name.
-      if (model_config.name() != child) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "unexpected directory name '" + child + "' for model '" +
-                model_config.name() +
-                "', directory name must equal model name");
+      if (model_poll_state == STATE_UNMODIFIED) {
+        ret.first->second.reset(new ModelInfo(*iitr->second));
+        unmodified->insert(child);
+      } else {
+        ret.first->second = std::move(model_info);
+        if (model_poll_state == STATE_ADDED) {
+          added->insert(child);
+        } else {
+          modified->insert(child);
+        }
       }
     }
-  }
 
-  // Anything in 'infos_' that is not in "added", "modified", or
-  // "unmodified" is deleted.
-  for (const auto& pr : infos_) {
-    if ((added->find(pr.first) == added->end()) &&
-        (modified->find(pr.first) == modified->end()) &&
-        (unmodified->find(pr.first) == unmodified->end())) {
-      deleted->insert(pr.first);
+    if (!status.IsOk()) {
+      LOG_ERROR << status.Message();
+      *all_models_polled = false;
     }
-  }
-
-  // Swap the new infos in place under a short-lived lock and only if
-  // there were no errors encountered during polling.
-  {
-    std::lock_guard<std::mutex> lock(infos_mu_);
-    infos_.swap(new_infos);
   }
 
   return Status::Success;
 }
 
+Status
+ModelRepositoryManager::UpdateDependencyGraph(
+    const std::set<std::string>& added, const std::set<std::string>& deleted,
+    const std::set<std::string>& modified)
+{
+  // update dependency graph, if the state of a node is changed, all its
+  // downstreams will be affected
+
+  // deleted, drop from dependency_graph, add to missing_nodes if downstreams is
+  // not empty affected_nodes are all ensembles as only ensembles are depending
+  // on other models
+  std::set<DependencyNode*> affected_nodes;
+  std::set<DependencyNode*> updated_nodes;
+  for (const auto& model_name : deleted) {
+    auto it = dependency_graph_.find(model_name);
+    if (it != dependency_graph_.end()) {
+      // remove this node from its upstreams
+      for (auto& upstream : it->second->upstreams_) {
+        upstream.first->downstreams_.erase(it->second.get());
+      }
+      it->second->upstreams_.clear();
+
+      if (!it->second->downstreams_.empty()) {
+        UncheckDownstream(&it->second->downstreams_, &affected_nodes);
+        // mark this node as missing upstream in its downstreams
+        for (auto& downstream : it->second->downstreams_) {
+          downstream->missing_upstreams_.emplace(it->second.get());
+        }
+        missing_nodes_.emplace(
+            std::make_pair(model_name, std::move(it->second)));
+      }
+
+      // Make sure deleted node will not be in affected nodes
+      affected_nodes.erase(it->second.get());
+      dependency_graph_.erase(it);
+    }
+  }
+
+  // modified, invalidate (uncheck) all downstreams
+  for (const auto& model_name : modified) {
+    auto it = dependency_graph_.find(model_name);
+    if (it != dependency_graph_.end()) {
+      UncheckDownstream(&it->second->downstreams_, &affected_nodes);
+      GetModelConfig(model_name, &it->second->model_config_);
+      // remove this node from its upstream node
+      for (auto& upstream : it->second->upstreams_) {
+        upstream.first->downstreams_.erase(it->second.get());
+      }
+      it->second->upstreams_.clear();
+      it->second->checked_ = false;
+      it->second->status_ = Status::Success;
+      updated_nodes.emplace(it->second.get());
+    }
+  }
+
+  // added, add to dependency_graph, if in missing_node, invalidate (uncheck)
+  // and associate all downstreams, remove from missing_node
+  for (const auto& model_name : added) {
+    std::unique_ptr<DependencyNode> added_node;
+    auto it = missing_nodes_.find(model_name);
+    if (it != missing_nodes_.end()) {
+      UncheckDownstream(&it->second->downstreams_, &affected_nodes);
+      // remove this node from missing upstream node in its downstream nodes
+      for (auto& downstream : it->second->downstreams_) {
+        downstream->missing_upstreams_.erase(it->second.get());
+      }
+
+      it->second->checked_ = false;
+      added_node = std::move(it->second);
+      missing_nodes_.erase(it);
+    } else {
+      // Right now, nothing is going to be filled until validation
+      added_node.reset(new DependencyNode(model_name));
+    }
+    GetModelConfig(model_name, &added_node->model_config_);
+    updated_nodes.emplace(added_node.get());
+    dependency_graph_.emplace(
+        std::make_pair(model_name, std::move(added_node)));
+  }
+
+  auto& affected_ensembles = affected_nodes;
+  for (auto& updated_node : updated_nodes) {
+    bool is_ensemble = ConnectDependencyGraph(updated_node);
+    if (is_ensemble) {
+      affected_ensembles.emplace(updated_node);
+    }
+  }
+
+  ValidateEnsembleConfig(&affected_ensembles);
+
+  return Status::Success;
+}
+
+void
+ModelRepositoryManager::UncheckDownstream(
+    NodeSet* downstreams, NodeSet* updated_nodes)
+{
+  // Mark downstream nodes as unchecked recursively
+  for (auto& node : *downstreams) {
+    if (node->checked_) {
+      node->checked_ = false;
+      node->status_ = Status::Success;
+      UncheckDownstream(&node->downstreams_, updated_nodes);
+      updated_nodes->emplace(node);
+    }
+  }
+}
+
+bool
+ModelRepositoryManager::ConnectDependencyGraph(DependencyNode* updated_node)
+{
+  // Check the node's model config to determine if it depends on other models
+  // and if those models are present
+  updated_node->upstreams_.clear();
+  updated_node->missing_upstreams_.clear();
+  if (updated_node->model_config_.has_ensemble_scheduling()) {
+    for (const auto& step :
+         updated_node->model_config_.ensemble_scheduling().step()) {
+      DependencyNode* upstream_node = nullptr;
+      const auto& model_name = step.model_name();
+      auto dit = dependency_graph_.find(model_name);
+      if (dit == dependency_graph_.end()) {
+        auto mit = missing_nodes_.find(model_name);
+        if (mit == missing_nodes_.end()) {
+          std::unique_ptr<DependencyNode> node(new DependencyNode(model_name));
+          updated_node->missing_upstreams_.emplace(node.get());
+          mit = missing_nodes_.emplace(model_name, std::move(node)).first;
+        }
+        // Add the node to missing node's downstream so that when the missing
+        // node is added, the downstreams can be found easily.
+        mit->second->downstreams_.emplace(updated_node);
+        upstream_node = mit->second.get();
+      } else {
+        dit->second->downstreams_.emplace(updated_node);
+        upstream_node = dit->second.get();
+      }
+      auto res = updated_node->upstreams_.emplace(
+          upstream_node, std::set<int64_t>({step.model_version()}));
+      // If map insertion doesn't happen, the same model is required in
+      // different step, insert the version to existing required version set.
+      if (!res.second) {
+        res.first->second.insert(step.model_version());
+      }
+    }
+    return true;
+  }
+  return false;
+}
 
 Status
 ModelRepositoryManager::GetModelConfig(
     const std::string& name, ModelConfig* model_config)
 {
-  std::lock_guard<std::mutex> lock(infos_mu_);
-
   const auto itr = infos_.find(name);
   if (itr == infos_.end()) {
     return Status(
@@ -1141,19 +1674,118 @@ ModelRepositoryManager::GetModelConfig(
   return Status::Success;
 }
 
+std::pair<ModelRepositoryManager::NodeSet, ModelRepositoryManager::NodeSet>
+ModelRepositoryManager::ModelsToLoadUnload(const NodeSet& loaded_models)
+{
+  // <valid model set, invalid model set>
+  std::pair<NodeSet, NodeSet> res;
+  // first call to this function
+  if (loaded_models.empty()) {
+    for (auto& pair : dependency_graph_) {
+      auto node = pair.second.get();
+      // only care about nodes that are affected by the update
+      if (!node->checked_) {
+        if (CheckNode(node)) {
+          if (node->status_.IsOk()) {
+            res.first.emplace(node);
+          } else {
+            res.second.emplace(node);
+          }
+        }
+      }
+    }
+  } else {
+    for (const auto& model : loaded_models) {
+      for (auto node : model->downstreams_) {
+        // only care about nodes that are affected by the update
+        if (!node->checked_) {
+          if (CheckNode(node)) {
+            if (node->status_.IsOk()) {
+              res.first.emplace(node);
+            } else {
+              res.second.emplace(node);
+            }
+          }
+        }
+      }
+    }
+  }
+  for (auto& node : res.first) {
+    node->checked_ = true;
+  }
+  for (auto& node : res.second) {
+    node->checked_ = true;
+  }
+  return res;
+}
+
+bool
+ModelRepositoryManager::CheckNode(DependencyNode* node)
+{
+  bool node_ready = true;
+  // if the node failed on validation, mark as ready as we know
+  // it should not be loaded
+  if (node->status_.IsOk()) {
+    for (auto& upstream : node->upstreams_) {
+      if (!upstream.first->checked_) {
+        node_ready = false;
+        break;
+      }
+      if (!upstream.first->status_.IsOk()) {
+        node->status_ = Status(
+            RequestStatusCode::INVALID_ARG,
+            "ensemble '" + node->model_name_ + "' depends on '" +
+                upstream.first->model_name_ + "' which is not valid");
+      } else if (upstream.first->loaded_versions_.empty()) {
+        node->status_ = Status(
+            RequestStatusCode::INVALID_ARG,
+            "ensemble '" + node->model_name_ + "' depends on '" +
+                upstream.first->model_name_ + "' which has no loaded version");
+      } else {
+        for (const auto& required_version : upstream.second) {
+          if (required_version == -1) {
+            continue;
+          }
+
+          auto it = upstream.first->loaded_versions_.find(required_version);
+          if (it == upstream.first->loaded_versions_.end()) {
+            node->status_ = Status(
+                RequestStatusCode::INVALID_ARG,
+                "ensemble '" + node->model_name_ + "' depends on '" +
+                    upstream.first->model_name_ + "' whose required version " +
+                    std::to_string(required_version) + " is not loaded");
+          }
+        }
+      }
+      if (!node->status_.IsOk()) {
+        break;
+      }
+    }
+  }
+  return node_ready;
+}
+
 Status
 ModelRepositoryManager::VersionsToLoad(
-    const std::string& name, const ModelConfig& model_config,
-    std::vector<int64_t>& versions)
+    const std::string model_repository_path, const std::string& name,
+    const ModelConfig& model_config, std::set<int64_t>* versions)
 {
-  versions.clear();
+  versions->clear();
 
   // Get integral number of the version directory
-  const auto model_path = JoinPath({repository_path_, name});
+  const auto model_path = JoinPath({model_repository_path, name});
   std::set<std::string> subdirs;
   RETURN_IF_ERROR(GetDirectorySubdirs(model_path, &subdirs));
   std::set<int64_t, std::greater<int64_t>> existing_versions;
   for (const auto& subdir : subdirs) {
+    if (subdir == kWarmupDataFolder) {
+      continue;
+    }
+    if ((subdir.length() > 1) && (subdir.front() == '0')) {
+      LOG_WARNING << "ignore version directory '" << subdir
+                  << "' which contains leading zeros in its directory name";
+      continue;
+    }
     try {
       int64_t version = std::stoll(subdir);
       existing_versions.insert(version);
@@ -1169,7 +1801,7 @@ ModelRepositoryManager::VersionsToLoad(
       // Only load the specific versions that are presented in model directory
       bool version_not_exist = existing_versions.insert(v).second;
       if (!version_not_exist) {
-        versions.push_back(v);
+        versions->emplace(v);
       } else {
         LOG_ERROR << "version " << v << " is specified for model '" << name
                   << "', but the version directory is not present";
@@ -1179,19 +1811,19 @@ ModelRepositoryManager::VersionsToLoad(
     if (model_config.version_policy().has_latest()) {
       // std::set is sorted with std::greater
       for (const auto& v : existing_versions) {
-        if (versions.size() >=
+        if (versions->size() >=
             model_config.version_policy().latest().num_versions()) {
           break;
         }
-        versions.push_back(v);
+        versions->emplace(v);
       }
     } else {
       // all
-      versions.assign(existing_versions.begin(), existing_versions.end());
+      versions->insert(existing_versions.begin(), existing_versions.end());
     }
   }
 
-  if (versions.empty()) {
+  if (versions->empty()) {
     return Status(
         RequestStatusCode::INVALID_ARG,
         "at least one version must be available under the version policy of "

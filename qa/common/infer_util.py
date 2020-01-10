@@ -25,16 +25,22 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import sys
+import os
 import numpy as np
 from tensorrtserver.api import *
+import tensorrtserver.shared_memory as shm
+import tensorrtserver.cuda_shared_memory as cudashm
 import test_util as tu
+import shm_util as su
+from sets import Set
+from ctypes import *
 
 # unicode() doesn't exist on python3, for how we use it the
 # corresponding function is bytes()
 if sys.version_info.major == 3:
     unicode = bytes
 
-_last_request_id = 0
+_seen_request_ids = Set()
 
 def _range_repr_dtype(dtype):
     if dtype == np.float64:
@@ -47,6 +53,12 @@ def _range_repr_dtype(dtype):
         return np.int32
     return dtype
 
+def _prepend_string_size(input_values):
+    input_list = []
+    for input_value in input_values:
+        input_list.append(serialize_string_tensor(input_value))
+    return input_list
+
 # Perform inference using an "addsum" type verification backend.
 def infer_exact(tester, pf, tensor_shape, batch_size,
                 input_dtype, output0_dtype, output1_dtype,
@@ -54,7 +66,8 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
                 model_version=None, swap=False,
                 outputs=("OUTPUT0", "OUTPUT1"), use_http=True, use_grpc=True,
                 skip_request_id_check=False, use_streaming=True,
-                correlation_id=0):
+                correlation_id=0, shm_region_names=None, precreated_shm_regions=None,
+                use_system_shared_memory=False, use_cuda_shared_memory=False):
     tester.assertTrue(use_http or use_grpc or use_streaming)
     configs = []
     if use_http:
@@ -64,70 +77,101 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
     if use_streaming:
         configs.append(("localhost:8001", ProtocolType.GRPC, True))
 
+    # outputs are sum and difference of inputs so set max input
+    # values so that they will not overflow the output. This
+    # allows us to do an exact match. For float types use 8, 16,
+    # 32 int range for fp 16, 32, 64 respectively. When getting
+    # class outputs the result value/probability is returned as a
+    # float so must use fp32 range in that case.
+    rinput_dtype = _range_repr_dtype(input_dtype)
+    routput0_dtype = _range_repr_dtype(output0_dtype if output0_raw else np.float32)
+    routput1_dtype = _range_repr_dtype(output1_dtype if output1_raw else np.float32)
+    val_min = max(np.iinfo(rinput_dtype).min,
+                np.iinfo(routput0_dtype).min,
+                np.iinfo(routput1_dtype).min) / 2
+    val_max = min(np.iinfo(rinput_dtype).max,
+                np.iinfo(routput0_dtype).max,
+                np.iinfo(routput1_dtype).max) / 2
+
+    num_classes = 3
+
+    input0_list = list()
+    input1_list = list()
+    expected0_list = list()
+    expected1_list = list()
+    expected0_val_list = list()
+    expected1_val_list = list()
+    for b in range(batch_size):
+        in0 = np.random.randint(low=val_min, high=val_max,
+                                size=tensor_shape, dtype=rinput_dtype)
+        in1 = np.random.randint(low=val_min, high=val_max,
+                                size=tensor_shape, dtype=rinput_dtype)
+        if input_dtype != np.object:
+            in0 = in0.astype(input_dtype)
+            in1 = in1.astype(input_dtype)
+
+        if not swap:
+            op0 = in0 + in1
+            op1 = in0 - in1
+        else:
+            op0 = in0 - in1
+            op1 = in0 + in1
+
+        expected0_val_list.append(op0)
+        expected1_val_list.append(op1)
+        if output0_dtype == np.object:
+            expected0_list.append(np.array([unicode(str(x), encoding='utf-8')
+                                            for x in (op0.flatten())], dtype=object).reshape(op0.shape))
+        else:
+            expected0_list.append(op0.astype(output0_dtype))
+        if output1_dtype == np.object:
+            expected1_list.append(np.array([unicode(str(x), encoding='utf-8')
+                                            for x in (op1.flatten())], dtype=object).reshape(op1.shape))
+        else:
+            expected1_list.append(op1.astype(output1_dtype))
+
+        if input_dtype == np.object:
+            in0n = np.array([str(x) for x in in0.reshape(in0.size)], dtype=object)
+            in0 = in0n.reshape(in0.shape)
+            in1n = np.array([str(x) for x in in1.reshape(in1.size)], dtype=object)
+            in1 = in1n.reshape(in1.shape)
+
+        input0_list.append(in0)
+        input1_list.append(in1)
+
+    # prepend size of string to string input string data
+    if input_dtype == np.object:
+        input0_list_tmp = _prepend_string_size(input0_list)
+        input1_list_tmp = _prepend_string_size(input1_list)
+    else:
+        input0_list_tmp = input0_list
+        input1_list_tmp = input1_list
+
+    input0_byte_size = sum([i0.nbytes for i0 in input0_list])
+    input1_byte_size = sum([i1.nbytes for i1 in input1_list])
+
+    if output0_dtype == np.object:
+        expected0_list_tmp = _prepend_string_size(expected0_list)
+    else:
+        expected0_list_tmp = expected0_list
+
+    if output1_dtype == np.object:
+        expected1_list_tmp = _prepend_string_size(expected1_list)
+    else:
+        expected1_list_tmp = expected1_list
+
+    # Create and register system/cuda shared memory regions if needed
+    shm_handles = su.create_register_set_shm_regions(input0_list_tmp, input1_list_tmp, expected0_list_tmp,
+                                    expected1_list_tmp, outputs, shm_region_names, precreated_shm_regions,
+                                    use_system_shared_memory, use_cuda_shared_memory)
+
+    # Run inference and check results for each config
     for config in configs:
         model_name = tu.get_model_name(pf, input_dtype, output0_dtype, output1_dtype)
 
-        # outputs are sum and difference of inputs so set max input
-        # values so that they will not overflow the output. This
-        # allows us to do an exact match. For float types use 8, 16,
-        # 32 int range for fp 16, 32, 64 respectively. When getting
-        # class outputs the result value/probability is returned as a
-        # float so must use fp32 range in that case.
-        rinput_dtype = _range_repr_dtype(input_dtype)
-        routput0_dtype = _range_repr_dtype(output0_dtype if output0_raw else np.float32)
-        routput1_dtype = _range_repr_dtype(output1_dtype if output1_raw else np.float32)
-        val_min = max(np.iinfo(rinput_dtype).min,
-                    np.iinfo(routput0_dtype).min,
-                    np.iinfo(routput1_dtype).min) / 2
-        val_max = min(np.iinfo(rinput_dtype).max,
-                    np.iinfo(routput0_dtype).max,
-                    np.iinfo(routput1_dtype).max) / 2
-
-        num_classes = 3
-
-        input0_list = list()
-        input1_list = list()
-        expected0_list = list()
-        expected1_list = list()
-        expected0_val_list = list()
-        expected1_val_list = list()
-        for b in range(batch_size):
-            in0 = np.random.randint(low=val_min, high=val_max,
-                                    size=tensor_shape, dtype=rinput_dtype)
-            in1 = np.random.randint(low=val_min, high=val_max,
-                                    size=tensor_shape, dtype=rinput_dtype)
-            if input_dtype != np.object:
-                in0 = in0.astype(input_dtype)
-                in1 = in1.astype(input_dtype)
-
-            if not swap:
-                op0 = in0 + in1
-                op1 = in0 - in1
-            else:
-                op0 = in0 - in1
-                op1 = in0 + in1
-
-            expected0_val_list.append(op0)
-            expected1_val_list.append(op1)
-            if output0_dtype == np.object:
-                expected0_list.append(np.array([unicode(str(x), encoding='utf-8')
-                                                for x in (op0.flatten())], dtype=object).reshape(op1.shape))
-            else:
-                expected0_list.append(op0)
-            if output1_dtype == np.object:
-                expected1_list.append(np.array([unicode(str(x), encoding='utf-8')
-                                                for x in (op1.flatten())], dtype=object).reshape(op1.shape))
-            else:
-                expected1_list.append(op1)
-
-            if input_dtype == np.object:
-                in0n = np.array([str(x) for x in in0.reshape(in0.size)], dtype=object)
-                in0 = in0n.reshape(in0.shape)
-                in1n = np.array([str(x) for x in in1.reshape(in1.size)], dtype=object)
-                in1 = in1n.reshape(in1.shape)
-
-            input0_list.append(in0)
-            input1_list.append(in1)
+        ctx = InferContext(config[0], config[1], model_name, model_version,
+                       correlation_id=correlation_id, streaming=config[2],
+                       verbose=True)
 
         expected0_sort_idx = [ np.flip(np.argsort(x.flatten()), 0) for x in expected0_val_list ]
         expected1_sort_idx = [ np.flip(np.argsort(x.flatten()), 0) for x in expected1_val_list ]
@@ -142,31 +186,41 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
             OUTPUT1 = "OUTPUT__1"
             INPUT0 = "INPUT__0"
             INPUT1 = "INPUT__1"
+        i=0
         if "OUTPUT0" in outputs:
-            if output0_raw:
-                output_req[OUTPUT0] = InferContext.ResultFormat.RAW
+            if len(shm_handles) != 0:
+                output_req[OUTPUT0] = (InferContext.ResultFormat.RAW, shm_handles[2])
             else:
-                output_req[OUTPUT0] = (InferContext.ResultFormat.CLASS, num_classes)
+                if output0_raw:
+                    output_req[OUTPUT0] = InferContext.ResultFormat.RAW
+                else:
+                    output_req[OUTPUT0] = (InferContext.ResultFormat.CLASS, num_classes)
+            i+=1
         if "OUTPUT1" in outputs:
-            if output1_raw:
-                output_req[OUTPUT1] = InferContext.ResultFormat.RAW
+            if len(shm_handles) != 0:
+                output_req[OUTPUT1] = (InferContext.ResultFormat.RAW, shm_handles[2+i])
             else:
-                output_req[OUTPUT1] = (InferContext.ResultFormat.CLASS, num_classes)
+                if output1_raw:
+                    output_req[OUTPUT1] = InferContext.ResultFormat.RAW
+                else:
+                    output_req[OUTPUT1] = (InferContext.ResultFormat.CLASS, num_classes)
 
-
-        ctx = InferContext(config[0], config[1], model_name, model_version,
-                           correlation_id=correlation_id, streaming=config[2],
-                           verbose=True)
-        results = ctx.run(
-                { INPUT0 : input0_list, INPUT1 : input1_list },
-                output_req, batch_size)
+        if len(shm_handles) != 0:
+            results = ctx.run(
+                    { INPUT0 : (shm_handles[0], tensor_shape),
+                    INPUT1 : (shm_handles[1], tensor_shape) },
+                    output_req, batch_size)
+        else:
+            results = ctx.run(
+                    { INPUT0 : input0_list, INPUT1 : input1_list },
+                    output_req, batch_size)
 
         if not skip_request_id_check:
-            global _last_request_id
-            min_request_id = _last_request_id + 1
+            global _seen_request_ids
             request_id = ctx.get_last_request_id()
-            _last_request_id = request_id
-            tester.assertGreaterEqual(request_id, min_request_id)
+            tester.assertFalse(request_id in _seen_request_ids,
+                               "request_id: {}".format(request_id))
+            _seen_request_ids.add(request_id)
 
         tester.assertEqual(ctx.get_last_request_model_name(), model_name)
         if model_version is not None:
@@ -179,12 +233,12 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
                     (result_name == OUTPUT1 and output1_raw)):
                     if result_name == OUTPUT0:
                         tester.assertTrue(np.array_equal(result_val[b], expected0_list[b]),
-                                        "{}, "+OUTPUT0+" expected: {}, got {}".format(
-                                            model_name, expected0_list[b], result_val[b]))
+                                        "{}, {} expected: {}, got {}".format(
+                                            model_name, OUTPUT0, expected0_list[b], result_val[b]))
                     elif result_name == OUTPUT1:
                         tester.assertTrue(np.array_equal(result_val[b], expected1_list[b]),
-                                        "{}, "+OUTPUT1+" expected: {}, got {}".format(
-                                            model_name, expected1_list[b], result_val[b]))
+                                        "{}, {} expected: {}, got {}".format(
+                                            model_name, OUTPUT1, expected1_list[b], result_val[b]))
                     else:
                         tester.assertTrue(False, "unexpected raw result {}".format(result_name))
                 else:
@@ -213,6 +267,11 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
                             tester.assertEqual(ctuple[1], expected1_flatten[expected1_sort_idx[b][idx]])
                         else:
                             tester.assertTrue(False, "unexpected class result {}".format(result_name))
+
+    # Unregister system/cuda shared memory regions if they exist
+    su.unregister_cleanup_shm_regions(shm_handles, precreated_shm_regions, outputs,
+                                        use_system_shared_memory, use_cuda_shared_memory)
+
     return results
 
 
@@ -220,7 +279,8 @@ def infer_exact(tester, pf, tensor_shape, batch_size,
 # zero-sized input/output tensor.
 def infer_zero(tester, pf, batch_size, tensor_dtype, input_shapes, output_shapes,
                model_version=None, use_http=True, use_grpc=True,
-               use_streaming=True):
+               use_streaming=True, shm_region_name_prefix=None, 
+               use_system_shared_memory=False, use_cuda_shared_memory=False):
     tester.assertTrue(use_http or use_grpc or use_streaming)
     configs = []
     if use_http:
@@ -229,48 +289,71 @@ def infer_zero(tester, pf, batch_size, tensor_dtype, input_shapes, output_shapes
         configs.append(("localhost:8001", ProtocolType.GRPC, False))
     if use_streaming:
         configs.append(("localhost:8001", ProtocolType.GRPC, True))
-
     tester.assertEqual(len(input_shapes), len(output_shapes))
     io_cnt = len(input_shapes)
 
-    for config in configs:
-        model_name = tu.get_zero_model_name(pf, io_cnt, tensor_dtype)
-        input_dict = {}
-        output_dict = {}
-        expected_dict = {}
+    if shm_region_name_prefix is None:
+        shm_region_name_prefix = ["input", "output"]
 
-        for io_num in range(io_cnt):
-            if pf == "libtorch" or pf == "libtorch_nobatch":
-                input_name = "INPUT__{}".format(io_num)
-                output_name = "OUTPUT__{}".format(io_num)
+    input_dict = {}
+    output_dict = {}
+    expected_dict = {}
+    shm_ip_handles = list()
+    shm_op_handles = list()
+    shared_memory_ctx = SharedMemoryControlContext("localhost:8000",  ProtocolType.HTTP, verbose=False)
+
+    for io_num in range(io_cnt):
+        if pf == "libtorch" or pf == "libtorch_nobatch":
+            input_name = "INPUT__{}".format(io_num)
+            output_name = "OUTPUT__{}".format(io_num)
+        else:
+            input_name = "INPUT{}".format(io_num)
+            output_name = "OUTPUT{}".format(io_num)
+
+        input_list = list()
+        expected_list = list()
+        for b in range(batch_size):
+            rtensor_dtype = _range_repr_dtype(tensor_dtype)
+            in0 = np.random.randint(low=np.iinfo(rtensor_dtype).min,
+                                    high=np.iinfo(rtensor_dtype).max,
+                                    size=input_shapes[io_num], dtype=rtensor_dtype)
+            if tensor_dtype != np.object:
+                in0 = in0.astype(tensor_dtype)
+                expected0 = np.ndarray.copy(in0)
             else:
-                input_name = "INPUT{}".format(io_num)
-                output_name = "OUTPUT{}".format(io_num)
+                expected0 = np.array([unicode(str(x), encoding='utf-8')
+                                for x in in0.flatten()], dtype=object)
+                in0 = np.array([str(x) for x in in0.flatten()],
+                                dtype=object).reshape(in0.shape)
 
-            input_list = list()
-            expected_list = list()
-            for b in range(batch_size):
-                rtensor_dtype = _range_repr_dtype(tensor_dtype)
-                in0 = np.random.randint(low=np.iinfo(rtensor_dtype).min,
-                                        high=np.iinfo(rtensor_dtype).max,
-                                        size=input_shapes[io_num], dtype=rtensor_dtype)
-                if tensor_dtype != np.object:
-                    in0 = in0.astype(tensor_dtype)
-                    expected0 = np.ndarray.copy(in0)
-                else:
-                    expected0 = np.array([unicode(str(x), encoding='utf-8')
-                                    for x in in0.flatten()], dtype=object)
-                    in0 = np.array([str(x) for x in in0.flatten()],
-                                   dtype=object).reshape(in0.shape)
+            expected0 = expected0.reshape(output_shapes[io_num])
 
-                expected0 = expected0.reshape(output_shapes[io_num])
+            input_list.append(in0)
+            expected_list.append(expected0)
 
-                input_list.append(in0)
-                expected_list.append(expected0)
+        expected_dict[output_name] = expected_list
 
+        input_byte_size = tu.shape_element_count(input_shapes[io_num]) *\
+                            np.dtype(tensor_dtype).itemsize * batch_size
+        output_byte_size = tu.shape_element_count(output_shapes[io_num]) *\
+                            np.dtype(tensor_dtype).itemsize * batch_size
+        # create and register shared memory region for inputs and outputs
+        shm_io_handle = su.create_register_set_either_shm_region([shm_region_name_prefix[0]+str(io_num), 
+                                                shm_region_name_prefix[1]+str(io_num)], input_list, 
+                                                input_byte_size, output_byte_size, shared_memory_ctx,
+                                                use_system_shared_memory, use_cuda_shared_memory)
+        if len(shm_io_handle) != 0:
+            shm_ip_handles.append(shm_io_handle[0])
+            shm_op_handles.append(shm_io_handle[1])
+            input_dict[input_name] = (shm_ip_handles[io_num], input_shapes)
+            output_dict[output_name] = (InferContext.ResultFormat.RAW, shm_op_handles[io_num])
+        else:
             input_dict[input_name] = input_list
             output_dict[output_name] = InferContext.ResultFormat.RAW
-            expected_dict[output_name] = expected_list
+
+    # Run inference and check results for each config
+    for config in configs:
+        model_name = tu.get_zero_model_name(pf, io_cnt, tensor_dtype)
 
         ctx = InferContext(config[0], config[1], model_name, model_version,
                            correlation_id=0, streaming=config[2],
@@ -291,5 +374,12 @@ def infer_zero(tester, pf, batch_size, tensor_dtype, input_shapes, output_shapes
                 tester.assertTrue(np.array_equal(result_val[b], expected),
                                   "{}, {}, slot {}, expected: {}, got {}".format(
                                       model_name, result_name, b, expected, result_val[b]))
+
+    if len(shm_ip_handles) != 0:
+        for io_num in range(io_cnt):
+            shared_memory_ctx.unregister(shm_ip_handles[io_num])
+            shared_memory_ctx.unregister(shm_op_handles[io_num])
+            su.destroy_either_shm_region(shm_ip_handles[io_num], use_system_shared_memory, use_cuda_shared_memory)
+            su.destroy_either_shm_region(shm_op_handles[io_num], use_system_shared_memory, use_cuda_shared_memory)
 
     return results

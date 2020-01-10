@@ -27,24 +27,37 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <csignal>
+#include <iostream>
 #include <mutex>
 
-#include "src/core/logging.h"
-#include "src/core/server.h"
-#include "src/core/status.h"
-#include "src/servers/grpc_server.h"
+#ifdef TRTIS_ENABLE_ASAN
+#include <sanitizer/lsan_interface.h>
+#endif  // TRTIS_ENABLE_ASAN
+
+#include "src/core/trtserver.h"
+#include "src/servers/common.h"
+#include "src/servers/shared_memory_block_manager.h"
+#include "src/servers/tracer.h"
+
+#ifdef TRTIS_ENABLE_GPU
+static_assert(
+    TRTIS_MIN_COMPUTE_CAPABILITY >= 1.0,
+    "Invalid TRTIS_MIN_COMPUTE_CAPABILITY specified");
+#endif  // TRTIS_ENABLE_GPU
+
+#if defined(TRTIS_ENABLE_HTTP) || defined(TRTIS_ENABLE_METRICS)
 #include "src/servers/http_server.h"
+#endif  // TRTIS_ENABLE_HTTP || TRTIS_ENABLE_METRICS
+
+#ifdef TRTIS_ENABLE_GRPC
+#include "src/servers/grpc_server.h"
+#endif  // TRTIS_ENABLE_GRPC
 
 namespace {
-
-// The inference server object. Once this server is successfully
-// created it does *not* transition back to a nullptr value and it is
-// *not* explicitly destructed. Thus we assume that 'server_' can
-// always be dereferenced.
-nvidia::inferenceserver::InferenceServer* server_ = nullptr;
 
 // Exit mutex and cv used to signal the main thread that it should
 // close the server and exit.
@@ -52,87 +65,118 @@ volatile bool exiting_ = false;
 std::mutex exit_mu_;
 std::condition_variable exit_cv_;
 
-// If true then exit if the inference-server fails to initialize
-// completely but is still in an operational state (i.e. one or more
-// models fail to load but the server is otherwise ok). If false then
-// exit if inference-server doesn't completely initialize (e.g. will
-// exit if even one model fails to load).
-bool exit_on_failed_init_ = true;
+// Interval, in seconds, when the model repository is polled for
+// changes.
+int32_t repository_poll_secs_ = 15;
 
-// The HTTP, GRPC and metrics service/s
+// Whether explicit model control is allowed
+bool allow_model_control_ = false;
+
+// The HTTP, GRPC and metrics service/s and ports. Initialized to
+// default values and modifyied based on command-line args. Set to -1
+// to indicate the protocol is disabled.
+#ifdef TRTIS_ENABLE_HTTP
 std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>
     http_services_;
-std::unique_ptr<nvidia::inferenceserver::GRPCServer> grpc_service_;
-std::unique_ptr<nvidia::inferenceserver::HTTPServer> metrics_service_;
-
-// The HTTP and GRPC ports. Initialized to default values and
-// modifyied based on command-line args. Set to -1 to indicate the
-// protocol is disabled.
 bool allow_http_ = true;
-bool allow_grpc_ = true;
 int32_t http_port_ = 8000;
-int32_t grpc_port_ = 8001;
-
-// Unique port for health requests on HTTP server
 int32_t http_health_port_ = -1;
 std::vector<int32_t> http_ports_;
+#ifdef TRTIS_ENABLE_HTTP_V2
+std::vector<std::string> endpoint_names = {"health", "infer"};
+#else
+std::vector<std::string> endpoint_names = {
+    "status",    "health", "infer", "modelcontrol", "sharedmemorycontrol",
+    "repository"};
+#endif  // TRTIS_ENABLE_HTTP_V2
+#endif  // TRTIS_ENABLE_HTTP
 
-// The metric port. Initialized to default values and modifyied based
-// on command-line args. Set to -1 to indicate the protocol is
-// disabled.
+#ifdef TRTIS_ENABLE_GRPC
+std::unique_ptr<nvidia::inferenceserver::GRPCServer> grpc_service_;
+bool allow_grpc_ = true;
+int32_t grpc_port_ = 8001;
+#endif  // TRTIS_ENABLE_GRPC
+
 #ifdef TRTIS_ENABLE_METRICS
+std::unique_ptr<nvidia::inferenceserver::HTTPServer> metrics_service_;
 bool allow_metrics_ = true;
 int32_t metrics_port_ = 8002;
-#else
-bool allow_metrics_ = false;
-int32_t metrics_port_ = -1;
 #endif  // TRTIS_ENABLE_METRICS
 
-// endpoint names for http/gRPC
-std::vector<std::string> endpoint_names = {"status", "health", "profile",
-                                           "infer"};
+#ifdef TRTIS_ENABLE_TRACING
+std::string trace_filepath_;
+TRTSERVER_Trace_Level trace_level_ = TRTSERVER_TRACE_LEVEL_DISABLED;
+int32_t trace_rate_ = 1000;
+#endif  // TRTIS_ENABLE_TRACING
 
-// Should GPU metrics be reported.
-bool allow_gpu_metrics_ = false;
+#ifdef TRTIS_ENABLE_GRPC
+// The number of threads to initialize for handling GRPC infer
+// requests.
+int grpc_infer_thread_cnt_ = 1;
 
-// The number of threads to initialize for handling GRPC infer requests.
-int grpc_infer_thread_cnt_ = 1000;
+// The number of threads to initialize for handling GRPC stream infer
+// requests.
+int grpc_stream_infer_thread_cnt_ = 1;
 
-// The number of threads to initialize for handling GRPC stream infer requests.
-int grpc_stream_infer_thread_cnt_ = 1000;
+// The maximum number of inference request/response objects that
+// remain allocated for reuse. As long as the number of in-flight
+// requests doesn't exceed this value there will be no
+// allocation/deallocation of request/response objects.
+int grpc_infer_allocation_pool_size_ = 8;
+#endif  // TRTIS_ENABLE_GRPC
 
+#ifdef TRTIS_ENABLE_HTTP
 // The number of threads to initialize for the HTTP front-end.
 int http_thread_cnt_ = 8;
+#endif  // TRTIS_ENABLE_HTTP
 
 // Command-line options
 enum OptionId {
   OPTION_HELP = 1000,
+#ifdef TRTIS_ENABLE_LOGGING
   OPTION_LOG_VERBOSE,
   OPTION_LOG_INFO,
   OPTION_LOG_WARNING,
   OPTION_LOG_ERROR,
+#endif  // TRTIS_ENABLE_LOGGING
   OPTION_ID,
-  OPTION_MODEL_STORE,
+  OPTION_MODEL_REPOSITORY,
   OPTION_EXIT_ON_ERROR,
   OPTION_STRICT_MODEL_CONFIG,
   OPTION_STRICT_READINESS,
-  OPTION_ALLOW_PROFILING,
-  OPTION_ALLOW_GRPC,
+#ifdef TRTIS_ENABLE_HTTP
   OPTION_ALLOW_HTTP,
-  OPTION_ALLOW_METRICS,
-  OPTION_ALLOW_GPU_METRICS,
-  OPTION_GRPC_PORT,
   OPTION_HTTP_PORT,
   OPTION_HTTP_HEALTH_PORT,
-  OPTION_METRICS_PORT,
+  OPTION_HTTP_THREAD_COUNT,
+#endif  // TRTIS_ENABLE_HTTP
+#ifdef TRTIS_ENABLE_GRPC
+  OPTION_ALLOW_GRPC,
+  OPTION_GRPC_PORT,
   OPTION_GRPC_INFER_THREAD_COUNT,
   OPTION_GRPC_STREAM_INFER_THREAD_COUNT,
-  OPTION_HTTP_THREAD_COUNT,
+  OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE,
+#endif  // TRTIS_ENABLE_GRPC
+#ifdef TRTIS_ENABLE_METRICS
+  OPTION_ALLOW_METRICS,
+  OPTION_ALLOW_GPU_METRICS,
+  OPTION_METRICS_PORT,
+#endif  // TRTIS_ENABLE_METRICS
+#ifdef TRTIS_ENABLE_TRACING
+  OPTION_TRACE_FILEPATH,
+  OPTION_TRACE_LEVEL,
+  OPTION_TRACE_RATE,
+#endif  // TRTIS_ENABLE_TRACING
+  OPTION_MODEL_CONTROL_MODE,
   OPTION_ALLOW_POLL_REPO,
   OPTION_POLL_REPO_SECS,
+  OPTION_ALLOW_MODEL_CONTROL,
+  OPTION_STARTUP_MODEL,
+  OPTION_PINNED_MEMORY_POOL_BYTE_SIZE,
   OPTION_EXIT_TIMEOUT_SECS,
   OPTION_TF_ALLOW_SOFT_PLACEMENT,
   OPTION_TF_GPU_MEMORY_FRACTION,
+  OPTION_TF_ADD_VGPU,
 };
 
 struct Option {
@@ -157,12 +201,26 @@ struct Option {
 
 std::vector<Option> options_{
     {OPTION_HELP, "help", "Print usage", false},
-    {OPTION_LOG_VERBOSE, "log-verbose", "Enable/disable verbose-level logging"},
+#ifdef TRTIS_ENABLE_LOGGING
+    {OPTION_LOG_VERBOSE, "log-verbose",
+     "Set verbose logging level. Zero (0) disables verbose logging and values "
+     ">= 1 enable verbose logging"},
     {OPTION_LOG_INFO, "log-info", "Enable/disable info-level logging"},
     {OPTION_LOG_WARNING, "log-warning", "Enable/disable warning-level logging"},
     {OPTION_LOG_ERROR, "log-error", "Enable/disable error-level logging"},
+#endif  // TRTIS_ENABLE_LOGGING
     {OPTION_ID, "id", "Identifier for this server"},
-    {OPTION_MODEL_STORE, "model-store", "Path to model repository directory"},
+    {OPTION_MODEL_REPOSITORY, "model-store",
+     "Path to model repository directory. It may be specified multiple times "
+     "to add multiple model repositories. Note that if a model is not unique "
+     "across all model repositories at any time, the model will not be "
+     "available."
+     "This option is deprecated, the preferred usage is --model-repository"},
+    {OPTION_MODEL_REPOSITORY, "model-repository",
+     "Path to model repository directory. It may be specified multiple times "
+     "to add multiple model repositories. Note that if a model is not unique "
+     "across all model repositories at any time, the model will not be "
+     "available."},
     {OPTION_EXIT_ON_ERROR, "exit-on-error",
      "Exit the inference server if an error occurs during initialization."},
     {OPTION_STRICT_MODEL_CONFIG, "strict-model-config",
@@ -175,38 +233,85 @@ std::vector<Option> options_{
      "is responsive and all models are available. If false "
      "/api/health/ready endpoint indicates ready if server is responsive "
      "even if some/all models are unavailable."},
-    {OPTION_ALLOW_PROFILING, "allow-profiling", "Allow server profiling."},
-    {OPTION_ALLOW_GRPC, "allow-grpc",
-     "Allow the server to listen for GRPC requests."},
+#ifdef TRTIS_ENABLE_HTTP
     {OPTION_ALLOW_HTTP, "allow-http",
      "Allow the server to listen for HTTP requests."},
+    {OPTION_HTTP_PORT, "http-port",
+     "The port for the server to listen on for HTTP requests."},
+    {OPTION_HTTP_HEALTH_PORT, "http-health-port",
+     "The port for the server to listen on for HTTP Health requests."},
+    {OPTION_HTTP_THREAD_COUNT, "http-thread-count",
+     "Number of threads handling HTTP requests."},
+#endif  // TRTIS_ENABLE_HTTP
+#ifdef TRTIS_ENABLE_GRPC
+    {OPTION_ALLOW_GRPC, "allow-grpc",
+     "Allow the server to listen for GRPC requests."},
+    {OPTION_GRPC_PORT, "grpc-port",
+     "The port for the server to listen on for GRPC requests."},
+    {OPTION_GRPC_INFER_THREAD_COUNT, "grpc-infer-thread-count",
+     "Number of threads handling GRPC inference requests."},
+    {OPTION_GRPC_STREAM_INFER_THREAD_COUNT, "grpc-stream-infer-thread-count",
+     "Number of threads handling GRPC stream inference requests."},
+    {OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE, "grpc-infer-allocation-pool-size",
+     "The maximum number of inference request/response objects that remain "
+     "allocated for reuse. As long as the number of in-flight requests doesn't "
+     "exceed this value there will be no allocation/deallocation of "
+     "request/response objects."},
+#endif  // TRTIS_ENABLE_GRPC
+#ifdef TRTIS_ENABLE_METRICS
     {OPTION_ALLOW_METRICS, "allow-metrics",
      "Allow the server to provide prometheus metrics."},
     {OPTION_ALLOW_GPU_METRICS, "allow-gpu-metrics",
      "Allow the server to provide GPU metrics. Ignored unless --allow-metrics "
      "is true."},
-    {OPTION_GRPC_PORT, "grpc-port",
-     "The port for the server to listen on for GRPC requests."},
-    {OPTION_HTTP_PORT, "http-port",
-     "The port for the server to listen on for HTTP requests."},
-    {OPTION_HTTP_HEALTH_PORT, "http-health-port",
-     "The port for the server to listen on for HTTP Health requests."},
     {OPTION_METRICS_PORT, "metrics-port",
      "The port reporting prometheus metrics."},
-    {OPTION_GRPC_INFER_THREAD_COUNT, "grpc-infer-thread-count",
-     "Number of threads handling GRPC inference requests."},
-    {OPTION_GRPC_STREAM_INFER_THREAD_COUNT, "grpc-stream-infer-thread-count",
-     "Number of threads handling GRPC stream inference requests."},
-    {OPTION_HTTP_THREAD_COUNT, "http-thread-count",
-     "Number of threads handling HTTP requests."},
+#endif  // TRTIS_ENABLE_METRICS
+#ifdef TRTIS_ENABLE_TRACING
+    {OPTION_TRACE_FILEPATH, "trace-file",
+     "Set the file where trace output will be saved."},
+    {OPTION_TRACE_LEVEL, "trace-level",
+     "Set the trace level. OFF to disable tracing, MIN for minimal tracing, "
+     "MAX for maximal tracing. Default is OFF."},
+    {OPTION_TRACE_RATE, "trace-rate",
+     "Set the trace sampling rate. Default is 1000."},
+#endif  // TRTIS_ENABLE_TRACING
+    {OPTION_MODEL_CONTROL_MODE, "model-control-mode",
+     "Specify the mode for model management. Options are \"none\", \"poll\" "
+     "and \"explicit\". The default is \"poll\". "
+     "For \"none\", the server will load all models in the model repositories "
+     "only once at startup. For \"poll\", the server will poll the model "
+     "repository to detect changes. The poll rate is controlled by "
+     "'repository-poll-secs'. For \"explicit\", the model load and unload is "
+     "initiated by using the model control APIs, and the models in the model "
+     "repository will not be loaded at startup, unless the model is specified "
+     "by --load-model."},
     {OPTION_ALLOW_POLL_REPO, "allow-poll-model-repository",
-     "Poll the model repository to detect changes. The poll rate is "
-     "controlled by 'repository-poll-secs'."},
+     "[DEPRECATED] Poll the model repository to detect changes. The poll rate "
+     "is controlled by 'repository-poll-secs'. This option is deprecated by "
+     "--model-control-mode, this option can not be specified if "
+     "--model-control-mode is specified."},
     {OPTION_POLL_REPO_SECS, "repository-poll-secs",
      "Interval in seconds between each poll of the model repository to check "
-     "for changes. A value of zero indicates that the repository is checked "
-     "only a single time at startup. Valid only when "
+     "for changes. Valid only when "
      "--allow-poll-model-repository=true is specified."},
+    {OPTION_ALLOW_MODEL_CONTROL, "allow-model-control",
+     "[DEPRECATED] Allow to load or to unload models explicitly using model "
+     "control API. If true the models in the model repository will not be "
+     "loaded at startup, unless the model is specified by --load-model. Cannot "
+     "be specified if --allow-poll-model-repository is true. This option is "
+     "deprecated by --model-control-mode, this option can not be specified if "
+     "--model-control-mode is specified."},
+    {OPTION_STARTUP_MODEL, "load-model",
+     "Name of the model to be loaded on server startup. It may be specified "
+     "multiple times to add multiple models. Note that this option will only "
+     "take affect if --allow-model-control is true."},
+    {OPTION_PINNED_MEMORY_POOL_BYTE_SIZE, "pinned-memory-pool-byte-size",
+     "The total byte size that can be allocated as pinned system memory. "
+     "If GPU support is enabled, the server will allocate pinned system memory "
+     "to accelerate data transfer between host and devices until it exceeds "
+     "the specified byte size. This option will not affect the allocation "
+     "conducted by the backend frameworks. Default is 256 MB."},
     {OPTION_EXIT_TIMEOUT_SECS, "exit-timeout-secs",
      "Timeout (in seconds) when exiting to wait for in-flight inferences to "
      "finish. After the timeout expires the server exits even if inferences "
@@ -218,15 +323,21 @@ std::vector<Option> options_{
      "Reserve a portion of GPU memory for TensorFlow models. Default "
      "value 0.0 indicates that TensorFlow should dynamically allocate "
      "memory as needed. Value of 1.0 indicates that TensorFlow should "
-     "allocate all of GPU memory."}};
-
+     "allocate all of GPU memory."},
+    {OPTION_TF_ADD_VGPU, "tf-add-vgpu",
+     "Add a tensorflow virtual GPU instances on a physical GPU. Input "
+     "should be 2 integers and 1 float separated by semicolons in the format "
+     "<physical GPU>;<number of virtual GPUs>;<memory limit per VGPU in "
+     "megabytes>. This option can be used multiple times, but only once per "
+     "physical GPU device. Subsequent uses will overwrite previous uses with "
+     "the same physical device. By default, no VGPUs are enabled."}};
 
 void
 SignalHandler(int signum)
 {
   // Don't need a mutex here since signals should be disabled while in
   // the handler.
-  LOG_INFO << "Interrupt signal (" << signum << ") received.";
+  std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
 
   // Do nothing if already exiting...
   if (exiting_)
@@ -243,143 +354,259 @@ SignalHandler(int signum)
 bool
 CheckPortCollision()
 {
+#if defined(TRTIS_ENABLE_HTTP) && defined(TRTIS_ENABLE_GRPC)
   // Check if HTTP and GRPC have shared ports
   if ((std::find(http_ports_.begin(), http_ports_.end(), grpc_port_) !=
        http_ports_.end()) &&
       (grpc_port_ != -1) && allow_http_ && allow_grpc_) {
-    LOG_ERROR << "The server cannot listen to HTTP requests "
-              << "and gRPC requests at the same port";
+    std::cerr << "The server cannot listen to HTTP requests "
+              << "and GRPC requests at the same port" << std::endl;
     return true;
   }
+#endif  // TRTIS_ENABLE_HTTP && TRTIS_ENABLE_GRPC
 
+#if defined(TRTIS_ENABLE_GRPC) && defined(TRTIS_ENABLE_METRICS)
   // Check if Metric and GRPC have shared ports
   if ((grpc_port_ == metrics_port_) && (metrics_port_ != -1) && allow_grpc_ &&
       allow_metrics_) {
-    LOG_ERROR << "The server cannot provide metrics on same port used for "
-              << "gRPC requests";
+    std::cerr << "The server cannot provide metrics on same port used for "
+              << "GRPC requests" << std::endl;
     return true;
   }
+#endif  // TRTIS_ENABLE_GRPC && TRTIS_ENABLE_METRICS
 
+#if defined(TRTIS_ENABLE_HTTP) && defined(TRTIS_ENABLE_METRICS)
   // Check if Metric and HTTP have shared ports
   if ((std::find(http_ports_.begin(), http_ports_.end(), metrics_port_) !=
        http_ports_.end()) &&
       (metrics_port_ != -1) && allow_http_ && allow_metrics_) {
-    LOG_ERROR << "The server cannot provide metrics on same port used for "
-              << "HTTP requests";
+    std::cerr << "The server cannot provide metrics on same port used for "
+              << "HTTP requests" << std::endl;
     return true;
   }
+#endif  // TRTIS_ENABLE_HTTP && TRTIS_ENABLE_METRICS
+
   return false;
 }
 
-std::unique_ptr<nvidia::inferenceserver::GRPCServer>
-StartGrpcService(nvidia::inferenceserver::InferenceServer* server)
+#ifdef TRTIS_ENABLE_GRPC
+TRTSERVER_Error*
+StartGrpcService(
+    std::unique_ptr<nvidia::inferenceserver::GRPCServer>* service,
+    const std::shared_ptr<TRTSERVER_Server>& server,
+    const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
+        smb_manager)
 {
-  std::unique_ptr<nvidia::inferenceserver::GRPCServer> service;
-  nvidia::inferenceserver::Status status =
-      nvidia::inferenceserver::GRPCServer::Create(
-          server, grpc_port_, grpc_infer_thread_cnt_,
-          grpc_stream_infer_thread_cnt_, &service);
-  if (status.IsOk()) {
-    status = service->Start();
+  TRTSERVER_Error* err = nvidia::inferenceserver::GRPCServer::Create(
+      server, trace_manager, smb_manager, grpc_port_, grpc_infer_thread_cnt_,
+      grpc_stream_infer_thread_cnt_, grpc_infer_allocation_pool_size_, service);
+  if (err == nullptr) {
+    err = (*service)->Start();
   }
 
-  if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
-    service.reset();
+  if (err != nullptr) {
+    service->reset();
   }
 
-  return std::move(service);
+  return err;
 }
+#endif  // TRTIS_ENABLE_GRPC
 
-nvidia::inferenceserver::Status
+#ifdef TRTIS_ENABLE_HTTP
+TRTSERVER_Error*
 StartHttpService(
-    nvidia::inferenceserver::InferenceServer* server,
-    const std::map<int32_t, std::vector<std::string>>& port_map)
+    std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>* services,
+    const std::shared_ptr<TRTSERVER_Server>& server,
+    const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
+        smb_manager,
+    std::map<int32_t, std::vector<std::string>>& port_map)
 {
-  nvidia::inferenceserver::Status status =
-      nvidia::inferenceserver::HTTPServer::CreateAPIServer(
-          server, port_map, http_thread_cnt_, &http_services_);
-  if (status.IsOk()) {
-    for (auto& http_eps : http_services_) {
+  TRTSERVER_Error* err = nvidia::inferenceserver::HTTPServer::CreateAPIServer(
+      server, trace_manager, smb_manager, port_map, http_thread_cnt_, services);
+  if (err == nullptr) {
+    for (auto& http_eps : *services) {
       if (http_eps != nullptr) {
-        status = http_eps->Start();
+        err = http_eps->Start();
       }
     }
   }
 
-  if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
-    for (auto& http_eps : http_services_) {
+  if (err != nullptr) {
+    for (auto& http_eps : *services) {
       if (http_eps != nullptr) {
         http_eps.reset();
       }
     }
   }
 
-  return status;
+  return err;
 }
+#endif  // TRTIS_ENABLE_HTTP
 
-std::unique_ptr<nvidia::inferenceserver::HTTPServer>
-StartMetricsService()
+#ifdef TRTIS_ENABLE_METRICS
+TRTSERVER_Error*
+StartMetricsService(
+    std::unique_ptr<nvidia::inferenceserver::HTTPServer>* service,
+    const std::shared_ptr<TRTSERVER_Server>& server)
 {
-  std::unique_ptr<nvidia::inferenceserver::HTTPServer> service;
-  nvidia::inferenceserver::Status status =
+  TRTSERVER_Error* err =
       nvidia::inferenceserver::HTTPServer::CreateMetricsServer(
-          metrics_port_, 1 /* HTTP thread count */, allow_gpu_metrics_,
-          &service);
-  if (status.IsOk()) {
-    status = service->Start();
+          server, metrics_port_, 1 /* HTTP thread count */, service);
+  if (err == nullptr) {
+    err = (*service)->Start();
   }
-  if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
-    service.reset();
+  if (err != nullptr) {
+    service->reset();
   }
 
-  return std::move(service);
+  return err;
 }
+#endif  // TRTIS_ENABLE_METRICS
 
 bool
-StartEndpoints(nvidia::inferenceserver::InferenceServer* server)
+StartEndpoints(
+    const std::shared_ptr<TRTSERVER_Server>& server,
+    const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
+        smb_manager)
 {
-  size_t i;
-  nvidia::inferenceserver::Status create_status;
-  LOG_INFO << "Starting endpoints, '" << server->Id() << "' listening on";
+  const char* id;
+  FAIL_IF_ERR(TRTSERVER_ServerId(server.get(), &id), "getting server ID");
+  std::cout << "Starting endpoints, '" << id << "' listening on" << std::endl;
 
-  // Enable gRPC endpoints if requested...
+#ifdef TRTIS_ENABLE_GRPC
+  // Enable GRPC endpoints if requested...
   if (allow_grpc_ && (grpc_port_ != -1)) {
-    grpc_service_ = StartGrpcService(server);
-    if (grpc_service_ == nullptr) {
-      LOG_ERROR << "Failed to start gRPC service";
+    TRTSERVER_Error* err =
+        StartGrpcService(&grpc_service_, server, trace_manager, smb_manager);
+    if (err != nullptr) {
+      LOG_IF_ERR(err, "failed to start GRPC service");
       return false;
     }
   }
+#endif  // TRTIS_ENABLE_GRPC
 
+#ifdef TRTIS_ENABLE_HTTP
   // Enable HTTP endpoints if requested...
   if (allow_http_) {
     std::map<int32_t, std::vector<std::string>> port_map;
 
     // Group by port numbers
-    for (i = 0; i < http_ports_.size(); i++) {
+    for (size_t i = 0; i < http_ports_.size(); i++) {
       if (http_ports_[i] != -1) {
         port_map[http_ports_[i]].push_back(endpoint_names[i]);
       }
     }
 
-    create_status = StartHttpService(server, port_map);
-    if (!create_status.IsOk()) {
-      LOG_ERROR << "Failed to start HTTP service";
+    TRTSERVER_Error* err = StartHttpService(
+        &http_services_, server, trace_manager, smb_manager, port_map);
+    if (err != nullptr) {
+      LOG_IF_ERR(err, "failed to start HTTP service");
       return false;
+    }
+  }
+#endif  // TRTIS_ENABLE_HTTP
+
+#ifdef TRTIS_ENABLE_METRICS
+  // Enable metrics endpoint if requested...
+  if (metrics_port_ != -1) {
+    TRTSERVER_Error* err = StartMetricsService(&metrics_service_, server);
+    if (err != nullptr) {
+      LOG_IF_ERR(err, "failed to start Metrics service");
+      return false;
+    }
+  }
+#endif  // TRTIS_ENABLE_METRICS
+
+  return true;
+}
+
+bool
+StopEndpoints()
+{
+  bool ret = true;
+
+#ifdef TRTIS_ENABLE_HTTP
+  for (auto& http_eps : http_services_) {
+    if (http_eps != nullptr) {
+      TRTSERVER_Error* err = http_eps->Stop();
+      if (err != nullptr) {
+        LOG_IF_ERR(err, "failed to stop HTTP service");
+        ret = false;
+      }
     }
   }
 
-  // Enable metrics endpoint if requested...
-  if (metrics_port_ != -1) {
-    metrics_service_ = StartMetricsService();
-    if (metrics_service_ == nullptr) {
-      LOG_ERROR << "Failed to start Metrics service";
-      return false;
+  http_services_.clear();
+#endif  // TRTIS_ENABLE_HTTP
+
+#ifdef TRTIS_ENABLE_GRPC
+  if (grpc_service_) {
+    TRTSERVER_Error* err = grpc_service_->Stop();
+    if (err != nullptr) {
+      LOG_IF_ERR(err, "failed to stop GRPC service");
+      ret = false;
+    }
+
+    grpc_service_.reset();
+  }
+#endif  // TRTIS_ENABLE_GRPC
+
+#ifdef TRTIS_ENABLE_METRICS
+  if (metrics_service_) {
+    TRTSERVER_Error* err = metrics_service_->Stop();
+    if (err != nullptr) {
+      LOG_IF_ERR(err, "failed to stop Metrics service");
+      ret = false;
+    }
+
+    metrics_service_.reset();
+  }
+#endif  // TRTIS_ENABLE_METRICS
+
+  return ret;
+}
+
+bool
+StartTracing(
+    const std::shared_ptr<TRTSERVER_Server>& server,
+    std::shared_ptr<nvidia::inferenceserver::TraceManager>* trace_manager)
+{
+  trace_manager->reset();
+
+#ifdef TRTIS_ENABLE_TRACING
+  TRTSERVER_Error* err = nullptr;
+
+  // Configure tracing if host is specified.
+  if (trace_level_ != TRTSERVER_TRACE_LEVEL_DISABLED) {
+    err = nvidia::inferenceserver::TraceManager::Create(
+        trace_manager, trace_filepath_);
+    if (err == nullptr) {
+      err = (*trace_manager)->SetRate(trace_rate_);
+      if (err == nullptr) {
+        err = (*trace_manager)->SetLevel(trace_level_);
+      }
     }
   }
+
+  if (err != nullptr) {
+    LOG_IF_ERR(err, "failed to configure tracing");
+    trace_manager->reset();
+    return false;
+  }
+#endif  // TRTIS_ENABLE_TRACING
+
+  return true;
+}
+
+bool
+StopTracing(
+    const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager)
+{
+#ifdef TRTIS_ENABLE_TRACING
+#endif  // TRTIS_ENABLE_TRACING
 
   return true;
 }
@@ -396,17 +623,21 @@ Usage()
 }
 
 bool
-ParseBoolOption(const std::string arg)
+ParseBoolOption(std::string arg)
 {
-  if ((arg == "true") || (arg == "True") || (arg == "1")) {
+  std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+
+  if ((arg == "true") || (arg == "1")) {
     return true;
   }
-  if ((arg == "false") || (arg == "False") || (arg == "0")) {
+  if ((arg == "false") || (arg == "0")) {
     return false;
   }
 
-  LOG_ERROR << "invalid value for bool option: " << arg;
-  LOG_ERROR << Usage();
+  std::cerr << "invalid value for bool option: " << arg << std::endl;
+  std::cerr << Usage() << std::endl;
   exit(1);
 }
 
@@ -416,43 +647,179 @@ ParseIntOption(const std::string arg)
   return std::stoi(arg);
 }
 
+int64_t
+ParseLongLongOption(const std::string arg)
+{
+  return std::stoll(arg);
+}
+
 float
 ParseFloatOption(const std::string arg)
 {
   return std::stof(arg);
 }
 
-bool
-Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
+// Condition here merely to avoid compilation error, this function will
+// be defined but not used otherwise.
+#ifdef TRTIS_ENABLE_LOGGING
+int
+ParseIntBoolOption(std::string arg)
 {
-  std::string server_id(server->Id());
-  std::string model_store_path(server->ModelStorePath());
-  bool strict_model_config = server->StrictModelConfigEnabled();
-  bool strict_readiness = server->StrictReadinessEnabled();
-  bool allow_profiling = server->ProfilingEnabled();
-  bool tf_allow_soft_placement = server->TensorFlowSoftPlacementEnabled();
-  float tf_gpu_memory_fraction = server->TensorFlowGPUMemoryFraction();
-  int32_t exit_timeout_secs = server->ExitTimeoutSeconds();
-  int32_t repository_poll_secs = server->RepositoryPollSeconds();
+  std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
 
-  bool exit_on_error = exit_on_failed_init_;
+  if (arg == "true") {
+    return 1;
+  }
+  if (arg == "false") {
+    return 0;
+  }
 
-  bool allow_gpu_metrics = true;
+  return ParseIntOption(arg);
+}
+#endif  // TRTIS_ENABLE_LOGGING
+
+#ifdef TRTIS_ENABLE_TRACING
+TRTSERVER_Trace_Level
+ParseTraceLevelOption(std::string arg)
+{
+  std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+
+  if ((arg == "false") || (arg == "off")) {
+    return TRTSERVER_TRACE_LEVEL_DISABLED;
+  }
+  if ((arg == "true") || (arg == "on") || (arg == "min")) {
+    return TRTSERVER_TRACE_LEVEL_MIN;
+  }
+  if (arg == "max") {
+    return TRTSERVER_TRACE_LEVEL_MAX;
+  }
+
+  std::cerr << "invalid value for trace level option: " << arg << std::endl;
+  std::cerr << Usage() << std::endl;
+  exit(1);
+}
+#endif  // TRTIS_ENABLE_TRACING
+
+struct VgpuOption {
+  int gpu_device_;
+  int num_vgpus_;
+  uint64_t mem_limit_mbytes_;
+};
+
+VgpuOption
+ParseVGPUOption(const std::string arg)
+{
+  int delim_gpu = arg.find(";");
+  int delim_num_vgpus = arg.find(";", delim_gpu + 1);
+
+  // Check for 2 semicolons
+  if ((delim_gpu < 0) || (delim_num_vgpus < 0)) {
+    std::cerr << "Cannot add virtual devices due to incorrect number of inputs."
+                 "--tf-add-vgpu argument requires format <physical "
+                 "GPU>;<number of virtual GPUs>;<memory limit per VGPU in "
+                 "megabytes>. "
+              << "Found: " << arg << std::endl;
+    std::cerr << Usage() << std::endl;
+    exit(1);
+  }
+
+  std::string gpu_string = arg.substr(0, delim_gpu);
+  std::string vgpu_string =
+      arg.substr(delim_gpu + 1, delim_num_vgpus - delim_gpu - 1);
+  std::string mem_limit_string = arg.substr(delim_num_vgpus + 1);
+
+  // Ensure that options are non-empty otherwise calling stoi/stof will throw an
+  // exception
+  if (gpu_string.empty() || vgpu_string.empty() || mem_limit_string.empty()) {
+    std::cerr << "Cannot add virtual devices due to empty inputs."
+                 "--tf-add-vgpu argument requires format <physical "
+                 "GPU>;<number of virtual GPUs>;<memory limit per VGPU in "
+                 "megabytes>. "
+              << "Found: " << arg << std::endl;
+    std::cerr << Usage() << std::endl;
+    exit(1);
+  }
+
+  int gpu_device = std::stoi(gpu_string);
+  int num_vgpus_on_device = std::stoi(vgpu_string);
+  uint64_t mem_limit = std::stoi(mem_limit_string);
+
+  if (gpu_device < 0) {
+    std::cerr << "Cannot add virtual devices. Physical GPU device index must "
+                 "be >= 0. "
+              << "Found: " << gpu_string << std::endl;
+    std::cerr << Usage() << std::endl;
+    exit(1);
+  }
+
+  if (num_vgpus_on_device <= 0) {
+    std::cerr
+        << "Cannot add virtual devices. Number of virtual GPUs must be > 0. "
+        << "Found: " << vgpu_string << std::endl;
+    std::cerr << Usage() << std::endl;
+    exit(1);
+  }
+
+  return {gpu_device, num_vgpus_on_device, mem_limit};
+}
+
+bool
+Parse(TRTSERVER_ServerOptions* server_options, int argc, char** argv)
+{
+  std::string server_id("inference:0");
+  std::set<std::string> model_repository_paths;
+  bool exit_on_error = true;
+  bool strict_model_config = true;
+  bool strict_readiness = true;
+  bool tf_allow_soft_placement = true;
+  float tf_gpu_memory_fraction = 0.0;
+  VgpuOption tf_vgpu;
+  int32_t exit_timeout_secs = 30;
+  int32_t repository_poll_secs = repository_poll_secs_;
+  int64_t pinned_memory_pool_byte_size = 1 << 28;
+
+#ifdef TRTIS_ENABLE_HTTP
   int32_t http_port = http_port_;
+  int32_t http_thread_cnt = http_thread_cnt_;
+  int32_t http_health_port = http_port_;
+#endif  // TRTIS_ENABLE_HTTP
+
+#ifdef TRTIS_ENABLE_GRPC
   int32_t grpc_port = grpc_port_;
-  int32_t metrics_port = metrics_port_;
   int32_t grpc_infer_thread_cnt = grpc_infer_thread_cnt_;
   int32_t grpc_stream_infer_thread_cnt = grpc_stream_infer_thread_cnt_;
-  int32_t http_thread_cnt = http_thread_cnt_;
+  int32_t grpc_infer_allocation_pool_size = grpc_infer_allocation_pool_size_;
+#endif  // TRTIS_ENABLE_GRPC
 
-  int32_t http_health_port = http_port_;
+#ifdef TRTIS_ENABLE_METRICS
+  int32_t metrics_port = metrics_port_;
+  bool allow_gpu_metrics = true;
+#endif  // TRTIS_ENABLE_METRICS
 
+#ifdef TRTIS_ENABLE_TRACING
+  std::string trace_filepath = trace_filepath_;
+  TRTSERVER_Trace_Level trace_level = trace_level_;
+  int32_t trace_rate = trace_rate_;
+#endif  // TRTIS_ENABLE_TRACING
+
+  bool deprecated_control_mode_set = false;
   bool allow_poll_model_repository = repository_poll_secs > 0;
+  bool allow_model_control = allow_model_control_;
+  std::set<std::string> startup_models_;
 
+  bool control_mode_set = false;
+  TRTSERVER_Model_Control_Mode control_mode = TRTSERVER_MODEL_CONTROL_POLL;
+
+#ifdef TRTIS_ENABLE_LOGGING
   bool log_info = true;
   bool log_warn = true;
   bool log_error = true;
   int32_t log_verbose = 0;
+#endif  // TRTIS_ENABLE_LOGGING
 
   std::vector<struct option> long_options;
   for (const auto& o : options_) {
@@ -465,11 +832,11 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
     switch (flag) {
       case OPTION_HELP:
       case '?':
-        LOG_ERROR << Usage();
+        std::cerr << Usage() << std::endl;
         return false;
-
+#ifdef TRTIS_ENABLE_LOGGING
       case OPTION_LOG_VERBOSE:
-        log_verbose = ParseIntOption(optarg);
+        log_verbose = ParseIntBoolOption(optarg);
         break;
       case OPTION_LOG_INFO:
         log_info = ParseBoolOption(optarg);
@@ -480,12 +847,13 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
       case OPTION_LOG_ERROR:
         log_error = ParseBoolOption(optarg);
         break;
+#endif  // TRTIS_ENABLE_LOGGING
 
       case OPTION_ID:
         server_id = optarg;
         break;
-      case OPTION_MODEL_STORE:
-        model_store_path = optarg;
+      case OPTION_MODEL_REPOSITORY:
+        model_repository_paths.insert(optarg);
         break;
 
       case OPTION_EXIT_ON_ERROR:
@@ -498,23 +866,9 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
         strict_readiness = ParseBoolOption(optarg);
         break;
 
-      case OPTION_ALLOW_PROFILING:
-        allow_profiling = ParseBoolOption(optarg);
-        break;
-      case OPTION_ALLOW_GRPC:
-        allow_grpc_ = ParseBoolOption(optarg);
-        break;
+#ifdef TRTIS_ENABLE_HTTP
       case OPTION_ALLOW_HTTP:
         allow_http_ = ParseBoolOption(optarg);
-        break;
-      case OPTION_ALLOW_METRICS:
-        allow_metrics_ = ParseBoolOption(optarg);
-        break;
-      case OPTION_ALLOW_GPU_METRICS:
-        allow_gpu_metrics = ParseBoolOption(optarg);
-        break;
-      case OPTION_GRPC_PORT:
-        grpc_port = ParseIntOption(optarg);
         break;
       case OPTION_HTTP_PORT:
         http_port = ParseIntOption(optarg);
@@ -523,25 +877,87 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
       case OPTION_HTTP_HEALTH_PORT:
         http_health_port = ParseIntOption(optarg);
         break;
-
-      case OPTION_METRICS_PORT:
-        metrics_port = ParseIntOption(optarg);
+      case OPTION_HTTP_THREAD_COUNT:
+        http_thread_cnt = ParseIntOption(optarg);
         break;
+#endif  // TRTIS_ENABLE_HTTP
 
+#ifdef TRTIS_ENABLE_GRPC
+      case OPTION_ALLOW_GRPC:
+        allow_grpc_ = ParseBoolOption(optarg);
+        break;
+      case OPTION_GRPC_PORT:
+        grpc_port = ParseIntOption(optarg);
+        break;
       case OPTION_GRPC_INFER_THREAD_COUNT:
         grpc_infer_thread_cnt = ParseIntOption(optarg);
         break;
       case OPTION_GRPC_STREAM_INFER_THREAD_COUNT:
         grpc_stream_infer_thread_cnt = ParseIntOption(optarg);
         break;
-      case OPTION_HTTP_THREAD_COUNT:
-        http_thread_cnt = ParseIntOption(optarg);
+      case OPTION_GRPC_INFER_ALLOCATION_POOL_SIZE:
+        grpc_infer_allocation_pool_size = ParseIntOption(optarg);
         break;
+#endif  // TRTIS_ENABLE_GRPC
+
+#ifdef TRTIS_ENABLE_METRICS
+      case OPTION_ALLOW_METRICS:
+        allow_metrics_ = ParseBoolOption(optarg);
+        break;
+      case OPTION_ALLOW_GPU_METRICS:
+        allow_gpu_metrics = ParseBoolOption(optarg);
+        break;
+      case OPTION_METRICS_PORT:
+        metrics_port = ParseIntOption(optarg);
+        break;
+#endif  // TRTIS_ENABLE_METRICS
+
+#ifdef TRTIS_ENABLE_TRACING
+      case OPTION_TRACE_FILEPATH:
+        trace_filepath = optarg;
+        break;
+      case OPTION_TRACE_LEVEL:
+        trace_level = ParseTraceLevelOption(optarg);
+        break;
+      case OPTION_TRACE_RATE:
+        trace_rate = ParseIntOption(optarg);
+        break;
+#endif  // TRTIS_ENABLE_TRACING
+
       case OPTION_ALLOW_POLL_REPO:
         allow_poll_model_repository = ParseBoolOption(optarg);
+        deprecated_control_mode_set = true;
         break;
       case OPTION_POLL_REPO_SECS:
         repository_poll_secs = ParseIntOption(optarg);
+        break;
+      case OPTION_ALLOW_MODEL_CONTROL:
+        allow_model_control = ParseBoolOption(optarg);
+        deprecated_control_mode_set = true;
+        break;
+      case OPTION_STARTUP_MODEL:
+        startup_models_.insert(optarg);
+        break;
+      case OPTION_MODEL_CONTROL_MODE: {
+        std::string mode_str(optarg);
+        std::transform(
+            mode_str.begin(), mode_str.end(), mode_str.begin(), ::tolower);
+        if (mode_str == "none") {
+          control_mode = TRTSERVER_MODEL_CONTROL_NONE;
+        } else if (mode_str == "poll") {
+          control_mode = TRTSERVER_MODEL_CONTROL_POLL;
+        } else if (mode_str == "explicit") {
+          control_mode = TRTSERVER_MODEL_CONTROL_EXPLICIT;
+        } else {
+          std::cerr << "invalid argument for --model-control-mode" << std::endl;
+          std::cerr << Usage() << std::endl;
+          return false;
+        }
+        control_mode_set = true;
+        break;
+      }
+      case OPTION_PINNED_MEMORY_POOL_BYTE_SIZE:
+        pinned_memory_pool_byte_size = ParseLongLongOption(optarg);
         break;
       case OPTION_EXIT_TIMEOUT_SECS:
         exit_timeout_secs = ParseIntOption(optarg);
@@ -553,58 +969,159 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
       case OPTION_TF_GPU_MEMORY_FRACTION:
         tf_gpu_memory_fraction = ParseFloatOption(optarg);
         break;
+      case OPTION_TF_ADD_VGPU:
+        tf_vgpu = ParseVGPUOption(optarg);
+        FAIL_IF_ERR(
+            TRTSERVER_ServerOptionsAddTensorFlowVgpuMemoryLimits(
+                server_options, tf_vgpu.gpu_device_, tf_vgpu.num_vgpus_,
+                tf_vgpu.mem_limit_mbytes_),
+            "adding tensorflow VGPU instances");
+        break;
     }
   }
 
   if (optind < argc) {
-    LOG_ERROR << "Unexpected argument: " << argv[optind];
-    LOG_ERROR << Usage();
+    std::cerr << "Unexpected argument: " << argv[optind] << std::endl;
+    std::cerr << Usage() << std::endl;
     return false;
   }
 
-  LOG_ENABLE_INFO(log_info);
-  LOG_ENABLE_WARNING(log_warn);
-  LOG_ENABLE_ERROR(log_error);
-  LOG_SET_VERBOSE(log_verbose);
+  repository_poll_secs_ =
+      (allow_poll_model_repository) ? std::max(0, repository_poll_secs) : 0;
 
-
-  if (!allow_http_ && !allow_grpc_) {
-    LOG_ERROR << "At least one of the following options must be true: "
-              << "--allow-http, --allow-grpc";
-
-    return false;
+  if (control_mode_set && deprecated_control_mode_set) {
+    std::cerr << "--allow-model-control or --allow-poll-model-repository "
+              << "can not be specified if --model-control-mode is specified"
+              << std::endl;
+    std::cerr << Usage() << std::endl;
   }
 
-  exit_on_failed_init_ = exit_on_error;
+  if (!control_mode_set) {
+    if (allow_model_control && allow_poll_model_repository) {
+      std::cerr << "--allow-model-control and --allow-poll-model-repository "
+                << "can not be both set to true" << std::endl;
+      std::cerr << Usage() << std::endl;
+      return false;
+    }
 
+    if (allow_model_control) {
+      control_mode = TRTSERVER_MODEL_CONTROL_EXPLICIT;
+    } else if (repository_poll_secs_ > 0) {
+      control_mode = TRTSERVER_MODEL_CONTROL_POLL;
+    } else {
+      control_mode = TRTSERVER_MODEL_CONTROL_NONE;
+    }
+  } else {
+    // May sure main() will not try to invoke polling periodically
+    if (control_mode != TRTSERVER_MODEL_CONTROL_POLL) {
+      repository_poll_secs_ = 0;
+    }
+  }
+
+
+#ifdef TRTIS_ENABLE_HTTP
   http_port_ = http_port;
-  grpc_port_ = grpc_port;
   http_health_port_ = http_health_port;
+#ifdef TRTIS_ENABLE_HTTP_V2
+  http_ports_ = {http_health_port_, http_port_};
+#else
+  http_ports_ = {http_port_, http_health_port_, http_port_,
+                 http_port_, http_port_,        http_port_};
+#endif  // TRTIS_ENABLE_HTTP_V2
+  http_thread_cnt_ = http_thread_cnt;
+#endif  // TRTIS_ENABLE_HTTP
 
+#ifdef TRTIS_ENABLE_GRPC
+  grpc_port_ = grpc_port;
+  grpc_infer_thread_cnt_ = grpc_infer_thread_cnt;
+  grpc_stream_infer_thread_cnt_ = grpc_stream_infer_thread_cnt;
+  grpc_infer_allocation_pool_size_ = grpc_infer_allocation_pool_size;
+#endif  // TRTIS_ENABLE_GRPC
+
+#ifdef TRTIS_ENABLE_METRICS
   metrics_port_ = allow_metrics_ ? metrics_port : -1;
-  http_ports_ = {http_port_, http_health_port_, http_port_, http_port_};
+  allow_gpu_metrics = allow_metrics_ ? allow_gpu_metrics : false;
+#endif  // TRTIS_ENABLE_METRICS
+
+#ifdef TRTIS_ENABLE_TRACING
+  trace_filepath_ = trace_filepath;
+  trace_level_ = trace_level;
+  trace_rate_ = trace_rate;
+#endif  // TRTIS_ENABLE_TRACING
 
   // Check if HTTP, GRPC and metrics port clash
   if (CheckPortCollision())
     return false;
 
-  allow_gpu_metrics_ = allow_metrics_ ? allow_gpu_metrics : false;
-  grpc_infer_thread_cnt_ = grpc_infer_thread_cnt;
-  grpc_stream_infer_thread_cnt_ = grpc_stream_infer_thread_cnt;
-  http_thread_cnt_ = http_thread_cnt;
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetServerId(server_options, server_id.c_str()),
+      "setting server ID");
+  for (const auto& model_repository_path : model_repository_paths) {
+    FAIL_IF_ERR(
+        TRTSERVER_ServerOptionsSetModelRepositoryPath(
+            server_options, model_repository_path.c_str()),
+        "setting model repository path");
+  }
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetModelControlMode(server_options, control_mode),
+      "setting model control mode");
+  for (const auto& model : startup_models_) {
+    FAIL_IF_ERR(
+        TRTSERVER_ServerOptionsSetStartupModel(server_options, model.c_str()),
+        "setting startup model");
+  }
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetPinnedMemoryPoolByteSize(
+          server_options, pinned_memory_pool_byte_size),
+      "setting total pinned memory byte size");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetExitOnError(server_options, exit_on_error),
+      "setting exit on error");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetStrictModelConfig(
+          server_options, strict_model_config),
+      "setting strict model configuration");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetStrictReadiness(
+          server_options, strict_readiness),
+      "setting strict readiness");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetExitTimeout(
+          server_options, std::max(0, exit_timeout_secs)),
+      "setting exit timeout");
 
-  server->SetId(server_id);
-  server->SetModelStorePath(model_store_path);
-  server->SetStrictModelConfigEnabled(strict_model_config);
-  server->SetStrictReadinessEnabled(strict_readiness);
-  server->SetProfilingEnabled(allow_profiling);
-  server->SetExitTimeoutSeconds(exit_timeout_secs);
+#ifdef TRTIS_ENABLE_LOGGING
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetLogInfo(server_options, log_info),
+      "setting log info enable");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetLogWarn(server_options, log_warn),
+      "setting log warn enable");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetLogError(server_options, log_error),
+      "setting log error enable");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetLogVerbose(server_options, log_verbose),
+      "setting log verbose level");
+#endif  // TRTIS_ENABLE_LOGGING
 
-  server->SetRepositoryPollSeconds(
-      (allow_poll_model_repository) ? std::max(0, repository_poll_secs) : 0);
+#ifdef TRTIS_ENABLE_METRICS
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetMetrics(server_options, allow_metrics_),
+      "setting metrics enable");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetGpuMetrics(server_options, allow_gpu_metrics),
+      "setting GPU metrics enable");
+#endif  // TRTIS_ENABLE_GRPC
 
-  server->SetTensorFlowSoftPlacementEnabled(tf_allow_soft_placement);
-  server->SetTensorFlowGPUMemoryFraction(tf_gpu_memory_fraction);
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetTensorFlowSoftPlacement(
+          server_options, tf_allow_soft_placement),
+      "setting tensorflow soft placement");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsSetTensorFlowGpuMemoryFraction(
+          server_options, tf_gpu_memory_fraction),
+      "setting tensorflow GPU memory fraction");
 
   return true;
 }
@@ -613,22 +1130,39 @@ Parse(nvidia::inferenceserver::InferenceServer* server, int argc, char** argv)
 int
 main(int argc, char** argv)
 {
-  // Create the inference server
-  server_ = new nvidia::inferenceserver::InferenceServer();
+  // Parse command-line to create the options for the inference
+  // server.
+  TRTSERVER_ServerOptions* server_options = nullptr;
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsNew(&server_options), "creating server options");
 
-  // Parse command-line using defaults provided by the inference
-  // server. Update inference server options appropriately.
-  if (!Parse(server_, argc, argv)) {
+  if (!Parse(server_options, argc, argv)) {
+    exit(1);
+  }
+
+  // Trace manager.
+  std::shared_ptr<nvidia::inferenceserver::TraceManager> trace_manager;
+
+  // Manager for shared memory blocks.
+  auto smb_manager =
+      std::make_shared<nvidia::inferenceserver::SharedMemoryBlockManager>();
+
+  // Create the server...
+  TRTSERVER_Server* server_ptr = nullptr;
+  FAIL_IF_ERR(
+      TRTSERVER_ServerNew(&server_ptr, server_options), "creating server");
+  FAIL_IF_ERR(
+      TRTSERVER_ServerOptionsDelete(server_options), "deleting server options");
+
+  std::shared_ptr<TRTSERVER_Server> server(server_ptr, TRTSERVER_ServerDelete);
+
+  // Configure and start tracing if specified on the command line.
+  if (!StartTracing(server, &trace_manager)) {
     exit(1);
   }
 
   // Start the HTTP, GRPC, and metrics endpoints.
-  if (!StartEndpoints(server_)) {
-    exit(1);
-  }
-
-  // Initialize the inference server
-  if (!server_->Init() && exit_on_failed_init_) {
+  if (!StartEndpoints(server, trace_manager, smb_manager)) {
     exit(1);
   }
 
@@ -638,37 +1172,42 @@ main(int argc, char** argv)
 
   // Wait until a signal terminates the server...
   while (!exiting_) {
-    uint32_t poll_secs = server_->RepositoryPollSeconds();
-
     // If enabled, poll the model repository to see if there have been
     // any changes.
-    if (poll_secs > 0) {
-      nvidia::inferenceserver::Status status = server_->PollModelRepository();
-      if (!status.IsOk()) {
-        LOG_ERROR << "Failed to poll model repository: " << status.Message();
-      }
+    if (repository_poll_secs_ > 0) {
+      LOG_IF_ERR(
+          TRTSERVER_ServerPollModelRepository(server.get()),
+          "failed to poll model repository");
     }
 
     // Wait for the polling interval (or a long time if polling is not
     // enabled). Will be woken if the server is exiting.
     std::unique_lock<std::mutex> lock(exit_mu_);
-    std::chrono::seconds wait_timeout((poll_secs == 0) ? 3600 : poll_secs);
+    std::chrono::seconds wait_timeout(
+        (repository_poll_secs_ == 0) ? 3600 : repository_poll_secs_);
     exit_cv_.wait_for(lock, wait_timeout);
   }
 
-  bool stop_status = server_->Stop();
+  TRTSERVER_Error* stop_err = TRTSERVER_ServerStop(server.get());
+  const int ret = (stop_err != nullptr) ? 1 : 0;
+  LOG_IF_ERR(stop_err, "failed to stop server");
 
-  if (grpc_service_) {
-    grpc_service_->Stop();
-  }
-  for (auto& http_eps : http_services_) {
-    if (http_eps != nullptr) {
-      http_eps->Stop();
-    }
-  }
-  if (metrics_service_) {
-    metrics_service_->Stop();
+  // Stop tracing and the HTTP, GRPC, and metrics endpoints.
+  StopTracing(trace_manager);
+  StopEndpoints();
+
+#ifdef TRTIS_ENABLE_ASAN
+  // Can invoke ASAN before exit though this is typically not very
+  // useful since there are many objects that are not yet destructed.
+  //  __lsan_do_leak_check();
+#endif  // TRTIS_ENABLE_ASAN
+
+  // FIXME. TF backend aborts if we attempt cleanup...
+  std::shared_ptr<TRTSERVER_Server>* keep_alive =
+      new std::shared_ptr<TRTSERVER_Server>(server);
+  if (keep_alive == nullptr) {
+    return 1;
   }
 
-  return (stop_status) ? 0 : 1;
+  return ret;
 }

@@ -25,6 +25,16 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+REPO_VERSION=${NVIDIA_TENSORRT_SERVER_VERSION}
+if [ "$#" -ge 1 ]; then
+    REPO_VERSION=$1
+fi
+if [ -z "$REPO_VERSION" ]; then
+    echo -e "Repository version must be specified"
+    echo -e "\n***\n*** Test Failed\n***"
+    exit 1
+fi
+
 CLIENT_LOG_BASE="./client_saved_model_shape"
 INFER_TEST=saved_model_shape_test.py
 
@@ -32,7 +42,7 @@ DATADIR=`pwd`/models
 
 SERVER=/opt/tensorrtserver/bin/trtserver
 # Allow more time to exit. Ensemble brings in too many models
-SERVER_ARGS="--model-store=$DATADIR --exit-timeout-secs=120"
+SERVER_ARGS="--model-repository=$DATADIR --exit-timeout-secs=120"
 SERVER_LOG_BASE="./server_saved_model_shape"
 source ../common/util.sh
 
@@ -44,7 +54,7 @@ SERVER_LOG=$SERVER_LOG_BASE.${TARGET}.log
 CLIENT_LOG=$CLIENT_LOG_BASE.${TARGET}.log
 
 rm -fr models && \
-    cp -r /data/inferenceserver/qa_noshape_model_repository models
+    cp -r /data/inferenceserver/${REPO_VERSION}/qa_noshape_model_repository models
 
 create_nop_modelfile `pwd`/libidentity.so `pwd`/models
 

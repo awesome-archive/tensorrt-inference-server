@@ -27,6 +27,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <map>
+#include <vector>
 
 // To avoid namespace and protobuf collision between TRTIS and
 // TensorFlow, we keep TensorFlow interface isolated to
@@ -47,6 +49,10 @@ extern "C" {
 
 // GPU device number that indicates that no gpu is available.
 #define TRTISTF_NO_GPU_DEVICE -1
+
+// GPU device number that indicates TRTIS should do nothing to control
+// the device alloaction for the network and let Tensorflow handle it.
+#define TRTISTF_MODEL_DEVICE -2
 
 // Max batch size value that indicates batching is not supported.
 #define TRTISTF_NO_BATCHING 0
@@ -79,6 +85,22 @@ typedef enum {
   TRTISTF_TYPE_FP64,
   TRTISTF_TYPE_STRING
 } TRTISTF_DataType;
+
+typedef enum {
+  TRTISTF_MODE_FP32,
+  TRTISTF_MODE_FP16,
+  TRTISTF_MODE_INT8,
+} TRTISTF_TFTRTPrecisionMode;
+
+// Config for TF-TRT optimization if specified
+typedef struct {
+  bool is_dynamic_op_;
+  int64_t max_batch_size_;
+  int64_t max_workspace_size_bytes_;
+  TRTISTF_TFTRTPrecisionMode precision_mode_;
+  int64_t minimum_segment_size_;
+  int64_t max_cached_engines_;
+} TRTISTF_TFTRTConfig;
 
 // A shape
 typedef struct {
@@ -136,11 +158,15 @@ TRTISTF_EXPORT void TRTISTF_TensorListDelete(TRTISTF_TensorList* list);
 
 
 // Create a new tensor with a given name, type and shape. 'shape_dims'
-// must be nullptr if shape_rank is 0.
+// must be nullptr if shape_rank is 0. If a tensor is intended to be used as
+// GPU input for model that supports GPU I/O (see TRTISTF_ModelMakeCallable),
+// 'tf_gpu_id' must be the same as the model's device id. Otherwise, negative
+// value should be provided. Note that a tensor may be created on CPU if
+// the data type is not supported for GPU tensor.
 // Return nullptr if failed to create the tensor.
 TRTISTF_EXPORT TRTISTF_Tensor* TRTISTF_TensorNew(
     const char* name, TRTISTF_DataType dtype, size_t shape_rank,
-    int64_t* shape_dims);
+    int64_t* shape_dims, int tf_gpu_id);
 
 // Return a tensor's datatype.
 TRTISTF_EXPORT TRTISTF_DataType TRTISTF_TensorDataType(TRTISTF_Tensor* tensor);
@@ -157,6 +183,9 @@ TRTISTF_Shape* TRTISTF_TensorShape(TRTISTF_Tensor* tensor);
 // types.. bad things might happen if called for string type tensor.
 TRTISTF_EXPORT char* TRTISTF_TensorData(TRTISTF_Tensor* tensor);
 
+// Check whether the memory type of the tensor data is GPU.
+TRTISTF_EXPORT bool TRTISTF_TensorIsGPUTensor(TRTISTF_Tensor* tensor);
+
 // Get the size, in bytes, of the tensor data. Defined only for
 // non-string types.. bad things might happen if called for string
 // type tensor.
@@ -165,17 +194,19 @@ TRTISTF_EXPORT size_t TRTISTF_TensorDataByteSize(TRTISTF_Tensor* tensor);
 // Get a string at a specified index within a tensor. Defined only for
 // string type.. bad things might happen if called for non-string type
 // tensor. The returned string is owned by the Tensor and must be
-// copied if the caller requires ownership.
+// copied if the caller requires ownership. Additionally returns the
+// 'length' of the string.
 TRTISTF_EXPORT const char* TRTISTF_TensorString(
-    TRTISTF_Tensor* tensor, size_t idx);
+    TRTISTF_Tensor* tensor, size_t idx, size_t* length);
 
 // Set a string at a specified index within a tensor. Defined only for
 // string type.. bad things might happen if called for non-string type
 // tensor. The provided string is copied by the tensor so the caller
 // retains ownership of 'str'. 'str' may be NULL to indicate that the
-// string should be set to empty.
+// string should be set to empty. 'length' denotes the size of the
+// character sequence to copy into the string within the tensor.
 TRTISTF_EXPORT void TRTISTF_TensorSetString(
-    TRTISTF_Tensor* tensor, size_t idx, const char* str);
+    TRTISTF_Tensor* tensor, size_t idx, const char* str, size_t length);
 
 //
 // Model
@@ -187,21 +218,36 @@ struct TRTISTF_Model;
 // Create a GraphDef model.
 TRTISTF_EXPORT TRTISTF_Error* TRTISTF_ModelCreateFromGraphDef(
     TRTISTF_Model** trtistf_model, const char* model_name,
-    const char* model_path, const int gpu_device, const bool has_graph_level,
+    const char* model_path, const int device_id, const bool has_graph_level,
     const int graph_level, const bool allow_gpu_memory_growth,
     const float per_process_gpu_memory_fraction,
-    const bool allow_soft_placement);
+    const bool allow_soft_placement,
+    const std::map<int, std::vector<float>>& memory_limit_mb,
+    const TRTISTF_TFTRTConfig* tftrt_config);
 
 // Create a SavedModel model.
 TRTISTF_EXPORT TRTISTF_Error* TRTISTF_ModelCreateFromSavedModel(
     TRTISTF_Model** trtistf_model, const char* model_name,
-    const char* model_path, const int gpu_device, const bool has_graph_level,
+    const char* model_path, const int device_id, const bool has_graph_level,
     const int graph_level, const bool allow_gpu_memory_growth,
     const float per_process_gpu_memory_fraction,
-    const bool allow_soft_placement);
+    const bool allow_soft_placement,
+    const std::map<int, std::vector<float>>& memory_limit_mb,
+    const TRTISTF_TFTRTConfig* tftrt_config);
 
 // Delete a model.
 TRTISTF_EXPORT void TRTISTF_ModelDelete(TRTISTF_Model* model);
+
+// Create a Callable for the model so that the inputs will be assumed to be from
+// GPU while the outputs will be produced on GPU. The Callable will assume the
+// inputs are on the same TF device (vGPU) as the model session.
+// Note that depending on the data type, GPU tensor may not be supported,
+// in such case, the callable will expect those unsupported I/Os to be on CPU.
+TRTISTF_Error* TRTISTF_ModelMakeCallable(
+    TRTISTF_Model* model, const char** input_names,
+    const TRTISTF_DataType* input_types, const size_t num_inputs,
+    const char** output_names, const TRTISTF_DataType* output_types,
+    const size_t num_outputs);
 
 // Get information about a model inputs. The returned list is owned by
 // the model and should not be modified or freed by the caller.

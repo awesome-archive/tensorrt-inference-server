@@ -52,12 +52,17 @@ CustomBackendFactory::Create(
 
 Status
 CustomBackendFactory::CreateBackend(
-    const std::string& path, const ModelConfig& model_config,
+    const std::string& model_repository_path, const std::string& model_name,
+    const int64_t version, const ModelConfig& model_config,
     std::unique_ptr<InferenceBackend>* backend)
 {
+  const auto path =
+      JoinPath({model_repository_path, model_name, std::to_string(version)});
+
   // Read all the files in 'path'.
   std::set<std::string> custom_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &custom_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &custom_files));
 
   std::unordered_map<std::string, std::string> custom_paths;
   for (const auto& filename : custom_files) {
@@ -74,7 +79,7 @@ CustomBackendFactory::CreateBackend(
   server_params[CustomServerParameter::INFERENCE_SERVER_VERSION] =
       backend_config_->inference_server_version;
   server_params[CustomServerParameter::MODEL_REPOSITORY_PATH] =
-      backend_config_->model_repository_path;
+      model_repository_path;
 
   // Create the backend for the model and all the execution contexts
   // requested for this model.

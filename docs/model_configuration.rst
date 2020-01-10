@@ -1,5 +1,5 @@
 ..
-  # Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+  # Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
   #
   # Redistribution and use in source and binary forms, with or without
   # modification, are permitted provided that the following conditions
@@ -151,14 +151,9 @@ minimal configuration above. Specifically:
   a model configuration file because the inference server can derive
   all the required settings automatically.
 
-* Some :ref:`TensorFlow SavedModel <section-tensorflow-models>` models
-  do not require a model configuration file. The models must specify
-  all inputs and outputs as fixed-size tensors (with an optional
-  initial batch dimension) for the model configuration to be generated
-  automatically. The easiest way to determine if a particular
-  SavedModel is supported is to try it with the server and check the
-  console log and :ref:`Status API <section-api-status>` to determine
-  if the model loaded successfully.
+* :ref:`TensorFlow SavedModel <section-tensorflow-models>` models do
+  not require a model configuration file because the inference server
+  can derive all the required settings automatically.
 
 * :ref:`ONNX Runtime ONNX <section-onnx-models>` models do not require
   a model configuration file because the inference server can derive
@@ -191,6 +186,13 @@ portions of the model configuration if necessary, such as
 <nvidia::inferenceserver::ModelConfig::cc_model_filenames>`, and
 :cpp:var:`tags <nvidia::inferenceserver::ModelConfig::tags>`.
 
+When serving a classification model, keep in mind that :cpp:var:`label_filename
+<nvidia::inferenceserver::ModelOutput::label_filename>` can not be automatically
+derived. You will need to either create a **config.pbtxt** file specifying all
+required :cpp:var:`output<nvidia::inferenceserver::ModelOutput>` along with the
+:cpp:var:`label_filename<nvidia::inferenceserver::ModelOutput::label_filename>`,
+or handle the mapping from model output to label in the client code directly.
+
 .. _section-datatypes:
 
 Datatypes
@@ -207,9 +209,9 @@ inference server does not support that datatype for that model.
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |Type          |TensorRT      |TensorFlow    |Caffe2        |ONNX Runtime  |PyTorch  |NumPy         |
 +==============+==============+==============+==============+==============+=========+==============+
-|TYPE_BOOL     |              |DT_BOOL       |BOOL          |BOOL          |kBool     |bool          |
+|TYPE_BOOL     |              |DT_BOOL       |BOOL          |BOOL          |kBool    |bool          |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
-|TYPE_UINT8    |              |DT_UINT8      |UINT8         |UINT8         |kByte     |uint8         |
+|TYPE_UINT8    |              |DT_UINT8      |UINT8         |UINT8         |kByte    |uint8         |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |TYPE_UINT16   |              |DT_UINT16     |UINT16        |UINT16        |         |uint16        |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
@@ -217,17 +219,17 @@ inference server does not support that datatype for that model.
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |TYPE_UINT64   |              |DT_UINT64     |              |UINT64        |         |uint64        |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
-|TYPE_INT8     | kINT8        |DT_INT8       |INT8          |INT8          |kChar     |int8          |
+|TYPE_INT8     | kINT8        |DT_INT8       |INT8          |INT8          |kChar    |int8          |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
-|TYPE_INT16    |              |DT_INT16      |INT16         |INT16         |kShort    |int16         |
+|TYPE_INT16    |              |DT_INT16      |INT16         |INT16         |kShort   |int16         |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
-|TYPE_INT32    | kINT32       |DT_INT32      |INT32         |INT32         |kInt    |int32         |
+|TYPE_INT32    | kINT32       |DT_INT32      |INT32         |INT32         |kInt     |int32         |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |TYPE_INT64    |              |DT_INT64      |INT64         |INT64         |kLong    |int64         |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |TYPE_FP16     | kHALF        |DT_HALF       |FLOAT16       |FLOAT16       |         |float16       |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
-|TYPE_FP32     | kFLOAT       |DT_FLOAT      |FLOAT         |FLOAT         |kFloat  |float32       |
+|TYPE_FP32     | kFLOAT       |DT_FLOAT      |FLOAT         |FLOAT         |kFloat   |float32       |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
 |TYPE_FP64     |              |DT_DOUBLE     |DOUBLE        |DOUBLE        |kDouble  |float64       |
 +--------------+--------------+--------------+--------------+--------------+---------+--------------+
@@ -409,7 +411,9 @@ GPU 0 and two execution instances on GPUs 1 and 2::
   ]
 
 The instance group setting is also used to enable exection of a model
-on the CPU. The following places two execution instances on the CPU::
+on the CPU. A model can be executed on the CPU even if there is a GPU
+available in the system. The following places two execution instances
+on the CPU::
 
   instance_group [
     {
@@ -454,12 +458,12 @@ Dynamic Batcher
 ^^^^^^^^^^^^^^^
 
 Dynamic batching is a feature of the inference server that allows
-non-batched inference requests to be combined by the server, so that a
-batch is created dynamically, resulting in the same increased
-throughput seen for batched inference requests. The dynamic batcher
-should be used for :ref:`stateless <section-models-and-schedulers>`
-models. The dynamically created batches are distributed to all
-:ref:`instances <section-instance-groups>` configured for the model.
+inference requests to be combined by the server, so that a batch is
+created dynamically, resulting in the same increased throughput seen
+for batched inference requests. The dynamic batcher should be used for
+:ref:`stateless <section-models-and-schedulers>` models. The
+dynamically created batches are distributed to all :ref:`instances
+<section-instance-groups>` configured for the model.
 
 Dynamic batching is enabled and configured independently for each
 model using the :cpp:var:`ModelDynamicBatching
@@ -499,9 +503,9 @@ model using the :cpp:var:`ModelSequenceBatching
 <nvidia::inferenceserver::ModelSequenceBatching>` settings in the
 model configuration. These settings control the sequence timeout as
 well as configuring how the inference server will send control signals
-to the model indicating sequence start and ready. See
-:ref:`section-models-and-schedulers` for more information and
-examples.
+to the model indicating sequence start, end, ready and
+correlation ID. See :ref:`section-models-and-schedulers` for more
+information and examples.
 
 The size of generated batches can be examined in aggregate using Count
 metrics, see :ref:`section-metrics`. Inference server verbose logging
@@ -533,3 +537,33 @@ optimization and prioritization settings for a model. These settings
 control if/how a model is optimized by the backend framework and how
 it is scheduled and executed by the inference server. See the protobuf
 documentation for the currently available settings.
+
+.. _section-optimization-policy-tensorrt:
+
+TensorRT Optimization
+^^^^^^^^^^^^^^^^^^^^^
+
+The TensorRT optimization is an especially powerful optimization that
+can be enabled for TensorFlow and ONNX models. When enabled for a
+model, TensorRT optimization will be applied to the model at load time
+or when it first receives inference requests. TensorRT optimizations
+include specializing and fusing model layers, and using reduced
+precision (for example 16-bit floating-point) to provide significant
+throughput and latency improvements.
+
+.. _section-model-warm-up:
+
+Model Warmup
+------------
+
+For some framework backends, model initialization may be delayed until the
+first inference is requested, TF-TRT optimization for example, which introduces
+unexpected latency seen by the client. The model configuration
+:cpp:var:`ModelWarmup <nvidia::inferenceserver::ModelWarmup>` is used to specify
+warmup settings for a model. The settings define a series of inference requests
+that the inference server should create to warm-up each model instance. A model
+instance will be served only if it completes the requests successfully.
+Note that the effect of warming up models varies depending on the framework
+backend, and it will cause the server to be less responsive to model update, so
+the users should experiment and choose the configuration that suits their need.
+See the protobuf documentation for the currently available settings.

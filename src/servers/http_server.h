@@ -25,26 +25,35 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-#include "src/core/status.h"
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+#include "src/core/trtserver.h"
+#include "src/servers/shared_memory_block_manager.h"
+#include "src/servers/tracer.h"
 
 namespace nvidia { namespace inferenceserver {
 
-class InferenceServer;
-
 class HTTPServer {
  public:
-  static Status CreateAPIServer(
-      InferenceServer* server,
+  static TRTSERVER_Error* CreateAPIServer(
+      const std::shared_ptr<TRTSERVER_Server>& server,
+      const std::shared_ptr<nvidia::inferenceserver::TraceManager>&
+          trace_manager,
+      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
       const std::map<int32_t, std::vector<std::string>>& port_map,
       const int thread_cnt,
       std::vector<std::unique_ptr<HTTPServer>>* http_servers);
 
-  static Status CreateMetricsServer(
-      int32_t port, int thread_cnt, const bool allow_gpu_metrics,
-      std::unique_ptr<HTTPServer>* metrics_server);
+  static TRTSERVER_Error* CreateMetricsServer(
+      const std::shared_ptr<TRTSERVER_Server>& server, int32_t port,
+      int thread_cnt, std::unique_ptr<HTTPServer>* metrics_server);
 
-  virtual Status Start() = 0;
-  virtual Status Stop() = 0;
+  virtual ~HTTPServer() = default;
+
+  virtual TRTSERVER_Error* Start() = 0;
+  virtual TRTSERVER_Error* Stop() = 0;
 };
 
 }}  // namespace nvidia::inferenceserver

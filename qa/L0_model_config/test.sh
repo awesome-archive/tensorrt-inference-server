@@ -25,6 +25,16 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+REPO_VERSION=${NVIDIA_TENSORRT_SERVER_VERSION}
+if [ "$#" -ge 1 ]; then
+    REPO_VERSION=$1
+fi
+if [ -z "$REPO_VERSION" ]; then
+    echo -e "Repository version must be specified"
+    echo -e "\n***\n*** Test Failed\n***"
+    exit 1
+fi
+
 CLIENT_LOG="./client.log"
 CLIENT=model_config_test.py
 
@@ -37,7 +47,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 TRIALS="tensorflow_savedmodel tensorflow_graphdef tensorrt_plan caffe2_netdef onnxruntime_onnx pytorch_libtorch custom"
 
-# Copy TensorRT plans into the test model repositories.
+# Copy fixed TensorRT plans into the test model repositories.
 for modelpath in \
         autofill_noplatform/tensorrt/bad_input_dims/1 \
         autofill_noplatform/tensorrt/bad_input_type/1 \
@@ -49,51 +59,86 @@ for modelpath in \
         autofill_noplatform/tensorrt/unknown_output/1 \
         autofill_noplatform_success/tensorrt/no_name_platform/1 \
         autofill_noplatform_success/tensorrt/empty_config/1     \
-        autofill_noplatform_success/tensorrt/no_config/1 ; do
+        autofill_noplatform_success/tensorrt/no_config/1 \
+        autofill_noplatform_success/tensorrt/incomplete_input/1 \
+        autofill_noplatform_success/tensorrt/incomplete_output/1 ; do
     mkdir -p $modelpath
-    cp /data/inferenceserver/qa_model_repository/plan_float32_float32_float32/1/model.plan \
+    cp /data/inferenceserver/${REPO_VERSION}/qa_model_repository/plan_float32_float32_float32/1/model.plan \
        $modelpath/.
 done
 
-# The tests in autofill_noplatform/ensemble_norun cannot be run until
-# DLIS-519 is resolved. Once that issue is resolve the tests should be
-# moved into autofill_noplatform/ensemble and the following
-# initialization should be uncommented.
-rm -fr autofill_noplatform/ensemble_norun
-#for modelpath in \
-#    autofill_noplatform/ensemble/invalid_input_map/invalid_input_map/1 \
-#        autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4_input4/1 \
-#        autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4_output3/1 \
-#        autofill_noplatform/ensemble/invalid_output_map/invalid_output_map/1 \
-#        autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4_input4/1 \
-#        autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4_output3/1 \
-#        autofill_noplatform/ensemble/invalid_batch_size/invalid_batch_size/1 \
-#        autofill_noplatform/ensemble/invalid_batch_size/invalid_batch_size/1 \
-#        autofill_noplatform/ensemble/invalid_batch_size/fp32_dim1_batch2/1 \
-#        autofill_noplatform/ensemble/invalid_batch_size/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/inconsistent_shape/inconsistent_shape/1 \
-#        autofill_noplatform/ensemble/inconsistent_shape/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/inconsistent_shape/fp32_dim3_batch4/1 \
-#        autofill_noplatform/ensemble/inconsistent_data_type/inconsistent_data_type/1 \
-#        autofill_noplatform/ensemble/inconsistent_data_type/fp32_dim1_batch2/1 \
-#        autofill_noplatform/ensemble/inconsistent_data_type/int32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/embedded_ensemble/ensemble/1 \
-#        autofill_noplatform/ensemble/embedded_ensemble/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/embedded_ensemble/inner_ensemble/1 \
-#        autofill_noplatform/ensemble/non_existing_model/non_existing_model/1 \
-#        autofill_noplatform/ensemble/non_existing_model/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/non_existing_model/fp32_dim1_batch4_output3/1 \
-#        autofill_noplatform/ensemble/self_circular_dependency/self_circular_dependency/1 \
-#        autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4/1 \
-#        autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4_input4/1 \
-#        autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4_output3/1 \
-#        autofill_noplatform/ensemble/circular_dependency/circular_dependency/1 \
-#        autofill_noplatform/ensemble/circular_dependency/circular_dependency_2/1 ; do
-#    mkdir -p $modelpath
-#    cp ./libidentity.so $modelpath/libcustom.so
-#done
+# Copy variable-sized TensorRT plans into the test model repositories.
+for modelpath in \
+        autofill_noplatform_success/tensorrt/no_name_platform_variable/1 \
+        autofill_noplatform_success/tensorrt/empty_config_variable/1     \
+        autofill_noplatform_success/tensorrt/no_config_variable/1 \
+        autofill_noplatform_success/tensorrt/hint_for_no_batch/1 \
+        autofill_noplatform_success/tensorrt/multi_prof_max_bs/1 \
+        autofill_noplatform_success/tensorrt/multi_prof_no_batch/1 ; do
+    mkdir -p $modelpath
+    cp /data/inferenceserver/${REPO_VERSION}/qa_variable_model_repository/plan_float32_float32_float32/1/model.plan \
+       $modelpath/.
+done
+
+for modelpath in \
+        autofill_noplatform/tensorrt/bad_dynamic_shapes_max/1 \
+        autofill_noplatform/tensorrt/bad_dynamic_shapes_min/1 ; do
+    mkdir -p $modelpath
+    cp /data/inferenceserver/${REPO_VERSION}/qa_variable_model_repository/plan_float32_float32_float32-4-32/1/model.plan \
+       $modelpath/.
+done
+
+for modelpath in \
+   autofill_noplatform/ensemble/invalid_input_map/invalid_input_map/1 \
+       autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4_input4/1 \
+       autofill_noplatform/ensemble/invalid_input_map/fp32_dim1_batch4_output3/1 \
+       autofill_noplatform/ensemble/invalid_output_map/invalid_output_map/1 \
+       autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4_input4/1 \
+       autofill_noplatform/ensemble/invalid_output_map/fp32_dim1_batch4_output3/1 \
+       autofill_noplatform/ensemble/invalid_batch_size/invalid_batch_size/1 \
+       autofill_noplatform/ensemble/invalid_batch_size/invalid_batch_size/1 \
+       autofill_noplatform/ensemble/invalid_batch_size/fp32_dim1_batch2/1 \
+       autofill_noplatform/ensemble/invalid_batch_size/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/inconsistent_shape/inconsistent_shape/1 \
+       autofill_noplatform/ensemble/inconsistent_shape/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/inconsistent_shape/fp32_dim3_batch4/1 \
+       autofill_noplatform/ensemble/inconsistent_data_type/inconsistent_data_type/1 \
+       autofill_noplatform/ensemble/inconsistent_data_type/fp32_dim1_batch2/1 \
+       autofill_noplatform/ensemble/inconsistent_data_type/int32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/non_existing_model/non_existing_model/1 \
+       autofill_noplatform/ensemble/non_existing_model/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/non_existing_model/fp32_dim1_batch4_output3/1 \
+       autofill_noplatform/ensemble/self_circular_dependency/self_circular_dependency/1 \
+       autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4_input4/1 \
+       autofill_noplatform/ensemble/self_circular_dependency/fp32_dim1_batch4_output3/1 \
+       autofill_noplatform/ensemble/unmapped_input/unmapped_input/1 \
+       autofill_noplatform/ensemble/unmapped_input/fp32_dim1_batch4/1 \
+       autofill_noplatform/ensemble/unmapped_input/fp32_dim1_batch4_input4/1 \
+       autofill_noplatform/ensemble/circular_dependency/circular_dependency/1 \
+       autofill_noplatform/ensemble/circular_dependency/circular_dependency_2/1 \
+       autofill_noplatform/ensemble/no_required_version/no_required_version/1 \
+       autofill_noplatform/ensemble/no_required_version/simple/1 \
+       autofill_noplatform/ensemble/no_required_version_2/no_required_version_2/1 \
+       autofill_noplatform/ensemble/no_required_version_2/simple/1 \
+       autofill_noplatform/ensemble/no_required_version_3/no_required_version_3/1 \
+       autofill_noplatform/ensemble/no_required_version_3/simple/1 \
+       autofill_noplatform_success/ensemble/embedded_ensemble/embedded_ensemble/1 \
+       autofill_noplatform_success/ensemble/embedded_ensemble/fp32_dim1_batch4/1 \
+       autofill_noplatform_success/ensemble/embedded_ensemble/inner_ensemble/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape/inconsistent_shape/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape/fp32_dim1_batch4/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape/fp32_dim2_nobatch/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape_2/inconsistent_shape_2/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape_2/fp32_dim1_batch4/1 \
+       autofill_noplatform_success/ensemble/inconsistent_shape_2/fp32_dim2_nobatch/1 \
+       autofill_noplatform_success/ensemble/unmapped_output/unmapped_output/1 \
+       autofill_noplatform_success/ensemble/unmapped_output/fp32_dim1_batch4_output3/1 ; do
+   mkdir -p $modelpath
+   cp ./libidentity.so $modelpath/libcustom.so
+done
 
 
 rm -f $SERVER_LOG_BASE* $CLIENT_LOG
@@ -103,7 +148,7 @@ for TRIAL in $TRIALS; do
     # Run all tests that require no autofill but that add the platform to
     # the model config before running the test
     for TARGET in `ls noautofill_platform`; do
-        SERVER_ARGS="--model-store=`pwd`/models --strict-model-config=true"
+        SERVER_ARGS="--model-repository=`pwd`/models --strict-model-config=true"
         SERVER_LOG=$SERVER_LOG_BASE.noautofill_platform_${TARGET}.log
 
         rm -fr models && mkdir models
@@ -156,7 +201,7 @@ for TARGET_DIR in `ls -d autofill_noplatform/*/*`; do
     TARGET_DIR_DOT=`echo $TARGET_DIR | tr / .`
     TARGET=`basename ${TARGET_DIR}`
 
-    SERVER_ARGS="--model-store=`pwd`/models --strict-model-config=false"
+    SERVER_ARGS="--model-repository=`pwd`/models --strict-model-config=false"
     SERVER_LOG=$SERVER_LOG_BASE.${TARGET_DIR_DOT}.log
 
     # If there is a config.pbtxt at the top-level of the test then
@@ -165,11 +210,11 @@ for TARGET_DIR in `ls -d autofill_noplatform/*/*`; do
     rm -fr models && mkdir models
     if [ -f ${TARGET_DIR}/config.pbtxt ]; then
         cp -r ${TARGET_DIR} models/.
+        EXPECTEDS=models/$TARGET/expected*
     else
         cp -r ${TARGET_DIR}/* models/.
+        EXPECTEDS=models/expected*
     fi
-
-    EXPECTEDS=models/$TARGET/expected*
 
     echo -e "Test ${TARGET_DIR}" >> $CLIENT_LOG
 
@@ -207,32 +252,37 @@ for TARGET_DIR in `ls -d autofill_noplatform_success/*/*`; do
     TARGET_DIR_DOT=`echo $TARGET_DIR | tr / .`
     TARGET=`basename ${TARGET_DIR}`
 
-    SERVER_ARGS="--model-store=`pwd`/models --strict-model-config=false"
+    SERVER_ARGS="--model-repository=`pwd`/models --strict-model-config=false"
     SERVER_LOG=$SERVER_LOG_BASE.${TARGET_DIR_DOT}.log
 
+    # If there is a config.pbtxt at the top-level of the test then
+    # assume that the directory is a single model. Otherwise assume
+    # that the directory is an entire model repository.
     rm -fr models && mkdir models
-    cp -r ${TARGET_DIR} models/.
+    if [ -f ${TARGET_DIR}/config.pbtxt ] || [ "$TARGET" = "no_config" ]  || [ "$TARGET" = "no_config_variable" ]; then
+        cp -r ${TARGET_DIR} models/.
+    else
+        cp -r ${TARGET_DIR}/* models/.
+    fi
 
     echo -e "Test $TARGET_DIR" >> $CLIENT_LOG
-
-    set +e
 
     run_server
     if [ "$SERVER_PID" == "0" ]; then
         echo -e "*** FAILED: unable to start $SERVER" >> $CLIENT_LOG
         RET=1
     else
+        set +e
         python ./compare_status.py --expected_dir models/$TARGET --model $TARGET >>$CLIENT_LOG 2>&1
         if [ $? -ne 0 ]; then
             echo -e "*** FAILED: unexpected model config" >> $CLIENT_LOG
             RET=1
         fi
+        set -e
 
         kill $SERVER_PID
         wait $SERVER_PID
     fi
-
-    set -e
 done
 
 if [ $RET -eq 0 ]; then

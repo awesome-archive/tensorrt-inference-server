@@ -27,6 +27,7 @@
 
 #include "src/backends/custom/custom.h"
 #include "src/core/backend.h"
+#include "src/core/backend_context.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
@@ -54,28 +55,20 @@ class CustomBackend : public InferenceBackend {
   // Init model on the context associated with 'runner_idx'.
   Status InitBackend(uint32_t runner_idx);
 
-  // Run model on the context associated with 'runner_idx' to
-  // execute for one or more requests.
-  void RunBackend(
-      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-      std::function<void(Status)> OnCompleteQueuedPayloads);
-
  private:
   DISALLOW_COPY_AND_ASSIGN(CustomBackend);
   friend std::ostream& operator<<(std::ostream&, const CustomBackend&);
   friend bool CustomGetNextInput(void*, const char*, const void**, uint64_t*);
   friend bool CustomGetOutput(
       void*, const char*, size_t, int64_t*, uint64_t, void**);
+  friend bool CustomGetNextInputV2(
+      void*, const char*, const void**, uint64_t*, CustomMemoryType*, int64_t*);
+  friend bool CustomGetOutputV2(
+      void*, const char*, size_t, int64_t*, uint64_t, void**, CustomMemoryType*,
+      int64_t*);
 
   // For each model instance there is a context.
-  struct Context {
-    // GPU device number that indicates that no gpu is available for a
-    // context
-    static constexpr int NO_GPU_DEVICE = -1;
-
-    // Max batch size value that indicates batching is not supported.
-    static constexpr int NO_BATCHING = 0;
-
+  struct Context : BackendContext {
     using IOSizeMap = std::unordered_map<std::string, size_t>;
 
     Context(
@@ -89,13 +82,10 @@ class CustomBackend : public InferenceBackend {
     // Return the shared library reported error string for 'err'.
     std::string LibraryErrorString(const int err);
 
-    // Run model to execute for one or more requests. This function
-    // assumes that it is only called by the single runner thread that
-    // is assigned to this context. A non-OK return status indicates
-    // an internal error that prevents any of the of requests from
-    // completing. If an error is isolate to a single request payload
-    // it will be reported in that payload.
-    Status Run(CustomBackend* base, std::vector<Scheduler::Payload>* payloads);
+    // See BackendContext::Run()
+    Status Run(
+        const InferenceBackend* base,
+        std::vector<Scheduler::Payload>* payloads) override;
 
     struct GetInputOutputContext {
       GetInputOutputContext(
@@ -105,30 +95,40 @@ class CustomBackend : public InferenceBackend {
       }
       CustomBackend::Context* context_;
       Scheduler::Payload* payload_;
+      // Variable for being compatible with V1 interface in the case of GPU I/O
+      std::vector<std::unique_ptr<char[]>> input_buffers_;
+      std::vector<std::tuple<void*, std::unique_ptr<char[]>, uint64_t>>
+          output_buffers_;
     };
+
+    // Callback used by custom backends to get the next block of input
+    // for a 'name'd input tensor. This function will enforce that
+    // the 'content' will be in CPU memory.
+    bool GetNextInput(
+        GetInputOutputContext* input_context, const char* name,
+        const void** content, uint64_t* content_byte_size);
 
     // Callback used by custom backends to get the next block of input
     // for a 'name'd input tensor.
     bool GetNextInput(
         GetInputOutputContext* input_context, const char* name,
-        const void** content, uint64_t* content_byte_size);
+        const void** content, uint64_t* content_byte_size,
+        CustomMemoryType* memory_type, int64_t* memory_type_id);
+
+    // Callback used by custom backends to get the output buffer for a
+    // 'name'd output tensor. This function will enforce that
+    // the 'content' will be in CPU memory.
+    bool GetOutput(
+        GetInputOutputContext* output_context, const char* name,
+        size_t shape_dim_cnt, int64_t* shape_dims, uint64_t content_byte_size,
+        void** content);
 
     // Callback used by custom backends to get the output buffer for a
     // 'name'd output tensor.
     bool GetOutput(
         GetInputOutputContext* output_context, const char* name,
         size_t shape_dim_cnt, int64_t* shape_dims, uint64_t content_byte_size,
-        void** content);
-
-    // Name of the model instance
-    std::string name_;
-
-    // The GPU index active when this context was created.
-    int gpu_device_;
-
-    // Maximum batch size to allow. NO_BATCHING indicates that
-    // batching is not supported.
-    int max_batch_size_;
+        void** content, CustomMemoryType* memory_type, int64_t* memory_type_id);
 
     // The handle to the shared library associated with this context.
     void* library_handle_;
@@ -142,24 +142,49 @@ class CustomBackend : public InferenceBackend {
     CustomFinalizeFn_t FinalizeFn_;
     CustomErrorStringFn_t ErrorStringFn_;
     CustomExecuteFn_t ExecuteFn_;
+    CustomExecuteV2Fn_t ExecuteV2Fn_;
+
+    // The version of the custom interface.
+    int custom_version_;
   };
 
   std::vector<std::string> server_params_;
-  std::vector<std::unique_ptr<Context>> contexts_;
 };
 
 std::ostream& operator<<(std::ostream& out, const CustomBackend& pb);
 
 // Callback used by custom backends to get the next block of input for
-// a 'name'd input tensor.
+// a 'name'd input tensor. The block will be guaranteed to be in CPU memory.
 bool CustomGetNextInput(
     void* input_context, const char* name, const void** content,
     uint64_t* content_byte_size);
 
 // Callback used by custom backends to get the output buffer for a
-// 'name'd output tensor.
+// 'name'd output tensor. The buffer will be in CPU memory.
 bool CustomGetOutput(
     void* output_context, const char* name, size_t shape_dim_cnt,
     int64_t* shape_dims, uint64_t content_byte_size, void** content);
+
+// See CustomGetNextInput, except that the block may not be in CPU memory.
+// Thus 'memory_type' acts as both input and output. On input gives the buffer
+// memory type preferred by the function caller. On output returns
+// the actual memory type of 'content'. 'memory_type_id' also acts as
+// both input and output. On input gives the buffer memory type id preferred by
+// the function caller. On output returns the actual memory type of 'content'.
+bool CustomGetNextInputV2(
+    void* input_context, const char* name, const void** content,
+    uint64_t* content_byte_size, CustomMemoryType* memory_type,
+    int64_t* memory_type_id);
+
+// See CustomGetOutput, except that the buffer is not limited to be
+// in CPU memory. 'memory_type' acts as both input and output. On input
+// gives the buffer memory type preferred by the function caller. On output
+// returns the actual memory type of 'content'. 'memory_type_id' also acts as
+// both input and output. On input gives the buffer memory type id preferred by
+// the function caller. On output returns the actual memory type of 'content'.
+bool CustomGetOutputV2(
+    void* output_context, const char* name, size_t shape_dim_cnt,
+    int64_t* shape_dims, uint64_t content_byte_size, void** content,
+    CustomMemoryType* memory_type, int64_t* memory_type_id);
 
 }}  // namespace nvidia::inferenceserver

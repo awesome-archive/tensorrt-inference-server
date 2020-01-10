@@ -55,9 +55,11 @@ except ImportError:
     bdist_wheel = None
 
 if os.name == 'nt':
-    platform_package_data = [ 'crequest.dll', 'request.dll', ]
+    platform_package_data = [ 'crequest.dll', 'request.dll']
 else:
-    platform_package_data = [ 'libcrequest.so', 'librequest.so', ]
+    platform_package_data = [ 'libcrequest.so', 'librequest.so', 'libcshm.so' ]
+    if bool(os.environ.get('CUDA_VERSION', 0)):
+        platform_package_data += ['libccudashm.so']
 
 setup(
     name='tensorrtserver',

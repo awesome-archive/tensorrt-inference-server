@@ -27,6 +27,7 @@
 #include "src/core/provider_utils.h"
 
 #include <google/protobuf/text_format.h>
+#include <deque>
 #include "src/core/backend.h"
 #include "src/core/constants.h"
 #include "src/core/logging.h"
@@ -89,13 +90,27 @@ NormalizeRequestHeader(
                 DimsListToString(io.dims()));
       }
 
-      // If there is a reshape for this input then clear the dims so
-      // that we set them to the reshape below. There cannot be a
-      // reshape if the tensor has variable-size dimensions so it is
-      // ok to throw away the request shape since it must be equal to
-      // the configuration shape.
+      // If there is a reshape for this input then clear the dims and
+      // set them to the reshape. As reshape may have variable-size dimensions,
+      // we need to record corresponding value
+      // so that we can set the value correctly for reshape.
       if (input_config->has_reshape()) {
+        std::deque<int64_t> variable_size_values;
+        for (int64_t idx = 0; idx < input_config->dims_size(); idx++) {
+          if (input_config->dims(idx) == -1) {
+            variable_size_values.push_back(io.dims(idx));
+          }
+        }
+
         io.clear_dims();
+        for (const auto& dim : input_config->reshape().shape()) {
+          if (dim == -1) {
+            io.add_dims(variable_size_values.front());
+            variable_size_values.pop_front();
+          } else {
+            io.add_dims(dim);
+          }
+        }
       }
     }
 
@@ -172,115 +187,6 @@ NormalizeRequestHeader(
     io.set_batch_byte_size(bs);
   }
 
-  return Status::Success;
-}
-
-Status
-EVBufferToInputMap(
-    const std::string& model_name, const InferRequestHeader& request_header,
-    evbuffer* input_buffer,
-    std::unordered_map<std::string, std::shared_ptr<SystemMemory>>& input_map)
-{
-  // Now need to create 'ref'. Each input has one entry in
-  // SystemMemory which gives a list of all the blocks of data for that
-  // input. These blocks are not necessarily contiguous so we keep
-  // track of each separately to avoid needing to copy everything into
-  // one buffer.
-  //
-  // Get the addr and size of each chunk of input data from the
-  // evbuffer.
-  struct evbuffer_iovec* v = nullptr;
-  int v_idx = 0;
-
-  int n = evbuffer_peek(input_buffer, -1, NULL, NULL, 0);
-  if (n > 0) {
-    v = static_cast<struct evbuffer_iovec*>(
-        alloca(sizeof(struct evbuffer_iovec) * n));
-    if (evbuffer_peek(input_buffer, -1, NULL, v, n) != n) {
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "unexpected error getting input buffers ");
-    }
-  }
-
-  // Get the byte-size for each input and from that get the blocks
-  // holding the data for that input
-  for (const auto& io : request_header.input()) {
-    auto memory_ref = std::make_shared<SystemMemoryReference>();
-    input_map.emplace(std::make_pair(
-        io.name(), std::static_pointer_cast<SystemMemory>(memory_ref)));
-
-    uint64_t byte_size = io.batch_byte_size();
-    while ((byte_size > 0) && (v_idx < n)) {
-      char* base = static_cast<char*>(v[v_idx].iov_base);
-      size_t base_size;
-      if (v[v_idx].iov_len > byte_size) {
-        base_size = byte_size;
-        v[v_idx].iov_base = static_cast<void*>(base + byte_size);
-        v[v_idx].iov_len -= byte_size;
-        byte_size = 0;
-      } else {
-        base_size = v[v_idx].iov_len;
-        byte_size -= v[v_idx].iov_len;
-        v_idx++;
-      }
-      memory_ref->AddBuffer(base, base_size);
-    }
-
-    if (byte_size != 0) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "unexpected size for input '" + io.name() + "', expecting " +
-              std::to_string(byte_size) + " bytes for model '" + model_name +
-              "'");
-    }
-  }
-
-  if (v_idx != n) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unexpected additional input data for model '" + model_name + "'");
-  }
-
-  return Status::Success;
-}
-
-Status
-GRPCInferRequestToInputMap(
-    const InferRequestHeader& request_header, const InferRequest& request,
-    std::unordered_map<std::string, std::shared_ptr<SystemMemory>>& input_map)
-{
-  // Make sure that the request is providing the same number of raw
-  // input tensor data.
-  if (request_header.input_size() != request.raw_input_size()) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "expected tensor data for " +
-            std::to_string(request_header.input_size()) + " inputs but got " +
-            std::to_string(request.raw_input_size()) +
-            " sets of data for model '" + request.model_name() + "'");
-  }
-
-  // Verify that the batch-byte-size of each input matches the size of
-  // the provided raw tensor data.
-  size_t idx = 0;
-  for (const auto& io : request_header.input()) {
-    auto memory_ref = std::make_shared<SystemMemoryReference>();
-    input_map.emplace(std::make_pair(
-        io.name(), std::static_pointer_cast<SystemMemory>(memory_ref)));
-
-    if (io.batch_byte_size() != request.raw_input(idx).size()) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "unexpected size " + std::to_string(request.raw_input(idx).size()) +
-              " for input '" + io.name() + "', expecting " +
-              std::to_string(io.batch_byte_size()) + " for model '" +
-              request.model_name() + "'");
-    }
-
-    const std::string& raw = request.raw_input(idx++);
-    memory_ref->AddBuffer(raw.c_str(), raw.size());
-  }
   return Status::Success;
 }
 

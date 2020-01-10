@@ -58,7 +58,7 @@ GetModelVersionFromPath(const std::string& path, int64_t* version)
 }
 
 Status
-GetSequenceControlProperties(
+GetBooleanSequenceControlProperties(
     const ModelSequenceBatching& batcher, const std::string& model_name,
     const ModelSequenceBatching::Control::Kind control_kind,
     const bool required, std::string* tensor_name, DataType* tensor_datatype,
@@ -157,6 +157,79 @@ GetSequenceControlProperties(
           if (fp32_true_value != nullptr) {
             *fp32_true_value = c.fp32_false_true(1);
           }
+        }
+      }
+    }
+  }
+
+  if (!seen_control) {
+    if (required) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "sequence batching control tensor must specify a " +
+              ModelSequenceBatching_Control_Kind_Name(control_kind) +
+              " value for " + model_name);
+    }
+
+    tensor_name->clear();
+  }
+
+  return Status::Success;
+}
+
+Status
+GetTypedSequenceControlProperties(
+    const ModelSequenceBatching& batcher, const std::string& model_name,
+    const ModelSequenceBatching::Control::Kind control_kind,
+    const bool required, std::string* tensor_name, DataType* tensor_datatype)
+{
+  // Make sure same tensor is not configured for multiple controls
+  std::set<std::string> seen_tensors;
+
+  // Make sure the control kind is not mentioned multiple times.
+  bool seen_control = false;
+
+  for (const auto& control_input : batcher.control_input()) {
+    if (control_input.name().empty()) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "sequence batching control tensor must have a name for " +
+              model_name);
+    }
+
+    if (seen_tensors.find(control_input.name()) != seen_tensors.end()) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "sequence batching control tensor '" + control_input.name() +
+              "' is specified for multiple control kinds for " + model_name);
+    }
+
+    seen_tensors.insert(control_input.name());
+
+    for (const auto& c : control_input.control()) {
+      if (c.kind() == control_kind) {
+        if (seen_control) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "sequence batching specifies multiple " +
+                  ModelSequenceBatching_Control_Kind_Name(control_kind) +
+                  " tensors for " + model_name);
+        }
+
+        *tensor_name = control_input.name();
+        if (tensor_datatype != nullptr) {
+          *tensor_datatype = c.data_type();
+        }
+
+        seen_control = true;
+
+        if ((c.int32_false_true_size() > 0) || (c.fp32_false_true_size() > 0)) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "sequence batching must not specify either 'int32_false_true' "
+              "nor 'fp32_false_true' for " +
+                  ModelSequenceBatching_Control_Kind_Name(control_kind) +
+                  " for " + model_name);
         }
       }
     }
@@ -296,17 +369,15 @@ GetNormalizedModelConfig(
       group->set_name(config->name());
     }
 
-    int device_cnt = 0;
+    // Creates a set of supported GPU device ids
+    std::set<int> supported_gpus;
 #ifdef TRTIS_ENABLE_GPU
-    cudaError_t cuerr = cudaGetDeviceCount(&device_cnt);
-    if (cuerr == cudaErrorNoDevice) {
-      device_cnt = 0;
-    } else if (cuerr != cudaSuccess) {
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "unable to get number of CUDA devices for " + config->name() + ": " +
-              cudaGetErrorString(cuerr));
+    // Get the total number of GPUs from the runtime library.
+    Status status = GetSupportedGPUs(supported_gpus);
+    if (!status.IsOk()) {
+      return status;
     }
+
 #endif  // TRTIS_ENABLE_GPU
 
     // Assign default name, kind and count to each instance group that
@@ -323,11 +394,11 @@ GetNormalizedModelConfig(
       // For KIND_AUTO... if there are no GPUs or if any of the listed
       // 'gpu's are not present, then use KIND_CPU.
       if (group.kind() == ModelInstanceGroup::KIND_AUTO) {
-        if (device_cnt == 0) {
+        if (supported_gpus.empty()) {
           group.set_kind(ModelInstanceGroup::KIND_CPU);
         } else {
           for (const int32_t gid : group.gpus()) {
-            if ((gid < 0) || (gid >= device_cnt)) {
+            if (supported_gpus.find(gid) == supported_gpus.end()) {
               group.set_kind(ModelInstanceGroup::KIND_CPU);
               break;
             }
@@ -347,7 +418,7 @@ GetNormalizedModelConfig(
       // GPUs
       if ((group.kind() == ModelInstanceGroup::KIND_GPU) &&
           (group.gpus().size() == 0)) {
-        for (int d = 0; d < device_cnt; d++) {
+        for (auto d : supported_gpus) {
           group.add_gpus(d);
         }
       }
@@ -371,6 +442,12 @@ ValidateModelConfig(
     return Status(
         RequestStatusCode::INVALID_ARG,
         "must specify 'platform' for " + config.name());
+  }
+
+  if (config.max_batch_size() < 0) {
+    return Status(
+        RequestStatusCode::INVALID_ARG,
+        "'max_batch_size' must be non-negative value for " + config.name());
   }
 
   if (!expected_platform.empty() && (config.platform() != expected_platform)) {
@@ -401,8 +478,7 @@ ValidateModelConfig(
   }
 
   // If dynamic batching is specified make sure the preferred batch
-  // sizes are positive and don't exceed maximum batch size. Make sure
-  // the max delay is non-negative.
+  // sizes are positive and don't exceed maximum batch size.
   if (config.has_dynamic_batching()) {
     for (const auto size : config.dynamic_batching().preferred_batch_size()) {
       if (size <= 0) {
@@ -432,19 +508,64 @@ ValidateModelConfig(
               config.name());
     }
 
-    // Make sure at most one SEQUENCE_START and one SEQUENCE_READY
-    // control is specified.
+    // Check boolean controls...
     std::string tensor_name;
-    RETURN_IF_ERROR(GetSequenceControlProperties(
+    RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
         batcher, config.name(),
         ModelSequenceBatching::Control::CONTROL_SEQUENCE_START,
-        true /* required */, &tensor_name, nullptr, nullptr, nullptr, nullptr,
+        false /* required */, &tensor_name, nullptr, nullptr, nullptr, nullptr,
         nullptr));
-    RETURN_IF_ERROR(GetSequenceControlProperties(
+    RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
+        batcher, config.name(),
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_END,
+        false /* required */, &tensor_name, nullptr, nullptr, nullptr, nullptr,
+        nullptr));
+    RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
         batcher, config.name(),
         ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY,
-        true /* required */, &tensor_name, nullptr, nullptr, nullptr, nullptr,
+        false /* required */, &tensor_name, nullptr, nullptr, nullptr, nullptr,
         nullptr));
+
+    // Check CORRID control and make sure it is one of the allowed types.
+    DataType tensor_datatype;
+    RETURN_IF_ERROR(GetTypedSequenceControlProperties(
+        batcher, config.name(),
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_CORRID,
+        false /* required */, &tensor_name, &tensor_datatype));
+    if (!tensor_name.empty()) {
+      if ((tensor_datatype != TYPE_UINT64) && (tensor_datatype != TYPE_INT64) &&
+          (tensor_datatype != TYPE_UINT32) && (tensor_datatype != TYPE_INT32)) {
+        return Status(
+            RequestStatusCode::INVALID_ARG,
+            "unexpected data type for control " +
+                ModelSequenceBatching_Control_Kind_Name(
+                    ModelSequenceBatching::Control::CONTROL_SEQUENCE_CORRID) +
+                " for " + config.name() +
+                ". Allowed data types are TYPE_UINT64, TYPE_INT64, TYPE_UINT32 "
+                "and TYPE_INT32");
+      }
+    }
+
+    // If oldest-first strategy is enabled make sure the preferred
+    // batch sizes are positive and don't exceed maximum batch size.
+    if (config.sequence_batching().has_oldest()) {
+      for (const auto size :
+           config.sequence_batching().oldest().preferred_batch_size()) {
+        if (size <= 0) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "sequence batching preferred batch size must be positive for " +
+                  config.name());
+        }
+        if (size > config.max_batch_size()) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "sequence batching preferred batch size must be <= max batch "
+              "size for " +
+                  config.name());
+        }
+      }
+    }
   }
 
   // If ensemble scheduling is specified, validate it.
@@ -469,20 +590,35 @@ ValidateModelConfig(
     // doesn't specify a non-existent GPU. Make sure non-KIND_GPU does
     // not specify any GPUs.
 #ifdef TRTIS_ENABLE_GPU
-    int dcnt = 0;
-    cudaError_t cuerr = cudaGetDeviceCount(&dcnt);
-    if (cuerr == cudaErrorNoDevice) {
-      dcnt = 0;
-    } else if (cuerr != cudaSuccess) {
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "failed to get device count for validation of model " +
-              config.name() + ": " + cudaGetErrorString(cuerr));
+    std::set<int> supported_gpus;
+    Status status = GetSupportedGPUs(supported_gpus);
+    if (!status.IsOk()) {
+      return status;
     }
 #endif  // TRTIS_ENABLE_GPU
 
     for (const auto& group : config.instance_group()) {
-      if (group.kind() == ModelInstanceGroup::KIND_GPU) {
+      // KIND_MODEL is supported only on TensorFlow.
+      if (group.kind() == ModelInstanceGroup::KIND_MODEL) {
+        if (group.gpus().size() > 0) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "instance group " + group.name() + " of model " + config.name() +
+                  " has kind KIND_MODEL but specifies one or more GPUs");
+        }
+#ifdef TRTIS_ENABLE_TENSORFLOW
+        if (!(config.platform() == kTensorFlowGraphDefPlatform ||
+              config.platform() == kTensorFlowSavedModelPlatform))
+#endif  // TRTIS_ENABLE_TENSORFLOW
+        {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "instance group " + group.name() + " of model " + config.name() +
+                  "on platform " + config.platform() +
+                  " has kind KIND_MODEL which is supported only on TensorFlow "
+                  "models");
+        }
+      } else if (group.kind() == ModelInstanceGroup::KIND_GPU) {
 #ifndef TRTIS_ENABLE_GPU
         return Status(
             RequestStatusCode::INVALID_ARG,
@@ -490,20 +626,30 @@ ValidateModelConfig(
                 " has kind KIND_GPU but server does not support GPUs");
 #else
         if (group.gpus().size() == 0) {
-          return Status(
-              RequestStatusCode::INVALID_ARG,
-              "instance group " + group.name() + " of model " + config.name() +
-                  " has kind KIND_GPU but specifies no GPUs");
-        }
-
-        for (const int32_t gid : group.gpus()) {
-          if ((gid < 0) || (gid >= dcnt)) {
+          if (supported_gpus.size() == 0) {
             return Status(
                 RequestStatusCode::INVALID_ARG,
                 "instance group " + group.name() + " of model " +
-                    config.name() + " specifies invalid GPU id " +
-                    std::to_string(gid) + ", valid GPUs are 0 - " +
-                    std::to_string(dcnt - 1));
+                    config.name() +
+                    " has kind KIND_GPU but no GPUs are available");
+          } else {
+            return Status(
+                RequestStatusCode::INVALID_ARG,
+                "instance group " + group.name() + " of model " +
+                    config.name() + " has kind KIND_GPU but specifies no GPUs");
+          }
+        }
+
+        for (const int32_t gid : group.gpus()) {
+          if (supported_gpus.find(gid) == supported_gpus.end()) {
+            return Status(
+                RequestStatusCode::INVALID_ARG,
+                "instance group " + group.name() + " of model " +
+                    config.name() +
+                    " specifies invalid or unsupported gpu id of " +
+                    std::to_string(gid) +
+                    ". The minimum required CUDA compute compatibility is " +
+                    std::to_string(TRTIS_MIN_COMPUTE_CAPABILITY));
           }
         }
 #endif  // !TRTIS_ENABLE_GPU
@@ -519,6 +665,33 @@ ValidateModelConfig(
             RequestStatusCode::INTERNAL, "instance group " + group.name() +
                                              " of model " + config.name() +
                                              " has unexpected kind KIND_AUTO");
+      }
+
+      if (
+#ifdef TRTIS_ENABLE_TENSORRT
+          (config.platform() != kTensorRTPlanPlatform) &&
+#endif  // TRTIS_ENABLE_TENSORRT
+          !group.profile().empty()) {
+        return Status(
+            RequestStatusCode::INVALID_ARG,
+            "instance group " + group.name() + " of model " + config.name() +
+                " and platform " + config.platform() +
+                "specifies profile field which is only supported for "
+                "TensorRT models");
+      } else if (!group.profile().empty()) {
+        for (const auto& profile : group.profile()) {
+          int profile_index;
+          RETURN_IF_ERROR(GetProfileIndex(profile, &profile_index));
+          if (profile_index < 0) {
+            return Status(
+                RequestStatusCode::INVALID_ARG,
+                "instance group " + group.name() + " of model " +
+                    config.name() + " and platform " + config.platform() +
+                    " specifies invalid profile " + profile +
+                    ". The field should contain the string representation of a "
+                    "non-negative integer.");
+          }
+        }
       }
     }
   }
@@ -545,6 +718,12 @@ ValidateEnsembleSchedulingConfig(const ModelConfig& config)
     return Status(
         RequestStatusCode::INVALID_ARG,
         "optimization should not be specified for ensemble '" + config.name() +
+            "'");
+  }
+  if (config.model_warmup_size() != 0) {
+    return Status(
+        RequestStatusCode::INVALID_ARG,
+        "model_warmup can not be specified for ensemble '" + config.name() +
             "'");
   }
 
@@ -708,22 +887,28 @@ BuildEnsembleGraph(
   return Status::Success;
 }
 
+namespace {
+
+template <class ModelIO>
 Status
-ValidateModelInput(const ModelInput& io, int32_t max_batch_size)
+ValidateIOShape(
+    const ModelIO& io, int32_t max_batch_size,
+    const std::string& message_prefix = "")
 {
   if (io.name().empty()) {
     return Status(
-        RequestStatusCode::INVALID_ARG, "model input must specify 'name'");
+        RequestStatusCode::INVALID_ARG, message_prefix + "must specify 'name'");
   }
 
   if (io.data_type() == DataType::TYPE_INVALID) {
     return Status(
-        RequestStatusCode::INVALID_ARG, "model input must specify 'data_type'");
+        RequestStatusCode::INVALID_ARG,
+        "model output must specify 'data_type'");
   }
 
   if (io.dims_size() == 0) {
     return Status(
-        RequestStatusCode::INVALID_ARG, "model input must specify 'dims'");
+        RequestStatusCode::INVALID_ARG, message_prefix + "must specify 'dims'");
   }
 
   // If the configuration is non-batching, then no input or output
@@ -733,7 +918,7 @@ ValidateModelInput(const ModelInput& io, int32_t max_batch_size)
       (max_batch_size == 0)) {
     return Status(
         RequestStatusCode::INVALID_ARG,
-        "model input cannot have empty reshape for non-batching model");
+        message_prefix + "cannot have empty reshape for non-batching model");
   }
 
   for (auto dim : io.dims()) {
@@ -741,42 +926,93 @@ ValidateModelInput(const ModelInput& io, int32_t max_batch_size)
     if ((dim < 1) && (dim != WILDCARD_DIM)) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "model input dimension must be integer >= 1, or " +
+          message_prefix + "dimension must be integer >= 1, or " +
               std::to_string(WILDCARD_DIM) +
               " to indicate a variable-size dimension");
     }
-
-    // Wildcards are not allowed in dims if there is a reshape.
-    if (io.has_reshape() && (dim == WILDCARD_DIM)) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "model input using reshape cannot have variable-size dimension " +
-              std::to_string(WILDCARD_DIM));
-    }
   }
 
-  // Wildcards and zeros are not allowed in reshape. Make sure the
-  // element count input dims matches the reshape.
   if (io.has_reshape()) {
+    // Zeros are not allowed in reshape.
     for (auto dim : io.reshape().shape()) {
-      if (dim <= 0) {
+      if ((dim < 1) && (dim != WILDCARD_DIM)) {
         return Status(
             RequestStatusCode::INVALID_ARG,
-            "model input reshape dimensions must be integer >= 1");
+            message_prefix + "reshape dimensions must be integer >= 1, or " +
+                std::to_string(WILDCARD_DIM) +
+                " to indicate a variable-size dimension");
       }
     }
 
+    const int64_t dims_size = GetElementCount(io.dims());
+    const int64_t reshape_size = GetElementCount(io.reshape().shape());
+
+    // dims and reshape must both have same element count
+    // or both have variable-size dimension.
     // Special case for empty reshape... expect dims to have element
     // count of 1.
-    const int64_t reshape_size =
-        std::max((int64_t)1, GetElementCount(io.reshape().shape()));
-    const int64_t dims_size = GetElementCount(io.dims());
-    if (dims_size != reshape_size) {
+    if ((dims_size != reshape_size) &&
+        ((reshape_size != 0) || (dims_size != 1))) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "model input has different size for dims and reshape");
+          message_prefix + "has different size for dims and reshape");
+    }
+
+    // shape contains variable-size dimension, in this case we compare if
+    // each pair of the trunks separated by variable-size dimension has
+    // the same element count. For instance, from [2, 4, -1, 6] to [8, -1, 1, 6]
+    // is valid reshape as 2 * 4 = 8 and 6 = 1 * 6.
+    if (dims_size == -1) {
+      std::vector<int64_t> dim_element_cnts;
+      std::vector<int64_t> reshape_element_cnts;
+      int64_t current_cnt = 1;
+      for (const auto& dim : io.dims()) {
+        if (dim != -1) {
+          current_cnt *= dim;
+        } else {
+          dim_element_cnts.push_back(current_cnt);
+          current_cnt = 1;
+        }
+      }
+      dim_element_cnts.push_back(current_cnt);
+
+      current_cnt = 1;
+      for (const auto& dim : io.reshape().shape()) {
+        if (dim != -1) {
+          current_cnt *= dim;
+        } else {
+          reshape_element_cnts.push_back(current_cnt);
+          current_cnt = 1;
+        }
+      }
+      reshape_element_cnts.push_back(current_cnt);
+
+      if (dim_element_cnts.size() != reshape_element_cnts.size()) {
+        return Status(
+            RequestStatusCode::INVALID_ARG,
+            message_prefix +
+                "has different number of variable-size dimensions for dims "
+                "and reshape");
+      }
+      for (size_t idx = 0; idx < dim_element_cnts.size(); idx++) {
+        if (dim_element_cnts[idx] != reshape_element_cnts[idx]) {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              message_prefix + "has different size for dims and reshape");
+        }
+      }
     }
   }
+
+  return Status::Success;
+}
+
+}  // namespace
+
+Status
+ValidateModelInput(const ModelInput& io, int32_t max_batch_size)
+{
+  RETURN_IF_ERROR(ValidateIOShape(io, max_batch_size, "model input "));
 
   if (((io.format() == ModelInput::FORMAT_NHWC) ||
        (io.format() == ModelInput::FORMAT_NCHW)) &&
@@ -812,74 +1048,7 @@ CheckAllowedModelInput(
 Status
 ValidateModelOutput(const ModelOutput& io, int32_t max_batch_size)
 {
-  if (io.name().empty()) {
-    return Status(
-        RequestStatusCode::INVALID_ARG, "model output must specify 'name'");
-  }
-
-  if (io.data_type() == DataType::TYPE_INVALID) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "model output must specify 'data_type'");
-  }
-
-  if (io.dims_size() == 0) {
-    return Status(
-        RequestStatusCode::INVALID_ARG, "model output must specify 'dims'");
-  }
-
-  // If the configuration is non-batching, then no input or output
-  // reshape can be empty as that would mean that input or output was
-  // always empty (no data).
-  if (io.has_reshape() && (io.reshape().shape_size() == 0) &&
-      (max_batch_size == 0)) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "model output cannot have empty reshape for non-batching model");
-  }
-
-  for (auto dim : io.dims()) {
-    // Dimension cannot be 0.
-    if ((dim < 1) && (dim != WILDCARD_DIM)) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "model output dimension must be integer >= 1, or " +
-              std::to_string(WILDCARD_DIM) +
-              " to indicate a variable-size dimension");
-    }
-
-    // Wildcards are not allowed in dims if there is a reshape.
-    if (io.has_reshape() && (dim == WILDCARD_DIM)) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "model output using reshape cannot have variable-size dimension " +
-              std::to_string(WILDCARD_DIM));
-    }
-  }
-
-  // Wildcards and zeros are not allowed in reshape. Make sure the
-  // element count output dims matches the reshape.
-  if (io.has_reshape()) {
-    for (auto dim : io.reshape().shape()) {
-      if (dim <= 0) {
-        return Status(
-            RequestStatusCode::INVALID_ARG,
-            "model output reshape dimensions must be integer >= 1");
-      }
-    }
-
-    // Special case for empty reshape... expect dims to have element
-    // count of 1.
-    const int64_t reshape_size =
-        std::max((int64_t)1, GetElementCount(io.reshape().shape()));
-    const int64_t dims_size = GetElementCount(io.dims());
-    if (dims_size != reshape_size) {
-      return Status(
-          RequestStatusCode::INVALID_ARG,
-          "model output has different size for dims and reshape");
-    }
-  }
-
+  RETURN_IF_ERROR(ValidateIOShape(io, max_batch_size, "model output "));
   return Status::Success;
 }
 
@@ -903,6 +1072,119 @@ CheckAllowedModelOutput(
   }
 
   return Status::Success;
+}
+
+Status
+ParseBoolParameter(
+    const std::string& key, std::string value, bool* parsed_value)
+{
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char c) { return std::tolower(c); });
+
+  if ((value == "true") || (value == "1")) {
+    *parsed_value = true;
+  } else if ((value == "false") || (value == "0")) {
+    *parsed_value = false;
+  } else {
+    return Status(
+        RequestStatusCode::INVALID_ARG,
+        "failed to convert " + key + " '" + value + "' to boolean value");
+  }
+
+  return Status::Success;
+}
+
+Status
+ParseLongLongParameter(
+    const std::string& key, const std::string& value, int64_t* parsed_value)
+{
+  try {
+    *parsed_value = std::stoll(value);
+  }
+  catch (const std::invalid_argument& ia) {
+    return Status(
+        RequestStatusCode::INVALID_ARG,
+        "failed to convert " + key + " '" + value + "' to integral number");
+  }
+
+  return Status::Success;
+}
+
+#ifdef TRTIS_ENABLE_GPU
+Status
+CheckGPUCompatibility(const int gpu_id)
+{
+  // Query the compute capability from the device
+  cudaDeviceProp cuprops;
+  cudaError_t cuerr = cudaGetDeviceProperties(&cuprops, gpu_id);
+  if (cuerr != cudaSuccess) {
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "unable to get CUDA device properties for GPU ID" +
+            std::to_string(gpu_id) + ": " + cudaGetErrorString(cuerr));
+  }
+  double compute_compability = cuprops.major + (cuprops.minor / 10.0);
+  if ((compute_compability > TRTIS_MIN_COMPUTE_CAPABILITY) ||
+      (abs(compute_compability - TRTIS_MIN_COMPUTE_CAPABILITY) < 0.01)) {
+    return Status::Success;
+  } else {
+    return Status(
+        RequestStatusCode::UNSUPPORTED,
+        "gpu " + std::to_string(gpu_id) + " has compute capability '" +
+            std::to_string(cuprops.major) + "." +
+            std::to_string(cuprops.minor) +
+            "' which is less than the minimum supported of '" +
+            std::to_string(TRTIS_MIN_COMPUTE_CAPABILITY) + "'");
+  }
+}
+
+Status
+GetSupportedGPUs(std::set<int>& supported_gpus)
+{
+  // Make sure set is empty before starting
+  supported_gpus.clear();
+
+  int device_cnt;
+  cudaError_t cuerr = cudaGetDeviceCount(&device_cnt);
+  if ((cuerr == cudaErrorNoDevice) || (cuerr == cudaErrorInsufficientDriver)) {
+    device_cnt = 0;
+  } else if (cuerr != cudaSuccess) {
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "unable to get number of CUDA devices: " +
+            std::string(cudaGetErrorString(cuerr)));
+  }
+
+  // populates supported_gpus
+  for (int gpu_id = 0; gpu_id < device_cnt; gpu_id++) {
+    Status status = CheckGPUCompatibility(gpu_id);
+    if (status.IsOk()) {
+      supported_gpus.insert(gpu_id);
+    }
+  }
+  return Status::Success;
+}
+
+#endif
+
+Status
+GetProfileIndex(const std::string& profile_name, int* profile_index)
+{
+  if (profile_name.empty()) {
+    return Status(
+        RequestStatusCode::INVALID_ARG, "profile name must not be empty");
+  } else {
+    try {
+      *profile_index = stoi(profile_name);
+    }
+    catch (const std::invalid_argument& ia) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "unable to parse '" + profile_name + "': " + ia.what());
+    }
+    return Status::Success;
+  }
 }
 
 }}  // namespace nvidia::inferenceserver

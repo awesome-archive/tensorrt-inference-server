@@ -25,7 +25,9 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#if defined(TRTIS_ENABLE_HTTP) || defined(TRTIS_ENABLE_METRICS)
 #include <event2/buffer.h>
+#endif
 #include "src/core/api.pb.h"
 #include "src/core/grpc_service.pb.h"
 #include "src/core/model_config.h"
@@ -39,15 +41,5 @@ class InferenceBackend;
 // input has a shape and a batch-byte-size.
 Status NormalizeRequestHeader(
     const InferenceBackend& is, InferRequestHeader& request_header);
-
-Status EVBufferToInputMap(
-    const std::string& model_name,
-    const InferRequestHeader& normalized_request_header, evbuffer* input_buffer,
-    std::unordered_map<std::string, std::shared_ptr<SystemMemory>>& input_map);
-
-Status GRPCInferRequestToInputMap(
-    const InferRequestHeader& normalized_request_header,
-    const InferRequest& request,
-    std::unordered_map<std::string, std::shared_ptr<SystemMemory>>& input_map);
 
 }}  // namespace nvidia::inferenceserver

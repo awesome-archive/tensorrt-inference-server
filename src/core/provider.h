@@ -25,11 +25,14 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#if defined(TRTIS_ENABLE_HTTP) || defined(TRTIS_ENABLE_METRICS)
 #include <event2/buffer.h>
+#endif
 #include "src/core/api.pb.h"
 #include "src/core/grpc_service.pb.h"
 #include "src/core/model_config.h"
 #include "src/core/status.h"
+#include "src/core/trtserver.h"
 
 namespace nvidia { namespace inferenceserver {
 
@@ -37,57 +40,89 @@ class InferenceBackend;
 class LabelProvider;
 
 //
-// SystemMemory used to access data in providers
+// Memory used to access data in providers
 //
-class SystemMemory {
+class Memory {
  public:
   // Get the 'idx'-th data block in the buffer. Using index to avoid
   // maintaining internal state such that one buffer can be shared
   // across multiple providers.
   // 'idx' zero base index. Valid indices are continuous.
   // 'byte_size' returns the byte size of the chunk of bytes.
+  // 'memory_type' returns the memory type of the chunk of bytes.
+  // 'memory_type_id' returns the memory type id of the chunk of bytes.
   // Return the pointer to the data block. Returns nullptr if 'idx' is
   // out of range
-  virtual const char* BufferAt(size_t idx, size_t* byte_size) const = 0;
+  virtual const char* BufferAt(
+      size_t idx, size_t* byte_size, TRTSERVER_Memory_Type* memory_type,
+      int64_t* memory_type_id) const = 0;
 
   // Return the total byte size of the data buffer
   size_t TotalByteSize() const { return total_byte_size_; }
 
  protected:
-  SystemMemory() : total_byte_size_(0) {}
+  Memory() : total_byte_size_(0) {}
   size_t total_byte_size_;
 };
 
-class SystemMemoryReference : public SystemMemory {
+class MemoryReference : public Memory {
  public:
   // Create a read-only data buffer as a reference to other data buffer
-  SystemMemoryReference();
+  MemoryReference();
 
-  //\see SystemMemory::BufferAt()
-  const char* BufferAt(size_t idx, size_t* byte_size) const override;
+  //\see Memory::BufferAt()
+  const char* BufferAt(
+      size_t idx, size_t* byte_size, TRTSERVER_Memory_Type* memory_type,
+      int64_t* memory_type_id) const override;
 
   // Add a 'buffer' with 'byte_size' as part of this data buffer
   // Return the index of the buffer
-  size_t AddBuffer(const char* buffer, size_t byte_size);
+  size_t AddBuffer(
+      const char* buffer, size_t byte_size, TRTSERVER_Memory_Type memory_type,
+      int64_t memory_type_id);
 
  private:
-  using Block = std::pair<const char*, size_t>;
+  struct Block {
+    Block(
+        const char* buffer, size_t byte_size, TRTSERVER_Memory_Type memory_type,
+        int64_t memory_type_id)
+        : buffer_(buffer), byte_size_(byte_size), memory_type_(memory_type),
+          memory_type_id_(memory_type_id)
+    {
+    }
+    const char* buffer_;
+    size_t byte_size_;
+    TRTSERVER_Memory_Type memory_type_;
+    int64_t memory_type_id_;
+  };
   std::vector<Block> buffer_;
 };
 
-class AllocatedSystemMemory : public SystemMemory {
+class AllocatedSystemMemory : public Memory {
  public:
-  // Create a continuous data buffer with 'byte_size'.
-  AllocatedSystemMemory(size_t byte_size);
+  // Create a continuous data buffer with 'byte_size', 'memory_type' and
+  // 'memory_id.
+  AllocatedSystemMemory(
+      size_t byte_size, TRTSERVER_Memory_Type memory_type,
+      int64_t memory_type_id);
 
-  //\see SystemMemory::BufferAt()
-  const char* BufferAt(size_t idx, size_t* byte_size) const override;
+  ~AllocatedSystemMemory();
 
+  //\see Memory::BufferAt()
+  const char* BufferAt(
+      size_t idx, size_t* byte_size, TRTSERVER_Memory_Type* memory_type,
+      int64_t* memory_type_id) const override;
+
+  // 'memory_type' returns the memory type of the chunk of bytes.
+  // 'memory_type_id' returns the memory type id of the chunk of bytes.
   // Return the mutable buffer
-  char* MutableBuffer();
+  char* MutableBuffer(
+      TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id);
 
  private:
-  std::unique_ptr<char[]> buffer_;
+  char* buffer_;
+  TRTSERVER_Memory_Type memory_type_;
+  int64_t memory_type_id_;
 };
 
 //
@@ -100,7 +135,7 @@ class InferRequestProvider {
   static Status Create(
       const std::string& model_name, const int64_t model_version,
       const InferRequestHeader& request_header,
-      const std::unordered_map<std::string, std::shared_ptr<SystemMemory>>&
+      const std::unordered_map<std::string, std::shared_ptr<Memory>>&
           input_buffer,
       std::shared_ptr<InferRequestProvider>* provider);
 
@@ -118,35 +153,44 @@ class InferRequestProvider {
 
   // Get the next contiguous chunk of bytes for the 'name'd
   // input. Return a pointer to the chunk in 'content'.
+  // If there are no more bytes for the input return 'content' == nullptr.
   // 'content_byte_size' acts as both input and output. On input
   // 'content_byte_size' is a hint of the maximum chunk size that
   // should be returned in 'content' and must be non-zero unless no
   // additional input is expected. On return 'content_byte_size' gives
-  // the actual size of the chunk pointed to by 'content'. If there
-  // are no more bytes for the input return 'content' == nullptr. If
-  // 'force_contiguous' is true then the entire (remaining) input will
-  // be returned as a single chunk. In some cases this will require
-  // copying the data.
+  // the actual size of the chunk pointed to by 'content'.
+  // 'memory_type' acts as both input and output. On input 'memory_type'
+  // is the buffer memory type preferred by the function caller, it will
+  // not affect the function behavior, but it will be propagated to the
+  // buffer and the buffer owner may collect such information for other use.
+  // On return 'memory_type' gives the actual memory type of the chunk
+  // pointed to by 'content'.
+  // 'memory_type_id' acts as both input and output. On input 'memory_type_id'
+  // is the buffer memory type id preferred by the function caller, it will
+  // not affect the function behavior, but it will be propagated to the
+  // buffer and the buffer owner may collect such information for other use.
+  // On return 'memory_type_id' gives the actual memory type id of the chunk
+  // pointed to by 'content'.
   virtual Status GetNextInputContent(
       const std::string& name, const void** content, size_t* content_byte_size,
-      bool force_contiguous);
+      TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id);
 
   // Retrieve the data buffer of input 'name'.
-  Status GetSystemMemory(
-      const std::string& name, std::shared_ptr<SystemMemory>* input_buffer);
+  Status GetMemory(
+      const std::string& name, std::shared_ptr<Memory>* input_buffer);
 
   // Set content for named inputs. If the input already has content,
-  // this content will be in-place of existing content.
+  // this content will be used in-place of existing content.
   struct InputOverride {
     std::vector<uint8_t> content_;
     DimsList dims_;
     DataType datatype_;
   };
 
-  using InputOverrideMap =
-      std::unordered_map<std::string, std::shared_ptr<InputOverride>>;
-  const std::shared_ptr<InputOverrideMap>& GetInputOverride() const;
-  Status SetInputOverride(const std::shared_ptr<InputOverrideMap>& override);
+  using InputOverrideMap = std::unordered_map<std::string, InputOverride>;
+  using InputOverrideMapVec = std::vector<std::shared_ptr<InputOverrideMap>>;
+  const InputOverrideMapVec& GetInputOverrides() const;
+  Status AddInputOverrides(const std::shared_ptr<InputOverrideMap>& overrides);
 
  protected:
   explicit InferRequestProvider(
@@ -168,8 +212,9 @@ class InferRequestProvider {
   const int64_t version_;
   InferRequestHeader request_header_;
 
-  // Input content overrides.
-  std::shared_ptr<InputOverrideMap> overrides_;
+  // Input content overrides. Multiple maps can be provided but a
+  // given tensor must not appear in more than one map.
+  InputOverrideMapVec overrides_maps_;
 
   // The inputs that have had their override content consumed by a
   // call to GetInputOverrideContent. A given input override will only
@@ -178,13 +223,9 @@ class InferRequestProvider {
   // has been consumed.
   std::set<std::string> overrides_consumed_;
 
-  // Placeholder for providing buffer as contiguous block.
-  std::vector<std::vector<char>> contiguous_buffers_;
-
   // Map from input name to the content of the input. The content contains
   // the buffer and index to the next data block for the named input.
-  std::unordered_map<
-      std::string, std::pair<std::shared_ptr<SystemMemory>, size_t>>
+  std::unordered_map<std::string, std::pair<std::shared_ptr<Memory>, size_t>>
       input_buffer_;
 };
 
@@ -204,7 +245,7 @@ class NULLInferRequestProvider : public InferRequestProvider {
 
   Status GetNextInputContent(
       const std::string& name, const void** content, size_t* content_byte_size,
-      bool force_contiguous) override;
+      TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id) override;
 
  private:
   // A buffer of zero bytes that is used commonly as the NULL input.
@@ -212,6 +253,9 @@ class NULLInferRequestProvider : public InferRequestProvider {
 
   // Mutex to guard buf_
   static std::mutex mu_;
+
+  // Record whether an input has been retrieved completely
+  std::unordered_map<std::string, size_t> inputs_remaining_bytes_;
 };
 
 //
@@ -225,15 +269,21 @@ class InferResponseProvider {
   using SecondaryLabelProviderMap =
       std::unordered_map<std::string, SecondaryLabelProvider>;
 
-  explicit InferResponseProvider(
+  static Status Create(
       const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider);
+      const std::shared_ptr<LabelProvider>& label_provider,
+      TRTSERVER_ResponseAllocator* allocator,
+      TRTSERVER_ResponseAllocatorAllocFn_t alloc_fn, void* alloc_userp,
+      TRTSERVER_ResponseAllocatorReleaseFn_t release_fn,
+      std::shared_ptr<InferResponseProvider>* infer_provider);
+
+  ~InferResponseProvider();
 
   // Get the full response header for this inference request.
-  virtual const InferResponseHeader& ResponseHeader() const = 0;
+  const InferResponseHeader& ResponseHeader() const;
 
   // Get a mutuable full response header for this inference request.
-  virtual InferResponseHeader* MutableResponseHeader() = 0;
+  InferResponseHeader* MutableResponseHeader();
 
   // Return true if this provider requires a named output.
   bool RequiresOutput(const std::string& name);
@@ -241,15 +291,19 @@ class InferResponseProvider {
   // Get a buffer to store results for a named output. Must be called
   // exactly once for each output that is being returned for the
   // request. The output must be listed in the request header.
-  virtual Status AllocateOutputBuffer(
+  Status AllocateOutputBuffer(
       const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape) = 0;
+      const std::vector<int64_t>& content_shape,
+      const TRTSERVER_Memory_Type preferred_memory_type,
+      const int64_t preferred_memory_type_id,
+      TRTSERVER_Memory_Type* actual_memory_type,
+      int64_t* actual_memory_type_id);
 
   // Get the address and byte-size of an output buffer. Error is
   // returned if the buffer is not already allocated.
   Status OutputBufferContents(
-      const std::string& name, const void** content,
-      size_t* content_byte_size) const;
+      const std::string& name, const void** content, size_t* content_byte_size,
+      TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id) const;
 
   // Get label provider.
   const std::shared_ptr<LabelProvider>& GetLabelProvider() const
@@ -269,22 +323,19 @@ class InferResponseProvider {
   // Finalize response based on a backend.
   Status FinalizeResponse(const InferenceBackend& is);
 
- protected:
-  struct Output;
+ private:
+  InferResponseProvider(
+      const InferRequestHeader& request_header,
+      const std::shared_ptr<LabelProvider>& label_provider,
+      TRTSERVER_ResponseAllocator* allocator,
+      TRTSERVER_ResponseAllocatorAllocFn_t alloc_fn, void* alloc_userp,
+      TRTSERVER_ResponseAllocatorReleaseFn_t release_fn);
 
-  // Check that 'name' is a valid output. If output is to be buffered,
-  // allocate space for it and point to that space with 'content'
-  Status CheckAndSetIfBufferedOutput(
-      const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape, Output** output);
-
- protected:
-  const InferRequestHeader& request_header_;
+  InferRequestHeader request_header_;
 
   // Map from output name to the InferRequestHeader output information
   // for that output.
-  std::unordered_map<std::string, const InferRequestHeader::Output*>
-      output_map_;
+  std::unordered_map<std::string, const InferRequestHeader::Output> output_map_;
 
   // Information about each output.
   struct Output {
@@ -293,9 +344,14 @@ class InferResponseProvider {
     size_t cls_count_;
     void* ptr_;
     size_t byte_size_;
+    TRTSERVER_Memory_Type memory_type_;
+    int64_t memory_type_id_;
 
     // Created buffer for non-RAW results
     std::unique_ptr<char[]> buffer_;
+
+    void* release_buffer_;
+    void* release_userp_;
   };
 
   // Ordered list of outputs as they "added" by AllocateOutputBuffer().
@@ -308,118 +364,11 @@ class InferResponseProvider {
   // This map should only be non-empty if the response provider is for models
   // that doesn't provide labels directly, i.e. ensemble models.
   SecondaryLabelProviderMap secondary_label_provider_map_;
-};
 
-//
-// Inference response provider for an internal request
-//
-class InternalInferResponseProvider : public InferResponseProvider {
- public:
-  // Create a InternalInferResponseProvider object.
-  static Status Create(
-      const InferenceBackend& is, const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider,
-      std::shared_ptr<InternalInferResponseProvider>* infer_provider);
-
-  const InferResponseHeader& ResponseHeader() const override;
-  InferResponseHeader* MutableResponseHeader() override;
-  Status AllocateOutputBuffer(
-      const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape) override;
-
-  // Retrieve the data buffer of output 'name'.
-  Status GetSystemMemory(
-      const std::string& name, std::shared_ptr<SystemMemory>* output_buffer);
-
- private:
-  InternalInferResponseProvider(
-      const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider);
-
-  InferResponseHeader response_header_;
-  std::unordered_map<std::string, std::shared_ptr<AllocatedSystemMemory>>
-      output_buffer_;
-};
-
-//
-// Inference response provider for a GRPC request
-//
-class GRPCInferResponseProvider : public InferResponseProvider {
- public:
-  // Initialize based on gRPC request
-  static Status Create(
-      const InferRequestHeader& request_header, InferResponse* response,
-      const std::shared_ptr<LabelProvider>& label_provider,
-      std::shared_ptr<GRPCInferResponseProvider>* infer_provider);
-
-  const InferResponseHeader& ResponseHeader() const override;
-  InferResponseHeader* MutableResponseHeader() override;
-  Status AllocateOutputBuffer(
-      const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape) override;
-
- private:
-  GRPCInferResponseProvider(
-      const InferRequestHeader& request_header, InferResponse* response,
-      const std::shared_ptr<LabelProvider>& label_provider)
-      : InferResponseProvider(request_header, label_provider),
-        response_(response)
-  {
-  }
-
-  InferResponse* response_;
-};
-
-//
-// Inference response provider for an HTTP request
-//
-class HTTPInferResponseProvider : public InferResponseProvider {
- public:
-  static Status Create(
-      evbuffer* output_buffer, const InferenceBackend& is,
-      const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider,
-      std::shared_ptr<HTTPInferResponseProvider>* infer_provider);
-
-  const InferResponseHeader& ResponseHeader() const override;
-  InferResponseHeader* MutableResponseHeader() override;
-  Status AllocateOutputBuffer(
-      const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape) override;
-
- private:
-  HTTPInferResponseProvider(
-      evbuffer* output_buffer, const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider);
-
-  InferResponseHeader response_header_;
-  evbuffer* output_buffer_;
-};
-
-//
-// Inference response provider that delegates output buffer allocation
-// via a callback.
-//
-class DelegatingInferResponseProvider : public InferResponseProvider {
- public:
-  static Status Create(
-      const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider,
-      std::shared_ptr<DelegatingInferResponseProvider>* infer_provider);
-
-  const InferResponseHeader& ResponseHeader() const override;
-  InferResponseHeader* MutableResponseHeader() override;
-  Status AllocateOutputBuffer(
-      const std::string& name, void** content, size_t content_byte_size,
-      const std::vector<int64_t>& content_shape) override;
-
- private:
-  DelegatingInferResponseProvider(
-      const InferRequestHeader& request_header,
-      const std::shared_ptr<LabelProvider>& label_provider)
-      : InferResponseProvider(request_header, label_provider)
-  {
-  }
+  TRTSERVER_ResponseAllocator* allocator_;
+  TRTSERVER_ResponseAllocatorAllocFn_t alloc_fn_;
+  void* alloc_userp_;
+  TRTSERVER_ResponseAllocatorReleaseFn_t release_fn_;
 
   InferResponseHeader response_header_;
 };

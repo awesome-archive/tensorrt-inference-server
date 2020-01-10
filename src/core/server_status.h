@@ -28,7 +28,6 @@
 #include <time.h>
 #include <mutex>
 #include "src/core/model_config.pb.h"
-#include "src/core/model_repository_manager.h"
 #include "src/core/server_status.pb.h"
 #include "src/core/status.h"
 
@@ -43,10 +42,16 @@ class ServerStatTimerScoped {
   enum Kind {
     // Stat for status request. Duration from request to response.
     STATUS,
-    // Stat for profile request. Duration from request to response.
-    PROFILE,
     // Stat for health request. Duration from request to response.
-    HEALTH
+    HEALTH,
+    // Stat for model control request. Duration from request to
+    // response.
+    MODEL_CONTROL,
+    // Stat for shared memory control request. Duration from request
+    // to response.
+    SHARED_MEMORY_CONTROL,
+    // Stat for repository request. Duration from request to response.
+    REPOSITORY
   };
 
   // Start server timer for a given status 'kind'.
@@ -74,30 +79,24 @@ class ServerStatTimerScoped {
   struct timespec start_;
 };
 
-// Stats collector for an inference request.
+// Stats collector for an inference request. If TRTIS_ENABLE_STATS is not
+// defined, it will only records timestamps that may be used by other objects
+// along the inference pipeline (i.e. scheduler)
 class ModelInferStats {
  public:
-  // A timer that starts on construction and stops on destruction. Can
-  // also be stopped and started manually and multiple times. The
-  // measured time is the accumulation of start-stop durations.
-  class ScopedTimer {
-   public:
-    ScopedTimer();
-    ~ScopedTimer();
-
-    struct timespec Start();
-    void Stop();
-
-    const struct timespec& StartTimeStamp() const { return start_; };
-
-   private:
-    friend class ModelInferStats;
-    struct timespec start_;
-    uint64_t cummulative_duration_ns_;
-    uint64_t* duration_ptr_;
+  enum class TimestampKind {
+    kRequestStart,        // Start request processing
+    kQueueStart,          // Request enters the queue
+    kComputeStart,        // Request leaves queue and starts compute
+    kComputeInputEnd,     // Requests finishes preparing inputs
+    kComputeOutputStart,  // Request starts processing outputs
+    kComputeEnd,          // Request completes compute
+    kRequestEnd,          // Done with request processing
+    COUNT__
   };
 
  public:
+#ifdef TRTIS_ENABLE_STATS
   // Start model-specific timer for 'model_name' and a given status
   // 'kind'.
   ModelInferStats(
@@ -105,13 +104,15 @@ class ModelInferStats {
       const std::string& model_name)
       : status_manager_(status_manager), model_name_(model_name),
         requested_model_version_(-1), batch_size_(0), gpu_device_(-1),
-        failed_(false), execution_count_(0), request_duration_ns_(0),
-        queue_duration_ns_(0), compute_duration_ns_(0)
+        failed_(false), execution_count_(0), extra_queue_duration_(0),
+        extra_compute_duration_(0), trace_manager_(nullptr), trace_(nullptr),
+        timestamps_((size_t)TimestampKind::COUNT__)
   {
+    memset(&timestamps_[0], 0, sizeof(struct timespec) * timestamps_.size());
   }
 
   // Report collected statistics.
-  ~ModelInferStats();
+  void Report();
 
   // Mark inferencing request as failed / not-failed.
   void SetFailed(bool failed) { failed_ = failed; }
@@ -138,22 +139,61 @@ class ModelInferStats {
   // the batched requests will count the execution).
   void SetModelExecutionCount(uint32_t count) { execution_count_ = count; }
 
-  // Get a ScopedTimer that measures entire inference request-response
-  // duration. The lifetime of 'timer' must not exceed the
-  // lifetime of 'this' object.
-  struct timespec StartRequestTimer(ScopedTimer* timer) const;
+  // Set the trace manager associated with the inference.
+  void SetTraceManager(TRTSERVER_TraceManager* tm) { trace_manager_ = tm; }
 
-  // Get a ScopedTimer that measures wait time spent in backend Run(),
-  // including queuing, scheduling. The lifetime of 'timer' must not
-  // exceed the lifetime of 'this' object.
-  struct timespec StartQueueTimer(ScopedTimer* timer) const;
+  // Get the trace manager associated with the inference.
+  TRTSERVER_TraceManager* GetTraceManager() const { return trace_manager_; }
 
-  // Get a ScopedTimer that measures model compute duration including
-  // H2D, compute and D2H. The lifetime of 'timer' must not exceed the
-  // lifetime of 'this' object.
-  struct timespec StartComputeTimer(ScopedTimer* timer) const;
+  // Create a trace object associated to the inference.
+  // Optional 'parent' can be provided if the trace object has a parent.
+  // Model name, model version, and trace manager should be set before calling
+  // this function. And each ModelInferStats instance should not call this
+  // function more than once.
+  void NewTrace(TRTSERVER_Trace* parent = nullptr);
+
+  // Get the trace object associated to the inference.
+  // Return nullptr if the inference will not be traced or if NewTrace()
+  // has not been called.
+  TRTSERVER_Trace* GetTrace() const { return trace_; }
+
+  // Include queue time from another stat into this stat's queue time.
+  void IncrementQueueDuration(const ModelInferStats& other);
+
+  // Include compute time from another stat into this stat's compute
+  // time.
+  void IncrementComputeDuration(const ModelInferStats& other);
+
+#else
+  // Start model-specific timer for 'model_name' and a given status
+  // 'kind'.
+  ModelInferStats() : timestamps_((size_t)TimestampKind::COUNT__)
+  {
+    memset(&timestamps_[0], 0, sizeof(struct timespec) * timestamps_.size());
+  }
+
+#endif  // TRTIS_ENABLE_STATS
+
+  // Get the timestamp for a kind.
+  const struct timespec& Timestamp(TimestampKind kind) const
+  {
+    return timestamps_[(size_t)kind];
+  }
+
+  // Set a timestamp to the current time. Return the timestamp.
+  const struct timespec& CaptureTimestamp(TimestampKind kind)
+  {
+    struct timespec& ts = timestamps_[(size_t)kind];
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts;
+  }
 
  private:
+#ifdef TRTIS_ENABLE_STATS
+  uint64_t Duration(
+      ModelInferStats::TimestampKind start_kind,
+      ModelInferStats::TimestampKind end_kind) const;
+
   std::shared_ptr<ServerStatusManager> status_manager_;
   std::shared_ptr<MetricModelReporter> metric_reporter_;
   const std::string model_name_;
@@ -163,9 +203,20 @@ class ModelInferStats {
   bool failed_;
 
   uint32_t execution_count_;
-  mutable uint64_t request_duration_ns_;
-  mutable uint64_t queue_duration_ns_;
-  mutable uint64_t compute_duration_ns_;
+
+  uint64_t extra_queue_duration_;
+  uint64_t extra_compute_duration_;
+
+  // The trace manager associated with these stats. This object is not owned by
+  // this ModelInferStats object and so is not destroyed by this object.
+  TRTSERVER_TraceManager* trace_manager_;
+
+  // The trace associated with these stats. This object is not owned by
+  // this ModelInferStats object and so is not destroyed by this object.
+  TRTSERVER_Trace* trace_;
+#endif  // TRTIS_ENABLE_STATS
+
+  std::vector<struct timespec> timestamps_;
 };
 
 // Manage access and updates to server status information.
@@ -182,18 +233,21 @@ class ServerStatusManager {
   Status UpdateConfigForModel(
       const std::string& model_name, const ModelConfig& model_config);
 
+  // Update the version ready state and reason for an existing model.
+  Status SetModelVersionReadyState(
+      const std::string& model_name, int64_t version, ModelReadyState state,
+      const ModelReadyStateReason& state_reason);
+
   // Get the entire server status, including status for all models.
   Status Get(
       ServerStatus* server_status, const std::string& server_id,
-      ServerReadyState server_ready_state, uint64_t server_uptime_ns,
-      ModelRepositoryManager* model_repository_manager) const;
+      ServerReadyState server_ready_state, uint64_t server_uptime_ns) const;
 
   // Get the server status and the status for a single model.
   Status Get(
       ServerStatus* server_status, const std::string& server_id,
       ServerReadyState server_ready_state, uint64_t server_uptime_ns,
-      const std::string& model_name,
-      ModelRepositoryManager* model_repository_manager) const;
+      const std::string& model_name) const;
 
   // Add a duration to the Server Stat specified by 'kind'.
   void UpdateServerStat(uint64_t duration, ServerStatTimerScoped::Kind kind);
@@ -201,13 +255,15 @@ class ServerStatusManager {
   // Add durations to Infer stats for a failed inference request.
   void UpdateFailedInferStats(
       const std::string& model_name, const int64_t model_version,
-      size_t batch_size, uint64_t request_duration_ns);
+      size_t batch_size, uint64_t last_timestamp_ms,
+      uint64_t request_duration_ns);
 
   // Add durations to Infer stats for a successful inference request.
   void UpdateSuccessInferStats(
       const std::string& model_name, const int64_t model_version,
-      size_t batch_size, uint32_t execution_cnt, uint64_t request_duration_ns,
-      uint64_t queue_duration_ns, uint64_t compute_duration_ns);
+      size_t batch_size, uint32_t execution_cnt, uint64_t last_timestamp_ms,
+      uint64_t request_duration_ns, uint64_t queue_duration_ns,
+      uint64_t compute_duration_ns);
 
  private:
   mutable std::mutex mu_;

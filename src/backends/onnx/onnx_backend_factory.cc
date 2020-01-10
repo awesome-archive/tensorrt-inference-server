@@ -68,7 +68,8 @@ OnnxBackendFactory::CreateBackend(
     std::unique_ptr<InferenceBackend>* backend)
 {
   std::set<std::string> onnx_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &onnx_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &onnx_files));
 
   std::unordered_map<std::string, std::string> models;
   for (const auto& filename : onnx_files) {
@@ -84,7 +85,8 @@ OnnxBackendFactory::CreateBackend(
   // Create the backend for the model and all the execution contexts
   // requested for this model.
   std::unique_ptr<OnnxBackend> local_backend(new OnnxBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
+  RETURN_IF_ERROR(
+      local_backend->Init(path, model_config, kOnnxRuntimeOnnxPlatform));
   RETURN_IF_ERROR(local_backend->CreateExecutionContexts(models));
 
   *backend = std::move(local_backend);

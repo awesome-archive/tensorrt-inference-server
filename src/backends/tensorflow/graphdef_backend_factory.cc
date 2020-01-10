@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "src/backends/tensorflow/graphdef_backend.h"
+#include "src/backends/tensorflow/tf_virtual_device.h"
 #include "src/core/constants.h"
 #include "src/core/filesystem.h"
 #include "src/core/logging.h"
@@ -49,6 +50,10 @@ GraphDefBackendFactory::Create(
   auto graphdef_backend_config =
       std::static_pointer_cast<Config>(backend_config);
   factory->reset(new GraphDefBackendFactory(graphdef_backend_config));
+
+  // Initalize VGPUs if required
+  VirtualDeviceTracker::Init(graphdef_backend_config->memory_limit_mb);
+
   return Status::Success;
 }
 
@@ -59,7 +64,8 @@ GraphDefBackendFactory::CreateBackend(
 {
   // Read all the graphdef files in 'path'.
   std::set<std::string> graphdef_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &graphdef_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &graphdef_files));
 
   std::unordered_map<std::string, std::string> graphdef_paths;
   for (const auto& filename : graphdef_files) {
@@ -70,9 +76,9 @@ GraphDefBackendFactory::CreateBackend(
   }
 
   std::unique_ptr<GraphDefBackend> local_backend(new GraphDefBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
-  RETURN_IF_ERROR(
-      local_backend->CreateExecutionContexts(backend_config_, graphdef_paths));
+  RETURN_IF_ERROR(local_backend->Init(
+      path, model_config, backend_config_.get(), kTensorFlowGraphDefPlatform));
+  RETURN_IF_ERROR(local_backend->CreateExecutionContexts(graphdef_paths));
 
   *backend = std::move(local_backend);
   return Status::Success;

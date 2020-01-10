@@ -39,6 +39,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(${TRTIS_ENABLE_GPU})
   add_definitions(-DTRTIS_ENABLE_GPU=1)
+  add_definitions(-DTRTIS_MIN_COMPUTE_CAPABILITY=${TRTIS_MIN_COMPUTE_CAPABILITY})
 endif() # TRTIS_ENABLE_GPU
 
 include_directories("${PROJECT_SOURCE_DIR}/../..")
@@ -56,7 +57,7 @@ endif() # TRTIS_ENABLE_GPU
 #
 # Protobuf
 #
-set(protobuf_MODULE_COMPATIBLE TRUE)
+set(protobuf_MODULE_COMPATIBLE TRUE CACHE BOOL "protobuf_MODULE_COMPATIBLE" FORCE)
 find_package(Protobuf CONFIG REQUIRED)
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 include_directories(${Protobuf_INCLUDE_DIRS})
@@ -69,9 +70,10 @@ message(STATUS "Using gRPC ${gRPC_VERSION}")
 include_directories($<TARGET_PROPERTY:gRPC::grpc,INTERFACE_INCLUDE_DIRECTORIES>)
 
 add_subdirectory(../../src/core src/core)
-add_subdirectory(../../src/custom src/custom)
+add_subdirectory(../../src/custom/sdk src/custom/sdk)
 add_subdirectory(../../src/custom/addsub src/custom/addsub)
 add_subdirectory(../../src/custom/identity src/custom/identity)
 add_subdirectory(../../src/custom/image_preprocess src/custom/image_preprocess)
 add_subdirectory(../../src/custom/param src/custom/param)
 add_subdirectory(../../src/custom/sequence src/custom/sequence)
+add_subdirectory(../../src/custom/dyna_sequence src/custom/dyna_sequence)

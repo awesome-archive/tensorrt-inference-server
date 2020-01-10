@@ -35,18 +35,20 @@ class SavedModelBackend : public BaseBackend {
   SavedModelBackend() = default;
   SavedModelBackend(SavedModelBackend&&) = default;
 
-  Status Init(const std::string& path, const ModelConfig& config);
-
   Status CreateTRTISTFModel(
-      const std::shared_ptr<GraphDefBackendFactory::Config>& backend_config,
-      const int gpu_device, const bool has_graph_level, const int graph_level,
+      const GraphDefBackendFactory::Config* backend_config, const int device_id,
+      const bool has_graph_level, const int graph_level,
       const std::string& model_path, TRTISTFModelHandle* trtistf_model,
-      IONameMap* input_name_map, IONameMap* output_name_map) override;
+      IONameMap* input_name_map, IONameMap* output_name_map,
+      const TRTISTF_TFTRTConfig* tftrt_config) override;
 
  private:
-  Status ValidateSequenceControl(
+  Status ValidateBooleanSequenceControl(
       const ModelSequenceBatching::Control::Kind control_kind,
-      const TRTISTF_IOList* inputs);
+      const TRTISTF_IOList* inputs, bool required, bool* have_control);
+  Status ValidateTypedSequenceControl(
+      const ModelSequenceBatching::Control::Kind control_kind,
+      const TRTISTF_IOList* inputs, bool required, bool* have_control);
 
   DISALLOW_COPY_AND_ASSIGN(SavedModelBackend);
 };

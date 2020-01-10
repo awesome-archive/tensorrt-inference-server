@@ -41,14 +41,12 @@ NVIDIA modifications are covered by the license terms that apply to the underlyi
 project or file.
 EOF
 
-if [[ "$(find /usr -name libcuda.so.1 | grep -v "compat") " == " " || "$(ls /dev/nvidiactl 2>/dev/null) " == " " ]]; then
+if [[ "$(find -L /usr -name libcuda.so.1 | grep -v "compat") " == " " || "$(ls /dev/nvidiactl 2>/dev/null) " == " " ]]; then
   echo
   echo "WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available."
   echo "   Use 'nvidia-docker run' to start this container; see"
   echo "   https://github.com/NVIDIA/nvidia-docker/wiki/nvidia-docker ."
-  ln -s `find / -name libcuda.so.1 -print -quit` /opt/tensorrtserver/lib/libcuda.so.1
   ln -s `find / -name libnvidia-ml.so -print -quit` /opt/tensorrtserver/lib/libnvidia-ml.so.1
-  ln -s `find / -name libnvidia-fatbinaryloader.so.${CUDA_DRIVER_VERSION} -print -quit` /opt/tensorrtserver/lib/libnvidia-fatbinaryloader.so.${CUDA_DRIVER_VERSION}
   export TENSORRT_SERVER_CPU_ONLY=1
 else
   ( /usr/local/bin/checkSMVER.sh )
@@ -68,6 +66,15 @@ else
       sleep 2
     fi
   fi
+fi
+
+if ! cat /proc/cpuinfo | grep flags | sort -u | grep avx >& /dev/null; then
+  echo
+  echo "ERROR: This container was built for CPUs supporting at least the AVX instruction set, but"
+  echo "       the CPU detected was $(cat /proc/cpuinfo |grep "model name" | sed 's/^.*: //' | sort -u), which does not report"
+  echo "       support for AVX.  An Illegal Instrution exception at runtime is likely to result."
+  echo "       See https://en.wikipedia.org/wiki/Advanced_Vector_Extensions#CPUs_with_AVX ."
+  sleep 2
 fi
 
 if [[ "$(df -k /dev/shm |grep ^shm |awk '{print $2}') " == "65536 " ]]; then

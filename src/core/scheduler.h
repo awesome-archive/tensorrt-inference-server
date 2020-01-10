@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <functional>
 #include "src/core/server_status.h"
 #include "src/core/status.h"
 
@@ -44,8 +45,7 @@ class Scheduler {
     Payload() = default;
     Payload(const Payload& payload) = delete;
     Payload(Payload&& payload)
-        : queue_timer_(std::move(payload.queue_timer_)),
-          stats_(std::move(payload.stats_)),
+        : stats_(std::move(payload.stats_)),
           request_provider_(std::move(payload.request_provider_)),
           response_provider_(std::move(payload.response_provider_)),
           complete_function_(std::move(payload.complete_function_)),
@@ -53,23 +53,20 @@ class Scheduler {
     {
     }
     Payload(
-        std::unique_ptr<ModelInferStats::ScopedTimer>& queue_timer,
         const std::shared_ptr<ModelInferStats>& stats,
         const std::shared_ptr<InferRequestProvider>& request_provider,
         const std::shared_ptr<InferResponseProvider>& response_provider,
-        const std::function<void(Status)> complete_function)
-        : queue_timer_(std::move(queue_timer)), stats_(stats),
-          request_provider_(request_provider),
+        const std::function<void(const Status&)> complete_function)
+        : stats_(stats), request_provider_(request_provider),
           response_provider_(response_provider),
           complete_function_(complete_function), status_(Status::Success)
     {
     }
 
-    std::unique_ptr<ModelInferStats::ScopedTimer> queue_timer_;
     std::shared_ptr<ModelInferStats> stats_;
     std::shared_ptr<InferRequestProvider> request_provider_;
     std::shared_ptr<InferResponseProvider> response_provider_;
-    std::function<void(Status)> complete_function_;
+    std::function<void(const Status&)> complete_function_;
     Status status_;
   };
 
@@ -80,6 +77,14 @@ class Scheduler {
   // non-OK error status indicates an initialization error that
   // prevents scheduler from using the runner.
   using StandardInitFunc = std::function<Status(uint32_t runner_idx)>;
+
+  // The prototype for the warmup function that will be called
+  // by the "standard" schedulers created based on a model's
+  // scheduling_choice settings. The warmup function is called once by
+  // the runner that will later execute payloads for 'runner_idx'. A
+  // non-OK error status indicates an warmup error that
+  // prevents scheduler from sending sample payloads to the runner.
+  using StandardWarmupFunc = std::function<Status(uint32_t runner_idx)>;
 
   // The prototype for the run function that will be called by the
   // "standard" schedulers created based on a model's
@@ -92,14 +97,14 @@ class Scheduler {
   // single request in 'payloads' it will be reported in that payload.
   using StandardRunFunc = std::function<void(
       uint32_t runner_idx, std::vector<Payload>* payloads,
-      std::function<void(Status)> OnRunComplete)>;
+      std::function<void(const Status&)> OnRunComplete)>;
 
   // Enqueue a request with the scheduler.
   virtual void Enqueue(
       const std::shared_ptr<ModelInferStats>& stats,
       const std::shared_ptr<InferRequestProvider>& request_provider,
       const std::shared_ptr<InferResponseProvider>& response_provider,
-      std::function<void(Status)> OnComplete) = 0;
+      std::function<void(const Status&)> OnComplete) = 0;
 };
 
 }}  // namespace nvidia::inferenceserver

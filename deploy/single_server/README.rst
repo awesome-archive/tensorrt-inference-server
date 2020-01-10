@@ -30,28 +30,37 @@
 TensorRT Inference Server Helm Chart
 ====================================
 
+    **NOTE: Some versions of Google Kubernetes Engine (GKE) contain a
+    regression in the handling of LD_LIBRARY_PATH that prevents the
+    inference server container from running correctly. See
+    https://issuetracker.google.com/issues/141255952. Use a GKE 1.13
+    or earlier version or a GKE 1.14.6 or later version to avoid this
+    issue.**
+
 Simple helm chart for installing a single instance of the NVIDIA
 TensorRT Inference Server. This guide assumes you already have a
 functional Kubernetes cluster and helm installed (see below for
 instructions on installing helm). Your cluster must be configured with
 support for the NVIDIA driver and CUDA version required by the version
-of the inference server you are using. For example, for inference
-server release 19.03 you need to have CUDA 10.1.
+of the inference server you are using.
+
+This helm chart is available from `TensorRT Inference Server GitHub
+<https://github.com/NVIDIA/tensorrt-inference-server>`_ or from the
+`NVIDIA GPU Cloud (NGC) <https://ngc.nvidia.com>`_
 
 The steps below describe how to set-up a model repository, use helm to
 launch the inference server, and then send inference requests to the
 running server.
 
-Get The Inference Server Source
--------------------------------
-
-The need to have a local copy of the inference server source
-repository to access the helm chart and the example model repository::
-
-  $ git clone https://github.com/NVIDIA/tensorrt-inference-server.git
-
 Model Repository
 ----------------
+
+If you already have a model repository you may use that with this helm
+chart. If you do not have a model repository, you can checkout a local
+copy of the inference server source repository to create an example
+model repository::
+
+  $ git clone https://github.com/NVIDIA/tensorrt-inference-server.git
 
 TensorRT Inference Server needs a repository of models that it will
 make available for inferencing. For this example you will place the
@@ -66,8 +75,45 @@ the GCS bucket::
 
   $ gsutil cp -r docs/examples/model_repository gs://tensorrt-inference-server-repository/model_repository
 
+GCS Permissions
+^^^^^^^^^^^^^^^
+
 Make sure the bucket permissions are set so that the inference server
-can access the model repository.
+can access the model repository. If the bucket is public then no
+additional changes are needed and you can proceed to "Running The
+Inference Server" section.
+
+If bucket premissions need to be set with the
+GOOGLE_APPLICATION_CREDENTIALS environment variable then perform the
+following steps:
+
+* Generate Google service account JSON with proper permissions called
+  *gcp-creds.json*.
+
+* Create a Kubernetes secret from this file::
+
+  $ kubectl create configmap gcpcreds --from-literal "project-id=myproject"
+  $ kubectl create secret generic gcpcreds --from-file gcp-creds.json
+
+* Modify templates/deployment.yaml to include the
+  GOOGLE_APPLICATION_CREDENTIALS environment variable::
+
+    env:
+      - name: GOOGLE_APPLICATION_CREDENTIALS
+        value: /secret/gcp-creds.json
+
+* Modify templates/deployment.yaml to mount the secret in a volume at
+  /secret::
+
+    volumeMounts:
+      - name: vsecret
+        mountPath: "/secret"
+        readOnly: true
+    ...
+    volumes:
+    - name: vsecret
+      secret:
+        secretName: gcpcreds
 
 Running The Inference Server
 ----------------------------
@@ -76,12 +122,13 @@ Once you have helm installed (see below if you need help installing
 helm) and your model repository ready, you can deploy the inference
 server using the default configuration with::
 
-  $ helm install deploy/single_server
+  $ cd <directory containing Chart.yaml>
+  $ helm install .
 
-You can use kubectl to wait until the inference server pod is running::
+Use kubectl to wait until the inference server pod is running::
 
   $ kubectl get pods
-  NAME                                                              READY   STATUS              RESTARTS   AGE
+  NAME                                                       READY   STATUS    RESTARTS   AGE
   wobbley-coral-tensorrt-inference-server-5f74b55885-n6lt7   1/1     Running   0          2m21s
 
 There are several ways of overriding the default configuration as
@@ -128,7 +175,7 @@ from the HTTP endpoint::
   $ curl 35.232.176.113:8000/api/status
 
 Follow the `instructions
-<https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/client.html#getting-the-client-libraries-and-examples>`_
+<https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/client.html#getting-the-client-examples>`_
 to get the example image classification client that can be used to
 perform inferencing using image classification models being served by
 the inference server. For example::

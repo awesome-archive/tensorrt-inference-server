@@ -39,14 +39,14 @@
 #include "src/core/api.pb.h"
 #include "src/core/backend.h"
 #include "src/core/constants.h"
+#include "src/core/cuda_utils.h"
 #include "src/core/logging.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
 #include "src/core/model_repository_manager.h"
-#include "src/core/profile.h"
+#include "src/core/pinned_memory_manager.h"
 #include "src/core/provider.h"
-#include "src/core/request_status.h"
 #include "src/core/server.h"
 #include "src/core/server_status.pb.h"
 
@@ -75,11 +75,11 @@ class ScopedAtomicIncrement {
 // InferenceServer
 //
 InferenceServer::InferenceServer()
-    : ready_state_(ServerReadyState::SERVER_INVALID), next_request_id_(1)
+    : ready_state_(ServerReadyState::SERVER_INVALID)
 {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  start_time_ns_ = ts.tv_sec * NANOS_PER_SECOND + ts.tv_nsec;
+  start_time_ns_ = TIMESPEC_TO_NANOS(ts);
 
   const char* vstr = getenv("TENSORRT_SERVER_VERSION");
   if (vstr != nullptr) {
@@ -89,19 +89,20 @@ InferenceServer::InferenceServer()
   id_ = "inference:0";
   strict_model_config_ = true;
   strict_readiness_ = true;
-  profiling_enabled_ = false;
   exit_timeout_secs_ = 30;
-  repository_poll_secs_ = 15;
+  pinned_memory_pool_size_ = 1 << 28;
 
   tf_soft_placement_enabled_ = true;
   tf_gpu_memory_fraction_ = 0.0;
+  tf_vgpu_memory_limits_ = {};
+
 
   inflight_request_counter_ = 0;
 
   status_manager_.reset(new ServerStatusManager(version_));
 }
 
-bool
+Status
 InferenceServer::Init()
 {
   Status status;
@@ -110,52 +111,71 @@ InferenceServer::Init()
 
   LOG_INFO << "Initializing TensorRT Inference Server";
 
-  if (model_store_path_.empty()) {
-    LOG_ERROR << "--model-store must be specified";
+  if (model_repository_paths_.empty()) {
     ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;
-    return false;
+    return Status(
+        RequestStatusCode::INVALID_ARG, "--model-repository must be specified");
   }
 
-  // Disable profiling at server start. Server API can be used to
-  // start/stop profiling.
-  status = ProfileStopAll();
+  // Create the shared memory manager that registers / unregisters and returns
+  // the shared memory regions that are current registered.
+  status =
+      SharedMemoryManager::Create(status_manager_, &shared_memory_manager_);
   if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
     ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;
-    return false;
+    return status;
   }
 
-  // Create the global manager for the repository. For now, all models are
-  // eagerly loaded below when the manager is created.
+  PinnedMemoryManager::Options options(pinned_memory_pool_size_);
+  status = PinnedMemoryManager::Create(options);
+  if (!status.IsOk()) {
+    ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;
+    return status;
+  }
+
+  status = EnablePeerAccess();
+  if (!status.IsOk()) {
+    // failed to enable peer access is not critical, just inefficient.
+    LOG_ERROR << status.Message();
+  }
+
+  // Create the model manager for the repository. Unless model control
+  // is disabled, all models are eagerly loaded when the manager is created.
+  bool polling_enabled = (model_control_mode_ == MODE_POLL);
+  bool model_control_enabled = (model_control_mode_ == MODE_EXPLICIT);
   status = ModelRepositoryManager::Create(
-      version_, status_manager_, model_store_path_, strict_model_config_,
-      tf_gpu_memory_fraction_, tf_soft_placement_enabled_,
-      repository_poll_secs_, true /* polling */, &model_repository_manager_);
+      this, version_, status_manager_, model_repository_paths_, startup_models_,
+      strict_model_config_, tf_gpu_memory_fraction_, tf_soft_placement_enabled_,
+      tf_vgpu_memory_limits_, polling_enabled, model_control_enabled,
+      &model_repository_manager_);
   if (!status.IsOk()) {
-    LOG_ERROR << status.Message();
     if (model_repository_manager_ == nullptr) {
       ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;
     } else {
-      // If error is returned while the manager is set, we assume the failure
-      // is due to a model not loading correctly so we just continue
-      // if not exiting on error.
+      // If error is returned while the manager is set, we assume the
+      // failure is due to a model not loading correctly so we just
+      // continue if not exiting on error.
       ready_state_ = ServerReadyState::SERVER_READY;
     }
-    return false;
+    return status;
   }
 
   ready_state_ = ServerReadyState::SERVER_READY;
-  return true;
+  return Status::Success;
 }
 
-bool
+Status
 InferenceServer::Stop()
 {
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status::Success;
+  }
+
   ready_state_ = ServerReadyState::SERVER_EXITING;
 
   if (model_repository_manager_ == nullptr) {
     LOG_INFO << "No server context available. Exiting immediately.";
-    return true;
+    return Status::Success;
   } else {
     LOG_INFO << "Waiting for in-flight inferences to complete.";
   }
@@ -178,16 +198,15 @@ InferenceServer::Stop()
     if (LOG_VERBOSE_IS_ON(1)) {
       for (const auto& m : live_models) {
         for (const auto& v : m.second) {
-          LOG_VERBOSE(1) << m.first << "v" << v.first << ": " << v.second;
+          LOG_VERBOSE(1) << m.first << " v" << v.first << ": " << v.second;
         }
       }
     }
 
     if ((live_models.size() == 0) && (inflight_request_counter_ == 0)) {
-      return true;
+      return Status::Success;
     }
     if (exit_timeout_iters <= 0) {
-      LOG_ERROR << "Exit timeout expired. Exiting immediately.";
       break;
     }
 
@@ -195,7 +214,9 @@ InferenceServer::Stop()
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
 
-  return false;
+  return Status(
+      RequestStatusCode::INTERNAL,
+      "Exit timeout expired. Exiting immediately.");
 }
 
 Status
@@ -212,185 +233,238 @@ InferenceServer::PollModelRepository()
   return Status::Success;
 }
 
-void
-InferenceServer::HandleHealth(
-    RequestStatus* request_status, bool* health, const std::string& mode)
+Status
+InferenceServer::IsLive(bool* live)
 {
-  *health = false;
+  *live = false;
 
   if (ready_state_ == ServerReadyState::SERVER_EXITING) {
-    RequestStatusFactory::Create(
-        request_status, 0, id_, RequestStatusCode::UNAVAILABLE,
-        "Server exiting");
-    return;
+    return Status(RequestStatusCode::UNAVAILABLE, "Server exiting");
   }
 
   ScopedAtomicIncrement inflight(inflight_request_counter_);
-  const uint64_t request_id = NextRequestId();
 
   // Server is considered live if it can respond to this health
   // request and it was able to initialize.
-  if (mode == "live") {
-    *health =
-        ((ready_state_ != ServerReadyState::SERVER_INVALID) &&
-         (ready_state_ != ServerReadyState::SERVER_FAILED_TO_INITIALIZE));
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, RequestStatusCode::SUCCESS);
-  }
-  // Server is considered ready if it is in the ready state.
-  // Additionally can report ready only when all models are ready.
-  else if (mode == "ready") {
-    *health = (ready_state_ == ServerReadyState::SERVER_READY);
-    if (*health && strict_readiness_) {
-      // Strict readiness... get the model status and make sure all
-      // models are ready.
-      ServerStatus server_status;
-      Status status = status_manager_->Get(
-          &server_status, id_, ready_state_, UptimeNs(),
-          model_repository_manager_.get());
-
-      *health = status.IsOk();
-      if (*health) {
-        for (const auto& ms : server_status.model_status()) {
-          // If a model status is present but no version status,
-          // the model is not ready as there is no proper version to be served
-          if (ms.second.version_status().size() == 0) {
-            *health = false;
-            goto strict_done;
-          }
-          for (const auto& vs : ms.second.version_status()) {
-            if (vs.second.ready_state() != ModelReadyState::MODEL_READY) {
-              *health = false;
-              goto strict_done;
-            }
-          }
-        }
-      strict_done:;
-      }
-    }
-
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, RequestStatusCode::SUCCESS);
-  } else {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, RequestStatusCode::UNKNOWN,
-        "unknown health mode '" + mode + "'");
-  }
+  *live =
+      ((ready_state_ != ServerReadyState::SERVER_INVALID) &&
+       (ready_state_ != ServerReadyState::SERVER_INITIALIZING) &&
+       (ready_state_ != ServerReadyState::SERVER_FAILED_TO_INITIALIZE));
+  return Status::Success;
 }
 
-void
-InferenceServer::HandleProfile(
-    RequestStatus* request_status, const std::string& cmd)
+Status
+InferenceServer::IsReady(bool* ready)
 {
-  if (ready_state_ != ServerReadyState::SERVER_READY) {
-    RequestStatusFactory::Create(
-        request_status, 0, id_, RequestStatusCode::UNAVAILABLE,
-        "Server not ready");
-    return;
+  *ready = false;
+
+  if (ready_state_ == ServerReadyState::SERVER_EXITING) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server exiting");
   }
 
   ScopedAtomicIncrement inflight(inflight_request_counter_);
-  const uint64_t request_id = NextRequestId();
 
-  if (!profiling_enabled_) {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, RequestStatusCode::UNSUPPORTED,
-        "Profile API not enabled");
-  } else if (cmd == "start") {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, ProfileStartAll());
-  } else if (cmd == "stop") {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, ProfileStopAll());
-  } else {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_, RequestStatusCode::INVALID_ARG,
-        "Unknown profile command '" + std::string(cmd) + "'");
+  // Server is considered ready if it is in the ready state.
+  // Additionally can report ready only when all models are ready.
+  *ready = (ready_state_ == ServerReadyState::SERVER_READY);
+  if (*ready && strict_readiness_) {
+    // Strict readiness... get the model status and make sure all
+    // models are ready.
+    ServerStatus server_status;
+    Status status =
+        status_manager_->Get(&server_status, id_, ready_state_, UptimeNs());
+
+    *ready = status.IsOk();
+    if (*ready) {
+      for (const auto& ms : server_status.model_status()) {
+        // If a model status is present but no version status,
+        // the model is not ready as there is no proper version to be served
+        if (ms.second.version_status().size() == 0) {
+          *ready = false;
+          goto strict_done;
+        }
+        for (const auto& vs : ms.second.version_status()) {
+          if (vs.second.ready_state() != ModelReadyState::MODEL_READY) {
+            *ready = false;
+            goto strict_done;
+          }
+        }
+      }
+    strict_done:;
+    }
   }
+
+  return Status::Success;
 }
 
 void
-InferenceServer::HandleInfer(
-    RequestStatus* request_status,
-    const std::shared_ptr<InferBackendHandle>& backend,
-    std::shared_ptr<InferRequestProvider> request_provider,
-    std::shared_ptr<InferResponseProvider> response_provider,
-    std::shared_ptr<ModelInferStats> infer_stats,
-    std::function<void()> OnCompleteInferRPC)
+InferenceServer::InferAsync(
+    const std::shared_ptr<InferenceBackend>& backend,
+    const std::shared_ptr<InferRequestProvider>& request_provider,
+    const std::shared_ptr<InferResponseProvider>& response_provider,
+    const std::shared_ptr<ModelInferStats>& infer_stats,
+    std::function<void(const Status&)> OnCompleteInfer)
 {
   if (ready_state_ != ServerReadyState::SERVER_READY) {
-    RequestStatusFactory::Create(
-        request_status, 0, id_, RequestStatusCode::UNAVAILABLE,
-        "Server not ready");
-    OnCompleteInferRPC();
+    OnCompleteInfer(Status(RequestStatusCode::UNAVAILABLE, "Server not ready"));
     return;
   }
 
   std::shared_ptr<ScopedAtomicIncrement> inflight(
       new ScopedAtomicIncrement(inflight_request_counter_));
-  const uint64_t request_id = NextRequestId();
 
   // Need to capture 'backend' to keep it alive... it goes away when
   // it goes out of scope which can cause the model to be unloaded,
   // and we don't want that to happen when a request is in flight.
-  auto OnCompleteHandleInfer = [this, OnCompleteInferRPC, backend,
-                                response_provider, request_status, request_id,
-                                infer_stats, inflight](Status status) mutable {
+  auto OnCompleteHandleInfer = [this, OnCompleteInfer, backend,
+                                response_provider,
+                                inflight](const Status& status) mutable {
     if (status.IsOk()) {
-      status =
-          response_provider->FinalizeResponse(*backend->GetInferenceBackend());
-      if (status.IsOk()) {
-        RequestStatusFactory::Create(request_status, request_id, id_, status);
-        OnCompleteInferRPC();
-        return;
-      }
+      OnCompleteInfer(response_provider->FinalizeResponse(*backend));
+    } else {
+      OnCompleteInfer(status);
     }
-
-    // Report only stats that are relevant for a failed inference run.
-    infer_stats->SetFailed(true);
-    LOG_VERBOSE(1) << "Infer failed: " << status.Message();
-    RequestStatusFactory::Create(request_status, request_id, id_, status);
-    OnCompleteInferRPC();
   };
 
-  // Need to set 'this' in each backend even though it is redundant after
-  // the first time. Once we remove TFS dependency we can construct each backend
-  // in a way that makes it directly aware of the inference server
-  backend->GetInferenceBackend()->SetInferenceServer(this);
-  backend->GetInferenceBackend()->Run(
+  backend->Run(
       infer_stats, request_provider, response_provider, OnCompleteHandleInfer);
 }
 
-void
-InferenceServer::HandleStatus(
-    RequestStatus* request_status, ServerStatus* server_status,
-    const std::string& model_name)
+Status
+InferenceServer::GetStatus(
+    ServerStatus* server_status, const std::string& model_name)
 {
   if (ready_state_ == ServerReadyState::SERVER_EXITING) {
-    RequestStatusFactory::Create(
-        request_status, 0, id_, RequestStatusCode::UNAVAILABLE,
-        "Server exiting");
-    return;
+    return Status(RequestStatusCode::UNAVAILABLE, "Server exiting");
   }
 
   ScopedAtomicIncrement inflight(inflight_request_counter_);
-  const uint64_t request_id = NextRequestId();
 
   // If no specific model request just return the entire status
   // object.
   if (model_name.empty()) {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_,
-        status_manager_->Get(
-            server_status, id_, ready_state_, UptimeNs(),
-            model_repository_manager_.get()));
+    return status_manager_->Get(server_status, id_, ready_state_, UptimeNs());
   } else {
-    RequestStatusFactory::Create(
-        request_status, request_id, id_,
-        status_manager_->Get(
-            server_status, id_, ready_state_, UptimeNs(), model_name,
-            model_repository_manager_.get()));
+    return status_manager_->Get(
+        server_status, id_, ready_state_, UptimeNs(), model_name);
   }
+
+  return Status::Success;
+}
+
+Status
+InferenceServer::GetModelRepositoryIndex(ModelRepositoryIndex* repository_index)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return model_repository_manager_->GetModelRepositoryIndex(repository_index);
+}
+
+Status
+InferenceServer::LoadModel(const std::string& model_name)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  auto action_type = ModelRepositoryManager::ActionType::LOAD;
+  return model_repository_manager_->LoadUnloadModel(model_name, action_type);
+}
+
+Status
+InferenceServer::UnloadModel(const std::string& model_name)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  auto action_type = ModelRepositoryManager::ActionType::UNLOAD;
+  return model_repository_manager_->LoadUnloadModel(model_name, action_type);
+}
+
+Status
+InferenceServer::RegisterSharedMemory(
+    const std::string& name, const std::string& shm_key, const size_t offset,
+    const size_t byte_size)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return shared_memory_manager_->RegisterSharedMemory(
+      name, shm_key, offset, byte_size);
+}
+
+#ifdef TRTIS_ENABLE_GPU
+Status
+InferenceServer::RegisterCudaSharedMemory(
+    const std::string& name, const cudaIpcMemHandle_t* cuda_shm_handle,
+    const size_t byte_size, const int device_id)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return shared_memory_manager_->RegisterCudaSharedMemory(
+      name, cuda_shm_handle, byte_size, device_id);
+}
+#endif  // TRTIS_ENABLE_GPU
+
+Status
+InferenceServer::UnregisterSharedMemory(const std::string& name)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return shared_memory_manager_->UnregisterSharedMemory(name);
+}
+
+Status
+InferenceServer::UnregisterAllSharedMemory()
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return shared_memory_manager_->UnregisterAllSharedMemory();
+}
+
+Status
+InferenceServer::SharedMemoryAddress(
+    const std::string& name, size_t offset, size_t byte_size,
+    void** shm_mapped_addr)
+{
+  return shared_memory_manager_->SharedMemoryAddress(
+      name, offset, byte_size, shm_mapped_addr);
+}
+
+Status
+InferenceServer::GetSharedMemoryStatus(SharedMemoryStatus* shm_status)
+{
+  if (ready_state_ != ServerReadyState::SERVER_READY) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Server not ready");
+  }
+
+  ScopedAtomicIncrement inflight(inflight_request_counter_);
+
+  return shared_memory_manager_->GetSharedMemoryStatus(shm_status);
 }
 
 uint64_t
@@ -399,50 +473,8 @@ InferenceServer::UptimeNs() const
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
 
-  uint64_t now_ns = now.tv_sec * NANOS_PER_SECOND + now.tv_nsec;
+  uint64_t now_ns = TIMESPEC_TO_NANOS(now);
   return now_ns - start_time_ns_;
-}
-
-//
-// InferBackendHandle
-//
-class InferBackendHandleImpl : public InferenceServer::InferBackendHandle {
- public:
-  InferBackendHandleImpl() = default;
-  Status Init(
-      const std::string& model_name, const int64_t model_version,
-      ModelRepositoryManager* model_repository_manager);
-
-  InferenceBackend* GetInferenceBackend() override
-  {
-    return backend_handle_->GetInferenceBackend();
-  }
-
- private:
-  std::shared_ptr<ModelRepositoryManager::BackendHandle> backend_handle_;
-};
-
-Status
-InferBackendHandleImpl::Init(
-    const std::string& model_name, const int64_t model_version,
-    ModelRepositoryManager* model_repository_manager)
-{
-  return model_repository_manager->GetBackendHandle(
-      model_name, model_version, &backend_handle_);
-}
-
-Status
-InferenceServer::InferBackendHandle::Create(
-    const InferenceServer* server, const std::string& model_name,
-    const int64_t model_version, std::shared_ptr<InferBackendHandle>* handle)
-{
-  InferBackendHandleImpl* bh = new InferBackendHandleImpl();
-  Status status = bh->Init(model_name, model_version, server->ModelManager());
-  if (status.IsOk()) {
-    handle->reset(bh);
-  }
-
-  return status;
 }
 
 }}  // namespace nvidia::inferenceserver

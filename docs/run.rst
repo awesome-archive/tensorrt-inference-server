@@ -35,6 +35,11 @@ supported GPUs, as explained in
 also be run on non-CUDA, non-GPU systems as described in
 :ref:`section-running-the-inference-server-without-gpu`.
 
+If you :ref:`build the inference server outside of Docker
+<section-building-the-server-with-cmake>`, you can then run the
+inference server without Docker, as explained in
+:ref:`section-running-the-inference-server-without-docker`.
+
 .. _section-example-model-repository:
 
 Example Model Repository
@@ -57,7 +62,7 @@ sure to checkout the release version of the branch that corresponds to
 the server you are using (or the master branch if you are using a
 server build from master)::
 
-  $ git checkout r19.05
+  $ git checkout r19.12
   $ cd docs/examples
   $ ./fetch_models.sh
 
@@ -66,7 +71,7 @@ An example ensemble model repository is also provided in the
 <https://github.com/NVIDIA/tensorrt-inference-server/tree/master/docs/examples/ensemble_model_repository>`_
 directory. It contains a custom image preprocess model, Caffe2
 ResNet50, and an ensemble (used by the :ref:`ensemble_image_client
-example <section-ensemble_image_classification_example>`).
+example <section-ensemble-image-classification-example>`).
 
 Before using the example ensemble model repository, in addition to
 fetching public model definition files as mentioned above, you must
@@ -95,16 +100,16 @@ Assuming the sample model repository is available in
 /path/to/model/repository, the following command runs the container
 you pulled from NGC or built locally::
 
-  $ nvidia-docker run --rm --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 -p8000:8000 -p8001:8001 -p8002:8002 -v/path/to/model/repository:/models <tensorrtserver image name> trtserver --model-store=/models
+  $ nvidia-docker run --rm --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 -p8000:8000 -p8001:8001 -p8002:8002 -v/path/to/model/repository:/models <tensorrtserver image name> trtserver --model-repository=/models
 
 Where *<tensorrtserver image name>* will be something like
-**nvcr.io/nvidia/tensorrtserver:19.05-py3** if you :ref:`pulled the
+**nvcr.io/nvidia/tensorrtserver:19.10-py3** if you :ref:`pulled the
 container from the NGC registry
 <section-installing-prebuilt-containers>`, or **tensorrtserver** if
 you :ref:`built it from source <section-building>`.
 
 The nvidia-docker -v option maps /path/to/model/repository on the host
-into the container at /models, and the -\\-model-store option to the
+into the container at /models, and the -\\-model-repository option to the
 server is used to point to /models as the model repository.
 
 The -p flags expose the container ports where the inference server
@@ -128,12 +133,27 @@ On a system without GPUs, the inference server should be run using
 docker instead of nvidia-docker, but is otherwise identical to what is
 described in :ref:`section-running-the-inference-server`::
 
-  $ docker run --rm --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 -p8000:8000 -p8001:8001 -p8002:8002 -v/path/to/model/repository:/models <tensorrtserver image name> trtserver --model-store=/models
+  $ docker run --rm --shm-size=1g --ulimit memlock=-1 --ulimit stack=67108864 -p8000:8000 -p8001:8001 -p8002:8002 -v/path/to/model/repository:/models <tensorrtserver image name> trtserver --model-repository=/models
 
 Because a GPU is not available, the inference server will be unable to
 load any model configuration that requires a GPU or that specifies a
 GPU instance by an :ref:`instance-group <section-instance-groups>`
 configuration.
+
+.. _section-running-the-inference-server-without-docker:
+
+Running The Inference Server Without Docker
+-------------------------------------------
+
+After :ref:`building the inference server outside of Docker
+<section-building-the-server-with-cmake>`, the *trtserver* binary will
+be in builddir/trtis/install/bin and the required shared libraries
+will be in builddir/trtis/install/lib. To run make sure that
+builddir/trtis/install/lib is on your library path (for example, by
+adding it to LD_LIBRARY_PATH), and then execute *trtserver* with the
+desired arguments::
+
+  $ builddir/trtis/install/bin/trtserver --model-repository=/models
 
 .. _section-checking-inference-server-status:
 

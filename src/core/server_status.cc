@@ -32,37 +32,9 @@
 #include "src/core/metric_model_reporter.h"
 #include "src/core/metrics.h"
 #include "src/core/provider.h"
+#include "src/core/tracing.h"
 
 namespace nvidia { namespace inferenceserver {
-
-namespace {
-
-void
-SetModelVersionReadyState(
-    ModelStatus& ms, ModelRepositoryManager* model_repository_manager)
-{
-  const std::string& model_name = ms.config().name();
-
-  // Set all model versions for which we have status to
-  // unavailable... and then override that with actual status for the
-  // versions that are currently being served.
-  auto& mvs = *ms.mutable_version_status();
-  for (auto& itr : mvs) {
-    itr.second.set_ready_state(ModelReadyState::MODEL_UNAVAILABLE);
-  }
-
-  // [TODO] Once ModelRepositoryManager (MRM) is improved, instead of polling
-  // version states from MRM, MRM will notify ServerStatusManager if there are
-  // version state changes. In this way, there is no cross referencing between
-  // these two classes.
-  const auto versions_and_states =
-      model_repository_manager->GetVersionStates(model_name);
-  for (const auto& version_and_state : versions_and_states) {
-    mvs[version_and_state.first].set_ready_state(version_and_state.second);
-  }
-}
-
-}  // namespace
 
 ServerStatusManager::ServerStatusManager(const std::string& server_version)
 {
@@ -112,19 +84,28 @@ ServerStatusManager::UpdateConfigForModel(
 }
 
 Status
-ServerStatusManager::Get(
-    ServerStatus* server_status, const std::string& server_id,
-    ServerReadyState server_ready_state, uint64_t server_uptime_ns,
-    ModelRepositoryManager* model_repository_manager) const
+ServerStatusManager::SetModelVersionReadyState(
+    const std::string& model_name, int64_t version, ModelReadyState state,
+    const ModelReadyStateReason& state_reason)
 {
   std::lock_guard<std::mutex> lock(mu_);
-  server_status->CopyFrom(server_status_);
-  server_status->set_id(server_id);
-  server_status->set_ready_state(server_ready_state);
-  server_status->set_uptime_ns(server_uptime_ns);
+  auto itr = server_status_.mutable_model_status()->find(model_name);
+  if (itr == server_status_.model_status().end()) {
+    return Status(
+        RequestStatusCode::INVALID_ARG,
+        "fail to update ready state for unknown model '" + model_name + "'");
+  }
 
-  for (auto& msitr : *server_status->mutable_model_status()) {
-    SetModelVersionReadyState(msitr.second, model_repository_manager);
+  auto vitr = itr->second.mutable_version_status()->find(version);
+  if (vitr == itr->second.version_status().end()) {
+    // Completely fresh
+    ModelVersionStatus version_status;
+    version_status.set_ready_state(state);
+    *version_status.mutable_ready_state_reason() = state_reason;
+    (*(itr->second.mutable_version_status()))[version] = version_status;
+  } else {
+    vitr->second.set_ready_state(state);
+    *(vitr->second.mutable_ready_state_reason()) = state_reason;
   }
 
   return Status::Success;
@@ -133,9 +114,22 @@ ServerStatusManager::Get(
 Status
 ServerStatusManager::Get(
     ServerStatus* server_status, const std::string& server_id,
+    ServerReadyState server_ready_state, uint64_t server_uptime_ns) const
+{
+  std::lock_guard<std::mutex> lock(mu_);
+  server_status->CopyFrom(server_status_);
+  server_status->set_id(server_id);
+  server_status->set_ready_state(server_ready_state);
+  server_status->set_uptime_ns(server_uptime_ns);
+
+  return Status::Success;
+}
+
+Status
+ServerStatusManager::Get(
+    ServerStatus* server_status, const std::string& server_id,
     ServerReadyState server_ready_state, uint64_t server_uptime_ns,
-    const std::string& model_name,
-    ModelRepositoryManager* model_repository_manager) const
+    const std::string& model_name) const
 {
   std::lock_guard<std::mutex> lock(mu_);
 
@@ -154,7 +148,6 @@ ServerStatusManager::Get(
 
   auto& ms = *server_status->mutable_model_status();
   ms[model_name].CopyFrom(itr->second);
-  SetModelVersionReadyState(ms[model_name], model_repository_manager);
 
   return Status::Success;
 }
@@ -174,17 +167,33 @@ ServerStatusManager::UpdateServerStat(
       break;
     }
 
-    case ServerStatTimerScoped::Kind::PROFILE: {
+    case ServerStatTimerScoped::Kind::HEALTH: {
       StatDuration* d =
-          server_status_.mutable_profile_stats()->mutable_success();
+          server_status_.mutable_health_stats()->mutable_success();
       d->set_count(d->count() + 1);
       d->set_total_time_ns(d->total_time_ns() + duration);
       break;
     }
 
-    case ServerStatTimerScoped::Kind::HEALTH: {
+    case ServerStatTimerScoped::Kind::MODEL_CONTROL: {
       StatDuration* d =
-          server_status_.mutable_health_stats()->mutable_success();
+          server_status_.mutable_model_control_stats()->mutable_success();
+      d->set_count(d->count() + 1);
+      d->set_total_time_ns(d->total_time_ns() + duration);
+      break;
+    }
+
+    case ServerStatTimerScoped::Kind::SHARED_MEMORY_CONTROL: {
+      StatDuration* d =
+          server_status_.mutable_shm_control_stats()->mutable_success();
+      d->set_count(d->count() + 1);
+      d->set_total_time_ns(d->total_time_ns() + duration);
+      break;
+    }
+
+    case ServerStatTimerScoped::Kind::REPOSITORY: {
+      StatDuration* d =
+          server_status_.mutable_repository_stats()->mutable_success();
       d->set_count(d->count() + 1);
       d->set_total_time_ns(d->total_time_ns() + duration);
       break;
@@ -195,7 +204,7 @@ ServerStatusManager::UpdateServerStat(
 void
 ServerStatusManager::UpdateFailedInferStats(
     const std::string& model_name, const int64_t model_version,
-    size_t batch_size, uint64_t request_duration_ns)
+    size_t batch_size, uint64_t last_timestamp_ms, uint64_t request_duration_ns)
 {
   std::lock_guard<std::mutex> lock(mu_);
 
@@ -212,12 +221,18 @@ ServerStatusManager::UpdateFailedInferStats(
     auto mvs_itr = mvs.find(model_version);
     if (mvs_itr == mvs.end()) {
       ModelVersionStatus& version_status = mvs[model_version];
+      version_status.set_last_inference_timestamp_milliseconds(
+          last_timestamp_ms);
       InferRequestStats& stats =
           (*version_status.mutable_infer_stats())[batch_size];
       stats.mutable_failed()->set_count(1);
       stats.mutable_failed()->set_total_time_ns(request_duration_ns);
     } else {
       ModelVersionStatus& version_status = mvs_itr->second;
+      if (last_timestamp_ms > 0) {
+        version_status.set_last_inference_timestamp_milliseconds(
+            last_timestamp_ms);
+      }
       auto& is = *version_status.mutable_infer_stats();
       auto is_itr = is.find(batch_size);
       if (is_itr == is.end()) {
@@ -237,8 +252,9 @@ ServerStatusManager::UpdateFailedInferStats(
 void
 ServerStatusManager::UpdateSuccessInferStats(
     const std::string& model_name, const int64_t model_version,
-    size_t batch_size, uint32_t execution_cnt, uint64_t request_duration_ns,
-    uint64_t queue_duration_ns, uint64_t compute_duration_ns)
+    size_t batch_size, uint32_t execution_cnt, uint64_t last_timestamp_ms,
+    uint64_t request_duration_ns, uint64_t queue_duration_ns,
+    uint64_t compute_duration_ns)
 {
   std::lock_guard<std::mutex> lock(mu_);
 
@@ -259,6 +275,8 @@ ServerStatusManager::UpdateSuccessInferStats(
       ModelVersionStatus& version_status = mvs[model_version];
       version_status.set_model_inference_count(batch_size);
       version_status.set_model_execution_count(execution_cnt);
+      version_status.set_last_inference_timestamp_milliseconds(
+          last_timestamp_ms);
       new_stats = &((*version_status.mutable_infer_stats())[batch_size]);
     } else {
       ModelVersionStatus& version_status = mvs_itr->second;
@@ -266,6 +284,10 @@ ServerStatusManager::UpdateSuccessInferStats(
           version_status.model_inference_count() + batch_size);
       version_status.set_model_execution_count(
           version_status.model_execution_count() + execution_cnt);
+      if (last_timestamp_ms > 0) {
+        version_status.set_last_inference_timestamp_milliseconds(
+            last_timestamp_ms);
+      }
 
       auto& is = *version_status.mutable_infer_stats();
       auto is_itr = is.find(batch_size);
@@ -307,55 +329,54 @@ ServerStatTimerScoped::~ServerStatTimerScoped()
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
 
-    uint64_t start_ns = start_.tv_sec * NANOS_PER_SECOND + start_.tv_nsec;
-    uint64_t end_ns = end.tv_sec * NANOS_PER_SECOND + end.tv_nsec;
+    uint64_t start_ns = TIMESPEC_TO_NANOS(start_);
+    uint64_t end_ns = TIMESPEC_TO_NANOS(end);
     uint64_t duration = (start_ns > end_ns) ? 0 : end_ns - start_ns;
 
     status_manager_->UpdateServerStat(duration, kind_);
   }
 }
 
-ModelInferStats::ScopedTimer::ScopedTimer()
-    : cummulative_duration_ns_(0), duration_ptr_(nullptr)
-{
-  start_.tv_sec = 0;
-  start_.tv_nsec = 0;
-}
 
-ModelInferStats::ScopedTimer::~ScopedTimer()
+#ifdef TRTIS_ENABLE_STATS
+
+void
+ModelInferStats::NewTrace(TRTSERVER_Trace* parent)
 {
-  if (duration_ptr_ != nullptr) {
-    Stop();
-    *duration_ptr_ = cummulative_duration_ns_;
+#ifdef TRTIS_ENABLE_TRACING
+  if (trace_manager_ != nullptr) {
+    auto ltrace_manager = reinterpret_cast<OpaqueTraceManager*>(trace_manager_);
+    TRTSERVER_Trace* trace = nullptr;
+    ltrace_manager->create_fn_(
+        &trace, model_name_.c_str(), requested_model_version_,
+        ltrace_manager->userp_);
+    if (trace != nullptr) {
+      auto ltrace = reinterpret_cast<Trace*>(trace);
+      ltrace->SetModelName(model_name_);
+      ltrace->SetModelVersion(requested_model_version_);
+      if (parent != nullptr) {
+        ltrace->SetParentId(reinterpret_cast<Trace*>(parent)->Id());
+      }
+      trace_ = trace;
+    }
   }
-}
-
-struct timespec
-ModelInferStats::ScopedTimer::Start()
-{
-  clock_gettime(CLOCK_MONOTONIC, &start_);
-  return start_;
+#endif  // TRTIS_ENABLE_TRACING
 }
 
 void
-ModelInferStats::ScopedTimer::Stop()
+ModelInferStats::Report()
 {
-  // Ignore the stop if the timer hasn't been started
-  if (start_.tv_sec != 0) {
-    struct timespec end;
-    clock_gettime(CLOCK_MONOTONIC, &end);
-
-    uint64_t start_ns = start_.tv_sec * NANOS_PER_SECOND + start_.tv_nsec;
-    uint64_t end_ns = end.tv_sec * NANOS_PER_SECOND + end.tv_nsec;
-    cummulative_duration_ns_ += (start_ns > end_ns) ? 0 : end_ns - start_ns;
-
-    start_.tv_sec = 0;
-    start_.tv_nsec = 0;
+#ifdef TRTIS_ENABLE_TRACING
+  if (trace_ != nullptr) {
+    auto ltrace = reinterpret_cast<Trace*>(trace_);
+    ltrace->Report(this);
+    // Inform that the trace object is done and can be released
+    auto ltrace_manager = reinterpret_cast<OpaqueTraceManager*>(trace_manager_);
+    ltrace_manager->release_fn_(
+        trace_, ltrace->ActivityUserp(), ltrace_manager->userp_);
   }
-}
+#endif  // TRTIS_ENABLE_TRACING
 
-ModelInferStats::~ModelInferStats()
-{
   // If the inference request failed before a backend could be
   // determined, there will be no metrics reporter.. so just use the
   // version directly from the inference request.
@@ -363,18 +384,32 @@ ModelInferStats::~ModelInferStats()
                                     ? metric_reporter_->ModelVersion()
                                     : requested_model_version_;
 
+  const uint64_t request_duration_ns =
+      Duration(TimestampKind::kRequestStart, TimestampKind::kRequestEnd);
+  const uint64_t last_timestamp_ms =
+      TIMESPEC_TO_MILLIS(Timestamp(TimestampKind::kRequestStart));
+
   if (failed_) {
     status_manager_->UpdateFailedInferStats(
-        model_name_, model_version, batch_size_, request_duration_ns_);
+        model_name_, model_version, batch_size_, last_timestamp_ms,
+        request_duration_ns);
 #ifdef TRTIS_ENABLE_METRICS
     if (metric_reporter_ != nullptr) {
       metric_reporter_->MetricInferenceFailure(gpu_device_).Increment();
     }
 #endif  // TRTIS_ENABLE_METRICS
   } else {
+    uint64_t queue_duration_ns =
+        extra_queue_duration_ +
+        Duration(TimestampKind::kQueueStart, TimestampKind::kComputeStart);
+    uint64_t compute_duration_ns =
+        extra_compute_duration_ +
+        Duration(TimestampKind::kComputeStart, TimestampKind::kComputeEnd);
+
     status_manager_->UpdateSuccessInferStats(
         model_name_, model_version, batch_size_, execution_count_,
-        request_duration_ns_, queue_duration_ns_, compute_duration_ns_);
+        last_timestamp_ms, request_duration_ns, queue_duration_ns,
+        compute_duration_ns);
 
 #ifdef TRTIS_ENABLE_METRICS
     if (metric_reporter_ != nullptr) {
@@ -387,40 +422,54 @@ ModelInferStats::~ModelInferStats()
       }
 
       metric_reporter_->MetricInferenceRequestDuration(gpu_device_)
-          .Increment(request_duration_ns_ / 1000);
+          .Increment(request_duration_ns / 1000);
       metric_reporter_->MetricInferenceComputeDuration(gpu_device_)
-          .Increment(compute_duration_ns_ / 1000);
+          .Increment(compute_duration_ns / 1000);
       metric_reporter_->MetricInferenceQueueDuration(gpu_device_)
-          .Increment(queue_duration_ns_ / 1000);
+          .Increment(queue_duration_ns / 1000);
 
       metric_reporter_->MetricInferenceLoadRatio(gpu_device_)
           .Observe(
-              (double)request_duration_ns_ /
-              std::max(1.0, (double)compute_duration_ns_));
+              (double)request_duration_ns /
+              std::max(1.0, (double)compute_duration_ns));
     }
 #endif  // TRTIS_ENABLE_METRICS
   }
 }
 
-struct timespec
-ModelInferStats::StartRequestTimer(ScopedTimer* timer) const
+void
+ModelInferStats::IncrementQueueDuration(const ModelInferStats& other)
 {
-  timer->duration_ptr_ = &request_duration_ns_;
-  return timer->Start();
+  extra_queue_duration_ +=
+      other.Duration(TimestampKind::kQueueStart, TimestampKind::kComputeStart);
 }
 
-struct timespec
-ModelInferStats::StartQueueTimer(ScopedTimer* timer) const
+void
+ModelInferStats::IncrementComputeDuration(const ModelInferStats& other)
 {
-  timer->duration_ptr_ = &queue_duration_ns_;
-  return timer->Start();
+  extra_compute_duration_ +=
+      other.Duration(TimestampKind::kComputeStart, TimestampKind::kComputeEnd);
 }
 
-struct timespec
-ModelInferStats::StartComputeTimer(ScopedTimer* timer) const
+uint64_t
+ModelInferStats::Duration(
+    ModelInferStats::TimestampKind start_kind,
+    ModelInferStats::TimestampKind end_kind) const
 {
-  timer->duration_ptr_ = &compute_duration_ns_;
-  return timer->Start();
+  const struct timespec& start = Timestamp(start_kind);
+  const struct timespec& end = Timestamp(end_kind);
+  uint64_t start_ns = TIMESPEC_TO_NANOS(start);
+  uint64_t end_ns = TIMESPEC_TO_NANOS(end);
+
+  // If the start or end timestamp is 0 then can't calculate the
+  // duration, so return 0.
+  if ((start_ns == 0) || (end_ns == 0)) {
+    return 0;
+  }
+
+  return (start_ns > end_ns) ? 0 : end_ns - start_ns;
 }
+
+#endif  // TRTIS_ENABLE_STATS
 
 }}  // namespace nvidia::inferenceserver

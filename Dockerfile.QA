@@ -40,6 +40,9 @@ ARG CLIENT_IMAGE=tensorrtserver_client
 ############################################################################
 FROM ${BUILD_IMAGE} AS build
 
+# Ensure apt-get won't prompt for selecting options
+ENV DEBIAN_FRONTEND=noninteractive
+
 # image_preprocess custom backend requires opencv
 RUN apt-get update && apt-get install -y --no-install-recommends \
             libopencv-dev \
@@ -47,7 +50,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /workspace
 RUN cd builddir && \
-    (make -j16 trtis-test-utils trtis-custom-backends || true) && \
     make -j16 trtis-test-utils trtis-custom-backends
 
 # Update the qa/ directory with test executables, models, etc.
@@ -55,13 +57,26 @@ WORKDIR /workspace
 RUN mkdir -p qa/common && \
     mkdir qa/L0_simple_example/models && \
     cp -r docs/examples/model_repository/simple qa/L0_simple_example/models/. && \
+    mkdir qa/L0_backend_release/simple_models && \
+    cp -r docs/examples/model_repository/simple qa/L0_backend_release/simple_models/. && \
     mkdir qa/L0_simple_callback_example/models && \
     cp -r docs/examples/model_repository/simple qa/L0_simple_callback_example/models/. && \
     mkdir qa/L0_simple_string_example/models && \
     cp -r docs/examples/model_repository/simple_string qa/L0_simple_string_example/models/. && \
-    mkdir qa/L0_simple_lib/models && \
+    mkdir qa/L0_simple_shared_memory_example/models && \
+    cp -r docs/examples/model_repository/simple qa/L0_simple_shared_memory_example/models/. && \
+    cp -r docs/examples/model_repository/simple_string qa/L0_simple_shared_memory_example/models/. && \
+    mkdir qa/L0_simple_cuda_shared_memory_example/models && \
+    cp -r docs/examples/model_repository/simple qa/L0_simple_cuda_shared_memory_example/models/. && \
+    cp -r docs/examples/model_repository/simple_string qa/L0_simple_cuda_shared_memory_example/models/. && \
+    mkdir qa/L0_shared_memory/models && \
+    cp -r docs/examples/model_repository/simple qa/L0_shared_memory/models/. && \
+    mkdir qa/L0_cuda_shared_memory/models && \
+    cp -r docs/examples/model_repository/simple qa/L0_cuda_shared_memory/models/. && \
+    mkdir qa/L0_cmdline_trace/models && \
+    cp -r docs/examples/model_repository/simple qa/L0_cmdline_trace/models/. && \
     cp /opt/tensorrtserver/bin/simple qa/L0_simple_lib/. && \
-    cp -r docs/examples/model_repository/simple qa/L0_simple_lib/models/.
+    cp /opt/tensorrtserver/bin/memory_alloc qa/L0_io/.
 
 RUN cp /workspace/builddir/trtis-test-utils/install/bin/caffe2plan qa/common/.
 
@@ -83,6 +98,9 @@ RUN mkdir -p qa/custom_models/custom_int32_int32_int32/1 && \
     mkdir -p qa/L0_simple_ensemble/models/simple/1 && \
     cp builddir/trtis-custom-backends/install/lib/libaddsub.so \
         qa/L0_simple_ensemble/models/simple/1/. && \
+    mkdir -p qa/L0_simple_ensemble/models/simple/2 && \
+    cp builddir/trtis-custom-backends/install/lib/libaddsub.so \
+        qa/L0_simple_ensemble/models/simple/2/. && \
     mkdir -p qa/L0_multiple_ports/models/simple/1 && \
     cp builddir/trtis-custom-backends/install/lib/libaddsub.so \
         qa/L0_multiple_ports/models/simple/1/.
@@ -98,9 +116,15 @@ RUN mkdir -p qa/L0_custom_param/models/param/1 && \
 RUN mkdir -p qa/L0_simple_sequence_example/models/simple_sequence/1 && \
     cp builddir/trtis-custom-backends/install/lib/libsequence.so \
         qa/L0_simple_sequence_example/models/simple_sequence/1/. && \
+    mkdir -p qa/L0_backend_release/simple_seq_models/simple_sequence/1 && \
+    cp builddir/trtis-custom-backends/install/lib/libsequence.so \
+        qa/L0_backend_release/simple_seq_models/simple_sequence/1/. && \
     mkdir -p qa/custom_models/custom_sequence_int32/1 && \
     cp builddir/trtis-custom-backends/install/lib/libsequence.so \
-        qa/custom_models/custom_sequence_int32/1/.
+        qa/custom_models/custom_sequence_int32/1/. && \
+    mkdir -p qa/custom_models/custom_dyna_sequence_int32/1 && \
+    cp builddir/trtis-custom-backends/install/lib/libdyna_sequence.so \
+        qa/custom_models/custom_dyna_sequence_int32/1/.
 
 RUN cp builddir/trtis-custom-backends/install/lib/libidentity.so \
         qa/L0_infer/. && \
@@ -115,11 +139,43 @@ RUN cp builddir/trtis-custom-backends/install/lib/libidentity.so \
     cp builddir/trtis-custom-backends/install/lib/libidentity.so \
         qa/L0_savedmodel_shape/. && \
     cp builddir/trtis-custom-backends/install/lib/libidentity.so \
-        qa/L0_perflab_nomodel/. && \
+        qa/L0_simple_perf/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_perf_custom/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_simple_dbatch_perf/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_perf_nomodel/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_perf_client/. && \
     cp builddir/trtis-custom-backends/install/lib/libidentity.so \
         qa/L0_large_payload/. && \
     cp builddir/trtis-custom-backends/install/lib/libidentity.so \
-        qa/L0_model_config/.
+        qa/L0_model_config/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_simple_lib/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_pinned_memory/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_io/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_warmup/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_cmdline_trace/. && \
+    cp builddir/trtis-custom-backends/install/lib/libidentity.so \
+        qa/L0_batcher/. && \
+    mkdir -p qa/L0_infer_shm && \
+    cp -r qa/L0_infer/. qa/L0_infer_shm && \
+    mkdir -p qa/L0_infer_cudashm && \
+    cp -r qa/L0_infer/. qa/L0_infer_cudashm && \
+    mkdir -p qa/L0_batcher_shm && \
+    cp -r qa/L0_batcher/. qa/L0_batcher_shm && \
+    mkdir -p qa/L0_batcher_cudashm && \
+    cp -r qa/L0_batcher/. qa/L0_batcher_cudashm && \
+    mkdir -p qa/L0_sequence_batcher_shm && \
+    cp -r qa/L0_sequence_batcher/. qa/L0_sequence_batcher_shm && \
+    mkdir -p qa/L0_sequence_batcher_cudashm && \
+    cp -r qa/L0_sequence_batcher/. qa/L0_sequence_batcher_cudashm
 
 # Generating the docs requires the docs source and the source code so
 # copy that into L0_docs so that it is available when that test runs.
@@ -155,15 +211,31 @@ RUN (cd qa/L0_custom_backend && tar xzf /workspace/*.custombackend.tar.gz)
 ############################################################################
 FROM $BASE_IMAGE
 
+# Ensure apt-get won't prompt for selecting options
+ENV DEBIAN_FRONTEND=noninteractive
+
+# install platform specific packages
+RUN if [ $(cat /etc/os-release | grep 'VERSION_ID="16.04"' | wc -l) -ne 0 ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+                libpng12-dev; \
+    elif [ $(cat /etc/os-release | grep 'VERSION_ID="18.04"' | wc -l) -ne 0 ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+                libpng-dev; \
+    else \
+        echo "Ubuntu version must be either 16.04 or 18.04" && \
+        exit 1; \
+    fi
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
+                              curl \
                               jmeter \
                               jmeter-http \
-                              libcurl3 \
                               libopencv-dev \
                               libopencv-core-dev \
-                              libpng12-dev \
                               libzmq3-dev \
-                              python \
+                              python-dev \
                               python-protobuf \
                               swig && \
     rm -rf /var/lib/apt/lists/*
@@ -171,15 +243,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
     python get-pip.py && \
     rm get-pip.py
-RUN pip install --upgrade numpy pillow future grpcio requests gsutil
+RUN pip install --upgrade numpy pillow future grpcio requests gsutil awscli six
 
-# CI expects tests in /opt/tensorrtserver/qa
+# CI expects tests in /opt/tensorrtserver/qa. The tensorrt-server
+# (1000) user should own all artifacts in case CI is run using
+# tensorrt-server user.
 WORKDIR /opt/tensorrtserver
-COPY --from=cbe /workspace/qa/ qa/
+COPY --chown=1000:1000 --from=cbe /workspace/qa/ qa/
 
 # Remove CI tests that are meant to run only on build image and
 # install the tensorrtserver python client APIs.
-RUN rm -fr qa/L0_copyrights qa/L0_unit_test && \
+RUN rm -fr qa/L0_copyrights qa/L0_build_variants && \
     pip install --upgrade qa/pkgs/tensorrtserver-*.whl
 
 ENV LD_LIBRARY_PATH /opt/tensorrtserver/qa/clients:${LD_LIBRARY_PATH}

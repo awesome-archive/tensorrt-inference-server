@@ -111,13 +111,13 @@ def np_to_c2_dtype(np_dtype):
 
 def np_to_trt_dtype(np_dtype):
     if np_dtype == np.int8:
-        return trt.infer.DataType.INT8
+        return trt.int8
     elif np_dtype == np.int32:
-        return trt.infer.DataType.INT32
+        return trt.int32
     elif np_dtype == np.float16:
-        return trt.infer.DataType.HALF
+        return trt.float16
     elif np_dtype == np.float32:
-        return trt.infer.DataType.FLOAT
+        return trt.float32
     return None
 
 def np_to_onnx_dtype(np_dtype):
@@ -421,8 +421,8 @@ def create_plan_modelfile(
     io_cnt = len(input_shapes)
 
     # Create the model that copies inputs to corresponding outputs.
-    G_LOGGER = trt.infer.ConsoleLogger(trt.infer.LogSeverity.INFO)
-    builder = trt.infer.create_infer_builder(G_LOGGER)
+    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    builder = trt.infer.Builder(TRT_LOGGER)
     network = builder.create_network()
 
     for io_num in range(io_cnt):
@@ -439,7 +439,7 @@ def create_plan_modelfile(
         network.mark_output(out0.get_output(0))
 
     builder.set_max_batch_size(max(1, max_batch))
-    builder.set_max_workspace_size(1 << 20)
+    builder.max_workspace_size = 1 << 20
     engine = builder.build_cuda_engine(network)
     network.destroy()
 
@@ -680,9 +680,24 @@ def create_ensemble_modelconfig(
                                     input_shapes[0], input_shapes[0], input_shapes[0]):
         return
 
+    # No reason to reshape ensemble inputs / outputs to empty as the inner models
+    # have to have non-empty shapes for inputs / outputs.
+    input_model_shapes_list = []
+    output_model_shapes_list = []
+    for idx in range(len(input_shapes)):
+        if len(input_model_shapes[idx]) == 0:
+            input_model_shapes_list.append(input_shapes[idx])
+        else:
+            input_model_shapes_list.append(input_model_shapes[idx])
+        if len(output_model_shapes[idx]) == 0:
+            output_model_shapes_list.append(output_shapes[idx])
+        else:
+            output_model_shapes_list.append(output_model_shapes[idx])
+
     emu.create_identity_ensemble_modelconfig(
         "reshape", models_dir, model_version, max_batch, dtype,
-        input_shapes, input_model_shapes, output_shapes, output_model_shapes)
+        input_shapes, tuple(input_model_shapes_list),
+        output_shapes, tuple(output_model_shapes_list))
 
 
 def create_onnx_modelfile(
@@ -898,6 +913,8 @@ if __name__ == '__main__':
                         help='Generate Pytorch LibTorch models')
     parser.add_argument('--ensemble', required=False, action='store_true',
                         help='Generate ensemble models')
+    parser.add_argument('--variable', required=False, action='store_true',
+                        help='Used variable-shape tensors for input/output')
     FLAGS, unparsed = parser.parse_known_args()
 
     if FLAGS.netdef:
@@ -942,7 +959,22 @@ if __name__ == '__main__':
                       output_shapes=([2,2,4], [1,2,1], [3,2,2], [1,1,1]),
                       output_model_shapes=([2,2,4], [1,2,1], [3,2,2], [1,1,1]))
 
+    # Tests with models that accept variable-shape input/output tensors and reshape
+    # TensorRT is ignored as it only allows fixed-shape tensors
+    # PyTorch is ignored as "tensor.view()" is shape dependent (shape is fixed
+    # based on input used for tracing), need to find equivalent operation that
+    # is not shape dependent.
+    if FLAGS.variable:
+        create_models(FLAGS.models_dir, np.int32,
+                      ([2,4,-1,6],), ([8,-1,1,6],))
+        create_models(FLAGS.models_dir, np.int32,
+                      ([1,-1,1], [-1], [2,2,3]), ([-1], [1,-1,1], [3,2,2]))
+        create_models(FLAGS.models_dir, np.int32,
+                    ([-1,1], [2]), ([1,-1], [1,2]),
+                    output_shapes=([1,-1], [1,2]),
+                    output_model_shapes=([1,-1], [1,2]))
+
     # TRT plan that reshapes neither input nor output. Needed for
     # L0_perflab_nomodel.
     create_trt_models(FLAGS.models_dir, np.float32,
-                      ([1,1,1],), ([1,1,1],))
+                      ([1],), ([1],))

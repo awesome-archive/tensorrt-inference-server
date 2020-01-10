@@ -25,20 +25,22 @@
   # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
   # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-.. _section-inference-server-api:
+.. _section-http-and-grpc-api:
 
-Inference Server API
-====================
+HTTP and GRPC API
+=================
 
 The TensorRT Inference Server exposes both HTTP and GRPC
-endpoints. Three endpoints with identical functionality are exposed
-for each protocol.
+endpoints. The following endpoints are exposed for each protocol.
 
 * :ref:`section-api-health`: The server health API for determining
   server liveness and readiness.
 
 * :ref:`section-api-status`: The server status API for getting
   information about the server and about the models being served.
+
+* :ref:`section-api-model-control`: The server model-control API for
+  explicitly loading and unloading models.
 
 * :ref:`section-api-inference`: The inference API that accepts model
   inputs, runs inference and returns the requested outputs.
@@ -51,13 +53,13 @@ only available when using the GRPC protocol:
   the requests are sent in the same connection until it is closed.
 
 The HTTP endpoints can be used directly as described in this section,
-but for most use-cases, the preferred way to access the inference
+but for most use-cases the preferred way to access the inference
 server is via the :ref:`C++ and Python Client libraries
-<section-client-libraries-and-examples>`.
+<section-client-libraries>`.
 
-The GRPC endpoints can also be used via the :ref:`C++ and Python Client
-libraries <section-client-libraries-and-examples>` or a GRPC-generated
-API can be used directly as shown in the grpc_image_client.py example.
+The GRPC endpoints can also be used via the :ref:`C++ and Python
+Client libraries <section-client-libraries>` or a GRPC-generated API
+can be used directly as shown in the grpc_image_client.py example.
 
 .. _section-api-health:
 
@@ -100,12 +102,13 @@ Performing an HTTP GET to /api/status returns status information about
 the server and all the models being served. Performing an HTTP GET to
 /api/status/<model name> returns information about the server and the
 single model specified by <model name>. The server status is returned
-in the HTTP response body in either text format (the default) or in
-binary format if query parameter format=binary is specified (for
-example, /api/status?format=binary). The success or failure of the
-status request is indicated in the HTTP response code and the
-**NV-Status** response header. The **NV-Status** response header
-returns a text protobuf formatted :cpp:var:`RequestStatus
+in the HTTP response body in either text format (the default), in binary
+format if query parameter format=binary is specified (for example,
+/api/status?format=binary) or in json format if query parameter
+format=json is specified (for example, /api/status?format=json).
+The success or failure of the status request is indicated in the HTTP
+response code and the **NV-Status** response header. The **NV-Status**
+response header returns a text protobuf formatted :cpp:var:`RequestStatus
 <nvidia::inferenceserver::RequestStatus>` message.
 
 For GRPC the :cpp:var:`GRPCService
@@ -119,6 +122,29 @@ message indicating success or failure.
 For either protocol the status itself is returned as a
 :cpp:var:`ServerStatus <nvidia::inferenceserver::ServerStatus>`
 message.
+
+.. _section-api-model-control:
+
+Model Control
+-------------
+
+Performing an HTTP POST to /api/modelcontrol/<load|unload>/<model
+name> loads or unloads a model from the inference server as described
+in :ref:`section-model-management`.
+
+The success or failure of the inference request is indicated in the
+HTTP response code and the **NV-Status** response header. The
+**NV-Status** response header returns a text protobuf formatted
+:cpp:var:`RequestStatus <nvidia::inferenceserver::RequestStatus>`
+message.
+
+For GRPC the :cpp:var:`GRPCService
+<nvidia::inferenceserver::GRPCService>` uses the
+:cpp:var:`ModelControlRequest
+<nvidia::inferenceserver::ModelControlRequest>` and
+:cpp:var:`ModelControlResponse
+<nvidia::inferenceserver::ModelControlResponse>` messages to implement
+the endpoint.
 
 .. _section-api-inference:
 

@@ -34,11 +34,14 @@ FLAGS = None
 SKIP_EXTS = ('jpeg', 'jpg', 'pgm', 'png',
              'log', 'serverlog',
              'preprocessed', 'jmx', 'gz',
-             'caffemodel')
+             'caffemodel', 'json')
 SKIP_PATHS = ('builddir',
+              'build/libevhtp',
+              'build/onnxruntime',
               'deploy/single_server/.helmignore',
               'docs/examples/model_repository',
               'docs/examples/ensemble_model_repository',
+              'qa/common/cuda_op_kernel.cu.cc.patch',
               'qa/custom_models/custom_float32_float32_float32/output0_labels.txt',
               'qa/custom_models/custom_nobatch_float32_float32_float32/output0_labels.txt',
               'qa/custom_models/custom_int32_int32_int32/output0_labels.txt',
@@ -52,6 +55,9 @@ SKIP_PATHS = ('builddir',
               'qa/L0_model_config/noautofill_platform',
               'qa/L0_model_config/autofill_noplatform',
               'qa/L0_model_config/autofill_noplatform_success',
+              'qa/L0_perf_nomodel/baseline',
+              'qa/L0_perf_nomodel/legacy_baseline',
+              'qa/L0_warmup/raw_mug_data',
               'tools/patch',
               'VERSION')
 
@@ -138,25 +144,26 @@ def visit(path):
         line = line.strip()
 
         # The next line must be the copyright line with a single year
-        # or a year range. It must start with either '#' or '//'
-        prefix = None
-        if line.startswith('#'):
-            prefix = '#'
-        elif line.startswith('//'):
-            prefix = '//'
-        else:
-            print("incorrect prefix for copyright line, expecting '#' or '//', for " +
+        # or a year range. It is optionally allowed to have '# ' or
+        # '// ' prefix.
+        prefix = ""
+        if line.startswith('# '):
+            prefix = '# '
+        elif line.startswith('// '):
+            prefix = '// '
+        elif not line.startswith(COPYRIGHT_YEAR_RE0[0]):
+            print("incorrect prefix for copyright line, allowed prefixes '# ' or '// ', for " +
                   path + ": " + line)
             return False
 
         start_year = 0
         end_year = 0
 
-        m = single_re.match(line[(len(prefix) + 1):])
+        m = single_re.match(line[len(prefix):])
         if m and len(m.groups()) == 1:
             start_year = end_year = int(m.group(1))
         else:
-            m = range_re.match(line[(len(prefix) + 1):])
+            m = range_re.match(line[len(prefix):])
             if m and len(m.groups()) == 2:
                 start_year = int(m.group(1))
                 end_year = int(m.group(2))
@@ -181,11 +188,15 @@ def visit(path):
             if copyright_idx >= len(copyright_body):
                 break
 
-            line = line.strip()
-            if len(copyright_body[copyright_idx]) == 0:
-                expected = prefix
+            if len(prefix) == 0:
+                line = line.rstrip()
             else:
-                expected = (prefix + " " + copyright_body[copyright_idx])
+                line = line.strip()
+
+            if len(copyright_body[copyright_idx]) == 0:
+                expected = prefix.strip()
+            else:
+                expected = (prefix + copyright_body[copyright_idx])
             if line != expected:
                 print("incorrect copyright body for " + path)
                 print("  expected: '" + expected + "'")

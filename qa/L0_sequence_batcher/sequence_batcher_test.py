@@ -36,26 +36,28 @@ import threading
 import traceback
 import unittest
 import numpy as np
-import infer_util as iu
 import test_util as tu
+import sequence_util as su
 from tensorrtserver.api import *
-import tensorrtserver.api.server_status_pb2 as server_status
+
+_test_system_shared_memory = bool(int(os.environ.get('TEST_SYSTEM_SHARED_MEMORY', 0)))
+_test_cuda_shared_memory = bool(int(os.environ.get('TEST_CUDA_SHARED_MEMORY', 0)))
 
 _no_batching = (int(os.environ['NO_BATCHING']) == 1)
 _model_instances = int(os.environ['MODEL_INSTANCES'])
 
 if _no_batching:
-    _trials = ("savedmodel_nobatch", "graphdef_nobatch", "netdef_nobatch", "plan_nobatch", "onnx_nobatch", "libtorch_nobatch")
+    _trials = ("savedmodel_nobatch", "graphdef_nobatch", "netdef_nobatch", "plan_nobatch", "onnx_nobatch")
 elif os.environ['BATCHER_TYPE'] == "VARIABLE":
-    _trials = ("savedmodel", "graphdef", "netdef", "onnx", "libtorch")
+    _trials = ("savedmodel", "graphdef", "netdef", "onnx")
 else:
-    _trials = ("custom", "savedmodel", "graphdef", "netdef", "plan", "onnx", "libtorch")
+    _trials = ("custom", "savedmodel", "graphdef", "netdef", "plan", "onnx")
 # Add ensemble to the _trials
 ENSEMBLE_PREFIXES = ["simple_", "sequence_", "fan_"]
 res = []
 for trial in _trials:
     res.append(trial)
-    if ("custom" in trial) or ("onnx" in trial) or ("libtorch" in trial):
+    if ("custom" in trial):
         continue
     for ensemble_prefix in ENSEMBLE_PREFIXES:
         res.append(ensemble_prefix + trial)
@@ -63,279 +65,13 @@ _trials = tuple(res)
 
 _protocols = ("http", "grpc")
 _max_sequence_idle_ms = 5000
-_check_exception = None
 
-class SequenceBatcherTest(unittest.TestCase):
-    def setUp(self):
-        global _check_exception
-        _check_exception = None
-
-    def check_deferred_exception(self):
-        if _check_exception is not None:
-            raise _check_exception
-
-    def check_sequence(self, trial, model_name, input_dtype, correlation_id,
-                       sequence_thresholds, values, expected_result,
-                       protocol, batch_size=1, sequence_name="<unknown>"):
-        """Perform sequence of inferences. The 'values' holds a list of
-        tuples, one for each inference with format:
-
-        (flag_str, value, (ls_ms, gt_ms), (pre_delay_ms, post_delay_ms)
-
-        """
-        global _check_exception
-
-        if (("savedmodel" in trial) or ("graphdef" in trial) or
-            ("netdef" in trial) or ("custom" in trial) or
-            ("onnx" in trial) or ("libtorch" in trial)):
-            tensor_shape = (1,)
-        elif "plan" in trial:
-            tensor_shape = (1,1,1)
-        else:
-            self.assertFalse(True, "unknown trial type: " + trial)
-
-        # Can only send the request exactly once since it is a
-        # sequence model with state
-        configs = []
-        if protocol == "http":
-            configs.append(("localhost:8000", ProtocolType.HTTP, False))
-        if protocol == "grpc":
-            configs.append(("localhost:8001", ProtocolType.GRPC, False))
-        if protocol == "streaming":
-            configs.append(("localhost:8001", ProtocolType.GRPC, True))
-
-        self.assertEqual(len(configs), 1)
-
-        for config in configs:
-            ctx = InferContext(config[0], config[1], model_name,
-                               correlation_id=correlation_id, streaming=config[2],
-                               verbose=True)
-            # Execute the sequence of inference...
-            try:
-                seq_start_ms = int(round(time.time() * 1000))
-
-                for flag_str, value, thresholds, delay_ms in values:
-                    if delay_ms is not None:
-                        time.sleep(delay_ms[0] / 1000.0)
-
-                    flags = InferRequestHeader.FLAG_NONE
-                    if flag_str is not None:
-                        if "start" in flag_str:
-                            flags = flags | InferRequestHeader.FLAG_SEQUENCE_START
-                        if "end" in flag_str:
-                            flags = flags | InferRequestHeader.FLAG_SEQUENCE_END
-
-                    input_list = list()
-                    for b in range(batch_size):
-                        if input_dtype == np.object:
-                            in0 = np.full(tensor_shape, value, dtype=np.int32)
-                            in0n = np.array([str(x) for x in in0.reshape(in0.size)], dtype=object)
-                            in0 = in0n.reshape(tensor_shape)
-                        else:
-                            in0 = np.full(tensor_shape, value, dtype=input_dtype)
-                        input_list.append(in0)
-
-                    start_ms = int(round(time.time() * 1000))
-                    if "libtorch" not in trial:
-                        results = ctx.run(
-                            { "INPUT" : input_list }, { "OUTPUT" : InferContext.ResultFormat.RAW},
-                            batch_size=batch_size, flags=flags)
-                        OUTPUT = "OUTPUT"
-                    else:
-                        results = ctx.run(
-                            { "INPUT__0" : input_list }, { "OUTPUT__0" : InferContext.ResultFormat.RAW},
-                            batch_size=batch_size, flags=flags)
-                        OUTPUT = "OUTPUT__0"
-
-                    end_ms = int(round(time.time() * 1000))
-
-                    self.assertEqual(len(results), 1)
-                    self.assertTrue(OUTPUT in results)
-                    result = results[OUTPUT][0][0]
-                    print("{}: {}".format(sequence_name, result))
-
-                    if thresholds is not None:
-                        lt_ms = thresholds[0]
-                        gt_ms = thresholds[1]
-                        if lt_ms is not None:
-                            self.assertTrue((end_ms - start_ms) < lt_ms,
-                                            "expected less than " + str(lt_ms) +
-                                            "ms response time, got " + str(end_ms - start_ms) + " ms")
-                        if gt_ms is not None:
-                            self.assertTrue((end_ms - start_ms) > gt_ms,
-                                            "expected greater than " + str(gt_ms) +
-                                            "ms response time, got " + str(end_ms - start_ms) + " ms")
-                    if delay_ms is not None:
-                        time.sleep(delay_ms[1] / 1000.0)
-
-                seq_end_ms = int(round(time.time() * 1000))
-
-                if input_dtype == np.object:
-                    self.assertEqual(int(result), expected_result)
-                else:
-                    self.assertEqual(result, expected_result)
-
-                if sequence_thresholds is not None:
-                    lt_ms = sequence_thresholds[0]
-                    gt_ms = sequence_thresholds[1]
-                    if lt_ms is not None:
-                        self.assertTrue((seq_end_ms - seq_start_ms) < lt_ms,
-                                        "sequence expected less than " + str(lt_ms) +
-                                        "ms response time, got " + str(seq_end_ms - seq_start_ms) + " ms")
-                    if gt_ms is not None:
-                        self.assertTrue((seq_end_ms - seq_start_ms) > gt_ms,
-                                        "sequence expected greater than " + str(gt_ms) +
-                                        "ms response time, got " + str(seq_end_ms - seq_start_ms) + " ms")
-            except Exception as ex:
-                _check_exception = ex
-
-    def check_sequence_async(self, trial, model_name, input_dtype, correlation_id,
-                             sequence_thresholds, values, expected_result,
-                             protocol, batch_size=1, sequence_name="<unknown>"):
-        """Perform sequence of inferences using async run. The 'values' holds
-        a list of tuples, one for each inference with format:
-
-        (flag_str, value, pre_delay_ms)
-
-        """
-        global _check_exception
-
-        if (("savedmodel" in trial) or ("graphdef" in trial) or
-            ("netdef" in trial) or ("custom" in trial) or
-            ("onnx" in trial) or ("libtorch" in trial)):
-            tensor_shape = (1,)
-        elif "plan" in trial:
-            tensor_shape = (1,1,1)
-        else:
-            self.assertFalse(True, "unknown trial type: " + trial)
-
-        # Can only send the request exactly once since it is a
-        # sequence model with state
-        configs = []
-        if protocol == "http":
-            configs.append(("localhost:8000", ProtocolType.HTTP, False))
-        if protocol == "grpc":
-            configs.append(("localhost:8001", ProtocolType.GRPC, False))
-        if protocol == "streaming":
-            configs.append(("localhost:8001", ProtocolType.GRPC, True))
-
-        self.assertEqual(len(configs), 1)
-
-        for config in configs:
-            ctx = InferContext(config[0], config[1], model_name,
-                               correlation_id=correlation_id, streaming=config[2],
-                               verbose=True)
-            # Execute the sequence of inference...
-            try:
-                seq_start_ms = int(round(time.time() * 1000))
-                result_ids = list()
-
-                for flag_str, value, pre_delay_ms in values:
-                    flags = InferRequestHeader.FLAG_NONE
-                    if flag_str is not None:
-                        if "start" in flag_str:
-                            flags = flags | InferRequestHeader.FLAG_SEQUENCE_START
-                        if "end" in flag_str:
-                            flags = flags | InferRequestHeader.FLAG_SEQUENCE_END
-
-                    input_list = list()
-                    for b in range(batch_size):
-                        if input_dtype == np.object:
-                            in0 = np.full(tensor_shape, value, dtype=np.int32)
-                            in0n = np.array([str(x) for x in in0.reshape(in0.size)], dtype=object)
-                            in0 = in0n.reshape(tensor_shape)
-                        else:
-                            in0 = np.full(tensor_shape, value, dtype=input_dtype)
-                        input_list.append(in0)
-
-                    if pre_delay_ms is not None:
-                        time.sleep(pre_delay_ms / 1000.0)
-
-                    if "libtorch" not in trial:
-                        result_ids.append(ctx.async_run(
-                            { "INPUT" : input_list }, { "OUTPUT" : InferContext.ResultFormat.RAW},
-                            batch_size=batch_size, flags=flags))
-                        OUTPUT = "OUTPUT"
-                    else:
-                        result_ids.append(ctx.async_run(
-                            { "INPUT__0" : input_list }, { "OUTPUT__0" : InferContext.ResultFormat.RAW},
-                            batch_size=batch_size, flags=flags))
-                        OUTPUT = "OUTPUT__0"
-
-                # Wait for the results in the order sent
-                result = None
-                for id in result_ids:
-                    results = ctx.get_async_run_results(id, True)
-                    self.assertEqual(len(results), 1)
-                    self.assertTrue(OUTPUT in results)
-                    result = results[OUTPUT][0][0]
-                    print("{}: {}".format(sequence_name, result))
-
-                seq_end_ms = int(round(time.time() * 1000))
-
-                if input_dtype == np.object:
-                    self.assertEqual(int(result), expected_result)
-                else:
-                    self.assertEqual(result, expected_result)
-
-                if sequence_thresholds is not None:
-                    lt_ms = sequence_thresholds[0]
-                    gt_ms = sequence_thresholds[1]
-                    if lt_ms is not None:
-                        self.assertTrue((seq_end_ms - seq_start_ms) < lt_ms,
-                                        "sequence expected less than " + str(lt_ms) +
-                                        "ms response time, got " + str(seq_end_ms - seq_start_ms) + " ms")
-                    if gt_ms is not None:
-                        self.assertTrue((seq_end_ms - seq_start_ms) > gt_ms,
-                                        "sequence expected greater than " + str(gt_ms) +
-                                        "ms response time, got " + str(seq_end_ms - seq_start_ms) + " ms")
-            except Exception as ex:
-                _check_exception = ex
-
-    def check_setup(self, model_name):
-        # Make sure test.sh set up the correct batcher settings
-        ctx = ServerStatusContext("localhost:8000", ProtocolType.HTTP, model_name, True)
-        ss = ctx.get_server_status()
-        self.assertEqual(len(ss.model_status), 1)
-        self.assertTrue(model_name in ss.model_status,
-                        "expected status for model " + model_name)
-        # Skip the sequence batching check on ensemble model
-        if ss.model_status[model_name].config.platform != "ensemble":
-            bconfig = ss.model_status[model_name].config.sequence_batching
-            self.assertEqual(bconfig.max_sequence_idle_microseconds, _max_sequence_idle_ms * 1000) # 5 secs
-
-    def check_status(self, model_name, static_bs, exec_cnt, infer_cnt):
-        ctx = ServerStatusContext("localhost:8000", ProtocolType.HTTP, model_name, True)
-        ss = ctx.get_server_status()
-        self.assertEqual(len(ss.model_status), 1)
-        self.assertTrue(model_name in ss.model_status,
-                        "expected status for model " + model_name)
-        vs = ss.model_status[model_name].version_status
-        self.assertEqual(len(vs), 1)
-        self.assertTrue(1 in vs, "expected status for version 1")
-        infer = vs[1].infer_stats
-        self.assertEqual(len(infer), len(static_bs),
-                         "expected batch-sizes (" + ",".join(str(b) for b in static_bs) +
-                         "), got " + str(vs[1]))
-        for b in static_bs:
-            self.assertTrue(b in infer,
-                            "expected batch-size " + str(b) + ", got " + str(vs[1]))
-
-        # Skip checking on ensemble because its execution count isn't modified like
-        # sequence batcher.
-        if ss.model_status[model_name].config.platform != "ensemble":
-            self.assertEqual(vs[1].model_execution_count, exec_cnt,
-                            "expected model-execution-count " + str(exec_cnt) + ", got " +
-                            str(vs[1].model_execution_count))
-            self.assertEqual(vs[1].model_inference_count, infer_cnt,
-                            "expected model-inference-count " + str(infer_cnt) + ", got " +
-                            str(vs[1].model_inference_count))
-
+class SequenceBatcherTest(su.SequenceBatcherTestUtil):
     def get_datatype(self, trial):
         # Get the datatype to use based on what models are available (see test.sh)
         if ("plan" in trial) or ("savedmodel" in trial):
             return np.float32
-        if "graphdef" in trial:
+        if ("graphdef" in trial):
             return np.dtype(object)
         return np.int32
 
@@ -358,6 +94,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -393,6 +130,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -426,6 +164,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -469,6 +208,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -510,6 +250,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -531,6 +272,7 @@ class SequenceBatcherTest(unittest.TestCase):
                     self.check_deferred_exception()
                     self.assertTrue(False, "expected error")
                 except InferenceServerException as ex:
+                    print(model_name + "-> " + ex.message())
                     self.assertEqual("inference:0", ex.server_id())
                     for prefix in ENSEMBLE_PREFIXES:
                         if model_name.startswith(prefix):
@@ -555,6 +297,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -602,6 +345,7 @@ class SequenceBatcherTest(unittest.TestCase):
         for trial in _trials:
             # Run on different protocols.
             for idx, protocol in enumerate(_protocols):
+                self.clear_deferred_exceptions()
                 try:
                     dtype = self.get_datatype(trial)
                     model_name = tu.get_sequence_model_name(trial, dtype)
@@ -627,13 +371,16 @@ class SequenceBatcherTest(unittest.TestCase):
                     self.assertTrue(False, "unexpected error {}".format(ex))
 
     def test_half_batch(self):
-        # Test model instances together are configured with
+        # Test model instances that together are configured with
         # total-batch-size 4.  Send two equal-length sequences in
         # parallel and make sure they get completely batched into
         # batch-size 2 inferences.
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3,4), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((0,9,5,13), dtype, 1)
             try:
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
                 protocol = "streaming"
 
@@ -657,7 +404,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 3, None),
                            ("end", 4, None)),
                           self.get_expected_result(10, 4, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -669,7 +416,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 5, None),
                            ("end", 13, None)),
                           self.get_expected_result(27, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 for t in threads:
@@ -680,6 +427,10 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), 4 * min(2, _model_instances), 8)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
 
     def test_skip_batch(self):
         # Test model instances together are configured with
@@ -687,8 +438,13 @@ class SequenceBatcherTest(unittest.TestCase):
         # two sequences have shorter length so that padding must be
         # applied correctly for the longer sequences.
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,13,14), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113,1114), dtype, 3)
             try:
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
                 protocol = "streaming"
 
@@ -710,7 +466,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 1, None),
                            ("end", 3, None)),
                           self.get_expected_result(4, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -722,7 +478,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 13, None),
                            ("end", 14, None)),
                           self.get_expected_result(50, 14, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -732,7 +488,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 111, None),
                            ("end", 113, None)),
                           self.get_expected_result(224, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -744,7 +500,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1113, None),
                            ("end", 1114, None)),
                           self.get_expected_result(4450, 1114, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[1].start()
@@ -763,6 +519,12 @@ class SequenceBatcherTest(unittest.TestCase):
                     self.check_status(model_name, (1,), 12, 12)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
 
     def test_full_batch(self):
         # Test model instances together are configured with
@@ -770,8 +532,13 @@ class SequenceBatcherTest(unittest.TestCase):
         # parallel and make sure they get completely batched into
         # batch-size 4 inferences.
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,112,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113), dtype, 3)
             try:
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
                 protocol = "streaming"
 
@@ -794,7 +561,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 2, None),
                            ("end", 3, None)),
                           self.get_expected_result(6, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -805,7 +572,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 12, None),
                            ("end", 13, None)),
                           self.get_expected_result(36, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -816,7 +583,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 112, None),
                            ("end", 113, None)),
                           self.get_expected_result(336, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -827,7 +594,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(3336, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 for t in threads:
@@ -838,6 +605,12 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), 3 * _model_instances, 12)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
 
     def test_backlog(self):
         # Test model instances together are configured with
@@ -846,9 +619,15 @@ class SequenceBatcherTest(unittest.TestCase):
         # batch-size 4 inferences plus the 5th should go in the
         # backlog and then get handled once there is a free slot.
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,112,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,11112,11113), dtype, 4)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -870,7 +649,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 2, None),
                            ("end", 3, None)),
                           self.get_expected_result(6, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -881,7 +660,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 12, None),
                            ("end", 13, None)),
                           self.get_expected_result(36, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -892,7 +671,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 112, None),
                            ("end", 113, None)),
                           self.get_expected_result(336, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -903,7 +682,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(3336, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -914,7 +693,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 11112, None),
                            ("end", 11113, None)),
                           self.get_expected_result(33336, 11113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 for t in threads:
@@ -925,6 +704,13 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), (3 * _model_instances) + 3, 15)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
 
     def test_backlog_fill(self):
         # Test model instances together are configured with
@@ -940,9 +726,16 @@ class SequenceBatcherTest(unittest.TestCase):
             return
 
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,), dtype, 4)
+            precreated_shm5_handles = self.precreate_register_regions((22222,), dtype, 5)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -964,7 +757,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 2, None),
                            ("end", 3, None)),
                           self.get_expected_result(6, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -974,7 +767,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 11, None),
                            ("end", 13, None)),
                           self.get_expected_result(24, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -984,7 +777,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 111, None),
                            ("end", 113, None)),
                           self.get_expected_result(224, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -995,7 +788,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(3336, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1004,7 +797,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           # (flag_str, value, pre_delay_ms)
                           (("start,end", 11111, None),),
                           self.get_expected_result(11111, 11111, trial, "start,end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1013,7 +806,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           # (flag_str, value, pre_delay_ms)
                           (("start,end", 22222, None),),
                           self.get_expected_result(22222, 22222, trial, "start,end"),
-                          protocol),
+                          protocol, precreated_shm5_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[0].start()
@@ -1029,6 +822,14 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), (3 * _model_instances), 12)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
+                    self.cleanup_shm_regions(precreated_shm5_handles)
 
     def test_backlog_fill_no_end(self):
         # Test model instances together are configured with
@@ -1045,9 +846,16 @@ class SequenceBatcherTest(unittest.TestCase):
             return
 
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,), dtype, 4)
+            precreated_shm5_handles = self.precreate_register_regions((22222,22223,22224), dtype, 5)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -1069,7 +877,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 2, None),
                            ("end", 3, None)),
                           self.get_expected_result(6, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1079,7 +887,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 11, None),
                            ("end", 13, None)),
                           self.get_expected_result(24, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1089,7 +897,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 111, None),
                            ("end", 113, None)),
                           self.get_expected_result(224, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1100,7 +908,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(3336, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1109,7 +917,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           # (flag_str, value, pre_delay_ms)
                           (("start,end", 11111, None),),
                           self.get_expected_result(11111, 11111, trial, "start,end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1120,7 +928,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 22223, None),
                            ("end", 22224, 2000),),
                           self.get_expected_result(66669, 22224, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm5_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[0].start()
@@ -1136,6 +944,14 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), (3 * _model_instances) + 2, 14)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
+                    self.cleanup_shm_regions(precreated_shm5_handles)
 
     def test_backlog_same_correlation_id(self):
         # Test model instances together are configured with
@@ -1144,9 +960,15 @@ class SequenceBatcherTest(unittest.TestCase):
         # batch-size 4 inferences. Send a 5th with the same
         # correlation ID as one of the first four.
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,2,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,112,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,11113), dtype, 4)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -1168,7 +990,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 2, None),
                            ("end", 3, None)),
                           self.get_expected_result(6, 3, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1179,7 +1001,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 12, None),
                            ("end", 13, None)),
                           self.get_expected_result(36, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1190,7 +1012,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 112, None),
                            ("end", 113, None)),
                           self.get_expected_result(336, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1201,7 +1023,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(3336, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1211,7 +1033,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 11111, None),
                            ("end", 11113, None)),
                           self.get_expected_result(22224, 11113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[0].start()
@@ -1226,6 +1048,14 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), (3 * _model_instances) + 2, 14)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
+
 
     def test_backlog_same_correlation_id_no_end(self):
         # Test model instances together are configured with
@@ -1244,9 +1074,15 @@ class SequenceBatcherTest(unittest.TestCase):
             return
 
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,12,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,112,112,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,11113), dtype, 4)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -1267,7 +1103,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 1, None),
                            (None, 3, None)),
                           self.get_expected_result(4, 3, trial, None),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1279,7 +1115,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 12, None),
                            ("end", 13, None)),
                           self.get_expected_result(48, 13, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1291,7 +1127,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 112, None),
                            ("end", 113, None)),
                           self.get_expected_result(448, 113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1303,7 +1139,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, None),
                            ("end", 1113, None)),
                           self.get_expected_result(4448, 1113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1313,7 +1149,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 11111, None),
                            ("end", 11113, None)),
                           self.get_expected_result(22224, 11113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[0].start()
@@ -1328,14 +1164,23 @@ class SequenceBatcherTest(unittest.TestCase):
                 self.check_status(model_name, (1,), 4 * _model_instances, 16)
             except InferenceServerException as ex:
                 self.assertTrue(False, "unexpected error {}".format(ex))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
 
     def test_backlog_sequence_timeout(self):
         # Test model instances together are configured with
         # total-max-batch-size 4. Send 4 sequences in parallel and
         # make sure they get completely batched into batch-size 4
-        # inferences. The sequences do not have end markers and so
-        # should timeout and allow a 5th sequence to come out of the
-        # backlog and finish.
+        # inferences. One of the sequences has a long delay that
+        # causes it to timeout and that allows a 5th sequence to come
+        # out of the backlog and finish. The timed-out sequence will
+        # then send the delayed inference but it will appear as a new
+        # sequence and so fail because it doesn't have the START flag.
 
         # Only works with 1 model instance since otherwise an instance
         # can run ahead and handle more work than expected (leads to
@@ -1344,9 +1189,15 @@ class SequenceBatcherTest(unittest.TestCase):
             return
 
         for trial in _trials:
+            self.clear_deferred_exceptions()
+            dtype = self.get_datatype(trial)
+            precreated_shm0_handles = self.precreate_register_regions((1,3), dtype, 0)
+            precreated_shm1_handles = self.precreate_register_regions((11,12,12,13), dtype, 1)
+            precreated_shm2_handles = self.precreate_register_regions((111,112,112,113), dtype, 2)
+            precreated_shm3_handles = self.precreate_register_regions((1111,1112,1112,1113), dtype, 3)
+            precreated_shm4_handles = self.precreate_register_regions((11111,11113), dtype, 4)
             try:
                 protocol = "streaming"
-                dtype = self.get_datatype(trial)
                 model_name = tu.get_sequence_model_name(trial, dtype)
 
                 self.check_setup(model_name)
@@ -1367,7 +1218,7 @@ class SequenceBatcherTest(unittest.TestCase):
                           (("start", 1, None),
                            (None, 3, _max_sequence_idle_ms + 1000)),
                           self.get_expected_result(4, 3, trial, None),
-                          protocol),
+                          protocol, precreated_shm0_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1379,7 +1230,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 12, _max_sequence_idle_ms / 2),
                            ("end", 13, _max_sequence_idle_ms / 2)),
                           self.get_expected_result(48, 13, trial, None),
-                          protocol),
+                          protocol, precreated_shm1_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1391,7 +1242,7 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 112, _max_sequence_idle_ms / 2),
                            ("end", 113, _max_sequence_idle_ms / 2)),
                           self.get_expected_result(448, 113, trial, None),
-                          protocol),
+                          protocol, precreated_shm2_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
@@ -1403,17 +1254,17 @@ class SequenceBatcherTest(unittest.TestCase):
                            (None, 1112, _max_sequence_idle_ms / 2),
                            ("end", 1113, _max_sequence_idle_ms / 2)),
                           self.get_expected_result(4448, 1113, trial, None),
-                          protocol),
+                          protocol, precreated_shm3_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
                 threads.append(threading.Thread(
                     target=self.check_sequence_async,
                     args=(trial, model_name, dtype, 1005,
-                          (None, _max_sequence_idle_ms - 2000),
+                          (None, None),
                           # (flag_str, value, pre_delay_ms)
                           (("start", 11111, None),
                            ("end", 11113, None)),
                           self.get_expected_result(22224, 11113, trial, "end"),
-                          protocol),
+                          protocol, precreated_shm4_handles),
                     kwargs={'sequence_name' : "{}_{}".format(self._testMethodName, protocol)}))
 
                 threads[0].start()
@@ -1444,6 +1295,13 @@ class SequenceBatcherTest(unittest.TestCase):
                         str("inference request for sequence 1001 to " +
                             "model '{}' must specify the START flag on the first " +
                             "request of the sequence").format(model_name)))
+            finally:
+                if _test_system_shared_memory or _test_cuda_shared_memory:
+                    self.cleanup_shm_regions(precreated_shm0_handles)
+                    self.cleanup_shm_regions(precreated_shm1_handles)
+                    self.cleanup_shm_regions(precreated_shm2_handles)
+                    self.cleanup_shm_regions(precreated_shm3_handles)
+                    self.cleanup_shm_regions(precreated_shm4_handles)
 
 if __name__ == '__main__':
     unittest.main()

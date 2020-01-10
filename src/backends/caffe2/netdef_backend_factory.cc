@@ -57,7 +57,8 @@ NetDefBackendFactory::CreateBackend(
 {
   // Read all the netdef files in 'path'.
   std::set<std::string> netdef_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &netdef_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &netdef_files));
 
   std::unordered_map<std::string, std::vector<char>> models;
   for (const auto& filename : netdef_files) {
@@ -72,7 +73,8 @@ NetDefBackendFactory::CreateBackend(
   // Create the backend for the model and all the execution contexts
   // requested for this model.
   std::unique_ptr<NetDefBackend> local_backend(new NetDefBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
+  RETURN_IF_ERROR(
+      local_backend->Init(path, model_config, kCaffe2NetDefPlatform));
   RETURN_IF_ERROR(local_backend->CreateExecutionContexts(models));
 
   *backend = std::move(local_backend);

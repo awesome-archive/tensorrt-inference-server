@@ -111,13 +111,13 @@ def np_to_c2_dtype(np_dtype):
 
 def np_to_trt_dtype(np_dtype):
     if np_dtype == np.int8:
-        return trt.infer.DataType.INT8
+        return trt.int8
     elif np_dtype == np.int32:
-        return trt.infer.DataType.INT32
+        return trt.int32
     elif np_dtype == np.float16:
-        return trt.infer.DataType.HALF
+        return trt.float16
     elif np_dtype == np.float32:
-        return trt.infer.DataType.FLOAT
+        return trt.float32
     return None
 
 def np_to_onnx_dtype(np_dtype):
@@ -571,22 +571,225 @@ output [
         for l in range(output0_label_cnt):
             lfile.write("label" + str(l) + "\n")
 
-
-def create_plan_modelfile(
-        models_dir, max_batch, model_version,
+def create_plan_dynamic_rf_modelfile(models_dir, max_batch, model_version,
         input_shape, output0_shape, output1_shape,
-        input_dtype, output0_dtype, output1_dtype, swap=False):
+        input_dtype, output0_dtype, output1_dtype, swap, min_dim, max_dim):
+    trt_input_dtype = np_to_trt_dtype(input_dtype)
+    trt_output0_dtype = np_to_trt_dtype(output0_dtype)
+    trt_output1_dtype = np_to_trt_dtype(output1_dtype)
+    trt_memory_format = trt.TensorFormat.LINEAR
 
-    if not tu.validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
-                                     input_shape, output0_shape, output1_shape):
-        return
+    # Create the model
+    G_LOGGER = trt.infer.ConsoleLogger(trt.infer.LogSeverity.WARNING)
+    builder = trt.infer.create_infer_builder(G_LOGGER)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    if max_batch == 0:
+        input_with_batchsize = [i for i in input_shape]
+    else:
+        input_with_batchsize = [-1] + [i for i in input_shape]
 
+    in0 = network.add_input("INPUT0", trt_input_dtype, input_with_batchsize)
+    in1 = network.add_input("INPUT1", trt_input_dtype, input_with_batchsize)
+    add = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUM)
+    sub = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUB)
+
+    out0 = add if not swap else sub
+    out1 = sub if not swap else add
+
+    out0.get_output(0).set_name("OUTPUT0")
+    out1.get_output(0).set_name("OUTPUT1")
+    network.mark_output(out0.get_output(0))
+    network.mark_output(out1.get_output(0))
+
+    out0.get_output(0).set_type(trt_output0_dtype)
+    out1.get_output(0).set_type(trt_output1_dtype)
+
+    in0.allowed_formats = 1 << int(trt_memory_format)
+    in1.allowed_formats = 1 << int(trt_memory_format)
+    out0.get_output(0).allowed_formats = 1 << int(trt_memory_format)
+    out1.get_output(0).allowed_formats = 1 << int(trt_memory_format)
+
+    if (trt_input_dtype == trt.DataType.INT8):
+        in0.dynamic_range = (-128.0, 127.0)
+        in1.dynamic_range = (-128.0, 127.0)
+    if (trt_output0_dtype == trt.DataType.INT8):
+        out0.get_output(0).dynamic_range = (-128.0, 127.0)
+    if (trt_output1_dtype == trt.DataType.INT8):
+        out1.get_output(0).dynamic_range = (-128.0, 127.0)
+
+
+    min_shape = []
+    opt_shape = []
+    max_shape = []
+    if max_batch != 0:
+        min_shape = min_shape + [1]
+        opt_shape = opt_shape + [max(1, max_batch)]
+        max_shape = max_shape + [max(1, max_batch)]
+    for i in input_shape:
+        if i == -1:
+            min_shape = min_shape + [min_dim]
+            opt_shape = opt_shape + [int((max_dim + min_dim) / 2)]
+            max_shape = max_shape + [max_dim]
+        else:
+            min_shape = min_shape + [i]
+            opt_shape = opt_shape + [i]
+            max_shape = max_shape + [i]
+
+    profile = builder.create_optimization_profile()
+    profile.set_shape("INPUT0", min_shape, opt_shape, max_shape)
+    profile.set_shape("INPUT1", min_shape, opt_shape, max_shape)
+    flags = 1 <<  int(trt.BuilderFlag.STRICT_TYPES)
+    datatype_set = set([trt_input_dtype, trt_output0_dtype, trt_output1_dtype])
+    for dt in datatype_set:
+        if (dt == trt.DataType.INT8):
+            flags |= 1 << int(trt.BuilderFlag.INT8)
+        elif (dt == trt.DataType.HALF):
+            flags |= 1 << int(trt.BuilderFlag.FP16)
+    config = builder.create_builder_config()
+    config.flags=flags
+    config.add_optimization_profile(profile)
+    config.max_workspace_size = 1 << 20
+    engine = builder.build_engine(network,config)
+
+
+    # Use a different model name for different kinds of models
+    model_name = tu.get_model_name("plan_nobatch" if max_batch == 0 else "plan",
+                                   input_dtype, output0_dtype, output1_dtype)
+    if min_dim != 1 or max_dim !=32:
+        model_name = "{}-{}-{}".format(model_name, min_dim, max_dim)
+
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass # ignore existing dir
+
+    with open(model_version_dir + "/model.plan", "wb") as f:
+        f.write(engine.serialize())
+
+    engine.destroy()
+    builder.destroy()
+
+def create_plan_dynamic_modelfile(models_dir, max_batch, model_version,
+        input_shape, output0_shape, output1_shape,
+        input_dtype, output0_dtype, output1_dtype, swap, min_dim, max_dim):
     trt_input_dtype = np_to_trt_dtype(input_dtype)
     trt_output0_dtype = np_to_trt_dtype(output0_dtype)
     trt_output1_dtype = np_to_trt_dtype(output1_dtype)
 
     # Create the model
-    G_LOGGER = trt.infer.ConsoleLogger(trt.infer.LogSeverity.INFO)
+    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    builder = trt.infer.Builder(TRT_LOGGER)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    if max_batch == 0:
+        input_with_batchsize = [i for i in input_shape]
+    else:
+        input_with_batchsize = [-1] + [i for i in input_shape] 
+    
+    in0 = network.add_input("INPUT0", trt_input_dtype, input_with_batchsize)
+    in1 = network.add_input("INPUT1", trt_input_dtype, input_with_batchsize)
+    add = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUM)
+    sub = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUB)
+
+    out0 = add if not swap else sub
+    out1 = sub if not swap else add
+
+    out0.get_output(0).set_name("OUTPUT0")
+    out1.get_output(0).set_name("OUTPUT1")
+    network.mark_output(out0.get_output(0))
+    network.mark_output(out1.get_output(0))
+
+
+    min_shape = []
+    opt_shape = []
+    max_shape = []
+    for i in input_shape:
+        if i == -1:
+            min_shape = min_shape + [min_dim]
+            opt_shape = opt_shape + [int((max_dim + min_dim) / 2)]
+            max_shape = max_shape + [max_dim]
+        else:
+            min_shape = min_shape + [i]
+            opt_shape = opt_shape + [i]
+            max_shape = max_shape + [i]
+
+    config = builder.create_builder_config()
+    # create multiple profiles with same shape for testing 
+    # with decreasing batch sizes
+    profile = []
+    for i in range(4):
+        profile.append(builder.create_optimization_profile())
+        if max_batch == 0:
+            profile[i].set_shape("INPUT0", min_shape, opt_shape, max_shape)
+            profile[i].set_shape("INPUT1", min_shape, opt_shape, max_shape)
+        else:
+            bs = [ max_batch - i if max_batch > i else 1]
+            opt_bs = [1 + i if 1 + i < max_batch - 1 else max_batch - 1]
+            # Hardcoded 'max_shape[0] += 1' in default profile for
+            # L0_trt_dynamic_shape, to differentiate whether default profile
+            # is used if no profile is specified
+            max_shape_override = max_shape
+            if i == 0 and (min_dim == 1 and max_dim ==32):
+              max_shape_override[0] += 1
+            
+            profile[i].set_shape("INPUT0", [1] + min_shape, opt_bs + opt_shape, bs + max_shape_override)
+            profile[i].set_shape("INPUT1", [1] + min_shape, opt_bs + opt_shape, bs + max_shape_override)
+        config.add_optimization_profile(profile[i])
+    # some profiles with non-one min shape for first dim to test autofiller
+    for i in range(2):
+        profile.append(builder.create_optimization_profile())
+        if max_batch == 0:
+            profile[i + 4].set_shape("INPUT0", min_shape, opt_shape, max_shape)
+            profile[i + 4].set_shape("INPUT1", min_shape, opt_shape, max_shape)
+        else:
+            profile[i + 4].set_shape("INPUT0", [5 + i] + min_shape, [6] + opt_shape, [max_batch] + max_shape)
+            profile[i + 4].set_shape("INPUT1", [5 + i] + min_shape, [6] + opt_shape, [max_batch] + max_shape)
+        config.add_optimization_profile(profile[i + 4])
+    # Will repeat another profile with same min and max shapes as the first profile to test non-zero profile
+    # for infer_variable test.
+    profile.append(builder.create_optimization_profile()) 
+    if max_batch == 0:
+        profile[6].set_shape("INPUT0", min_shape, opt_shape, max_shape)
+        profile[6].set_shape("INPUT1", min_shape, opt_shape, max_shape)
+    else:
+        profile[6].set_shape("INPUT0", [1] + min_shape, [1] + opt_shape, [max_batch] + max_shape)
+        profile[6].set_shape("INPUT1", [1] + min_shape, [1] + opt_shape, [max_batch] + max_shape)
+    config.add_optimization_profile(profile[6])
+
+    config.max_workspace_size = 1 << 20
+    engine = builder.build_engine(network,config)
+
+
+    # Use a different model name for different kinds of models
+    model_name = tu.get_model_name("plan_nobatch" if max_batch == 0 else "plan",
+                                   input_dtype, output0_dtype, output1_dtype)
+    if min_dim != 1 or max_dim !=32:
+        model_name = "{}-{}-{}".format(model_name, min_dim, max_dim)
+       
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass # ignore existing dir
+
+    with open(model_version_dir + "/model.plan", "wb") as f:
+        f.write(engine.serialize())
+
+    engine.destroy()
+    builder.destroy()
+
+def create_plan_fixed_rf_modelfile( models_dir, max_batch, model_version,
+        input_shape, output0_shape, output1_shape,
+        input_dtype, output0_dtype, output1_dtype, swap):
+    trt_input_dtype = np_to_trt_dtype(input_dtype)
+    trt_output0_dtype = np_to_trt_dtype(output0_dtype)
+    trt_output1_dtype = np_to_trt_dtype(output1_dtype)
+    trt_memory_format = trt.TensorFormat.LINEAR
+
+    # Create the model
+    G_LOGGER = trt.infer.ConsoleLogger(trt.infer.LogSeverity.WARNING)
     builder = trt.infer.create_infer_builder(G_LOGGER)
     network = builder.create_network()
     in0 = network.add_input("INPUT0", trt_input_dtype, input_shape)
@@ -602,8 +805,78 @@ def create_plan_modelfile(
     network.mark_output(out0.get_output(0))
     network.mark_output(out1.get_output(0))
 
+    out0.get_output(0).set_type(trt_output0_dtype)
+    out1.get_output(0).set_type(trt_output1_dtype)
+
+    in0.allowed_formats = 1 << int(trt_memory_format)
+    in1.allowed_formats = 1 << int(trt_memory_format)
+    out0.get_output(0).allowed_formats = 1 << int(trt_memory_format)
+    out1.get_output(0).allowed_formats = 1 << int(trt_memory_format)
+
+    if (trt_input_dtype == trt.DataType.INT8):
+        in0.dynamic_range = (-128.0, 127.0)
+        in1.dynamic_range = (-128.0, 127.0)
+    if (trt_output0_dtype == trt.DataType.INT8):
+        out0.get_output(0).dynamic_range = (-128.0, 127.0)
+    if (trt_output1_dtype == trt.DataType.INT8):
+        out1.get_output(0).dynamic_range = (-128.0, 127.0)
+    
+    flags = 1 <<  int(trt.BuilderFlag.STRICT_TYPES)
+    datatype_set = set([trt_input_dtype, trt_output0_dtype, trt_output1_dtype])
+    for dt in datatype_set:
+        if (dt == trt.DataType.INT8):
+            flags |= 1 << int(trt.BuilderFlag.INT8)
+        elif (dt == trt.DataType.HALF):
+            flags |= 1 << int(trt.BuilderFlag.FP16)
+    config = builder.create_builder_config()
+    config.flags=flags
+    config.max_workspace_size = 1 << 20
     builder.set_max_batch_size(max(1, max_batch))
-    builder.set_max_workspace_size(1 << 20)
+    engine = builder.build_engine(network,config)
+
+
+    model_name = tu.get_model_name("plan_nobatch" if max_batch == 0 else "plan",
+                                   input_dtype, output0_dtype, output1_dtype)
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass # ignore existing dir
+
+    with open(model_version_dir + "/model.plan", "wb") as f:
+        f.write(engine.serialize())
+
+    engine.destroy()
+    builder.destroy()
+    
+    
+def create_plan_fixed_modelfile( models_dir, max_batch, model_version,
+        input_shape, output0_shape, output1_shape,
+        input_dtype, output0_dtype, output1_dtype, swap):
+    trt_input_dtype = np_to_trt_dtype(input_dtype)
+    trt_output0_dtype = np_to_trt_dtype(output0_dtype)
+    trt_output1_dtype = np_to_trt_dtype(output1_dtype)
+
+    # Create the model
+    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    builder = trt.infer.Builder(TRT_LOGGER)
+    network = builder.create_network()
+    in0 = network.add_input("INPUT0", trt_input_dtype, input_shape)
+    in1 = network.add_input("INPUT1", trt_input_dtype, input_shape)
+    add = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUM)
+    sub = network.add_elementwise(in0, in1, trt.infer.ElementWiseOperation.SUB)
+
+    out0 = add if not swap else sub
+    out1 = sub if not swap else add
+
+    out0.get_output(0).set_name("OUTPUT0")
+    out1.get_output(0).set_name("OUTPUT1")
+    network.mark_output(out0.get_output(0))
+    network.mark_output(out1.get_output(0))
+
+    builder.set_max_batch_size(max(1, max_batch))
+    builder.max_workspace_size = 1 << 20
     engine = builder.build_cuda_engine(network)
     network.destroy()
 
@@ -623,11 +896,50 @@ def create_plan_modelfile(
     builder.destroy()
 
 
+def create_plan_modelfile(
+        models_dir, max_batch, model_version,
+        input_shape, output0_shape, output1_shape,
+        input_dtype, output0_dtype, output1_dtype, swap=False, min_dim=1, max_dim=32):
+
+    if not tu.validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
+                                     input_shape, output0_shape, output1_shape):
+        return
+
+    if input_dtype != np.float32 or output0_dtype != np.float32 or output1_dtype != np.float32:
+        if (not tu.shape_is_fixed(input_shape) or
+            not tu.shape_is_fixed(output0_shape) or
+            not tu.shape_is_fixed(output1_shape)):
+            create_plan_dynamic_rf_modelfile(
+                models_dir, max_batch, model_version,
+                input_shape, output0_shape, output1_shape,
+                input_dtype, output0_dtype, output1_dtype, swap,
+                min_dim, max_dim)
+        else:
+            create_plan_fixed_rf_modelfile(
+                models_dir, max_batch, model_version,
+                input_shape, output0_shape, output1_shape,
+                input_dtype, output0_dtype, output1_dtype, swap)
+
+    else:
+        if (not tu.shape_is_fixed(input_shape) or
+            not tu.shape_is_fixed(output0_shape) or
+            not tu.shape_is_fixed(output1_shape)):
+            create_plan_dynamic_modelfile(
+                models_dir, max_batch, model_version,
+                input_shape, output0_shape, output1_shape,
+                input_dtype, output0_dtype, output1_dtype, swap,
+                min_dim, max_dim)
+        else:
+            create_plan_fixed_modelfile(
+                models_dir, max_batch, model_version,
+                input_shape, output0_shape, output1_shape,
+                input_dtype, output0_dtype, output1_dtype, swap)
+                
 def create_plan_modelconfig(
         models_dir, max_batch, model_version,
         input_shape, output0_shape, output1_shape,
         input_dtype, output0_dtype, output1_dtype,
-        output0_label_cnt, version_policy):
+        output0_label_cnt, version_policy, min_dim=1, max_dim=32):
 
     if not tu.validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
                                      input_shape, output0_shape, output1_shape):
@@ -644,11 +956,61 @@ def create_plan_modelconfig(
         else:
             version_policy_str = "{ all { }}"
 
-    # Use a different model name for the non-batching variant
+    # Use a different model name for different kinds of models
     model_name = tu.get_model_name("plan_nobatch" if max_batch == 0 else "plan",
                                    input_dtype, output0_dtype, output1_dtype)
+    if min_dim != 1 or max_dim !=32:
+        model_name = "{}-{}-{}".format(model_name, min_dim, max_dim)
+
     config_dir = models_dir + "/" + model_name
-    config = '''
+    if -1 in input_shape:
+        # Selects the sixth profile for FP32 datatype
+        # Note the min and max shapes of first and sixth 
+        # profile are identical.
+        profile_index = 6 if input_dtype == np.float32 else 0
+        config = '''
+name: "{}"
+platform: "tensorrt_plan"
+max_batch_size: {}
+version_policy: {}
+input [
+  {{
+    name: "INPUT0"
+    data_type: {}
+    dims: [ {} ]
+  }},
+  {{
+    name: "INPUT1"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+output [
+  {{
+    name: "OUTPUT0"
+    data_type: {}
+    dims: [ {} ]
+    label_filename: "output0_labels.txt"
+   }},
+  {{
+    name: "OUTPUT1"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+instance_group [
+  {{
+      profile:"{}"
+  }}
+]
+'''.format(model_name, max_batch, version_policy_str,
+           np_to_model_dtype(input_dtype), tu.shape_to_dims_str(input_shape),
+           np_to_model_dtype(input_dtype), tu.shape_to_dims_str(input_shape),
+           np_to_model_dtype(output0_dtype), tu.shape_to_dims_str(output0_shape),
+           np_to_model_dtype(output1_dtype), tu.shape_to_dims_str(output1_shape),
+           profile_index)
+    else:
+        config = '''
 name: "{}"
 platform: "tensorrt_plan"
 max_batch_size: {}
@@ -1004,25 +1366,41 @@ def create_models(
 
     if FLAGS.tensorrt:
         # max-batch 8
+        suffix = ()
+        if input_dtype == np.int8 or output0_dtype == np.int8 or output1_dtype == np.int8:
+            suffix = (1,1)
         create_plan_modelconfig(
             models_dir, 8, model_version,
-            input_shape, output0_shape, output1_shape,
+            input_shape + suffix, output0_shape + suffix, output1_shape  + suffix,
             input_dtype, output0_dtype, output1_dtype,
             output0_label_cnt, version_policy)
         create_plan_modelfile(
             models_dir, 8, model_version,
-            input_shape, output0_shape, output1_shape,
+            input_shape + suffix, output0_shape + suffix, output1_shape + suffix,
             input_dtype, output0_dtype, output1_dtype)
         # max-batch 0
         create_plan_modelconfig(
             models_dir, 0, model_version,
-            input_shape, output0_shape, output1_shape,
+            input_shape + suffix, output0_shape + suffix, output1_shape + suffix,
             input_dtype, output0_dtype, output1_dtype,
             output0_label_cnt, version_policy)
         create_plan_modelfile(
             models_dir, 0, model_version,
-            input_shape, output0_shape, output1_shape,
+            input_shape + suffix, output0_shape + suffix, output1_shape + suffix,
             input_dtype, output0_dtype, output1_dtype)
+        
+        if -1 in input_shape:
+            # models for testing optimization profiles
+            create_plan_modelconfig(
+                models_dir, 8, model_version,
+                input_shape + suffix, output0_shape + suffix, output1_shape  + suffix,
+                input_dtype, output0_dtype, output1_dtype,
+                output0_label_cnt, version_policy, min_dim=4, max_dim=32)
+            create_plan_modelfile(
+                models_dir, 8, model_version,
+                input_shape + suffix, output0_shape + suffix, output1_shape + suffix,
+                input_dtype, output0_dtype, output1_dtype, min_dim=4, max_dim=32)
+
 
     if FLAGS.onnx:
         # max-batch 8
@@ -1073,48 +1451,46 @@ def create_models(
             if not pair[1](input_dtype, output0_dtype, output1_dtype,
                             input_shape, output0_shape, output1_shape):
                 continue
+            
+            config_input_shape = input_shape
+            config_output0_shape = output0_shape
+            config_output1_shape = output1_shape
             if pair[0] == "plan":
-                if len(input_shape) == 1:
-                    input_shape = (input_shape[0], 1, 1)
-                if len(output0_shape) == 1:
-                    output0_shape = (output0_shape[0], 1, 1)
-                if len(output1_shape) == 1:
-                    output1_shape = (output1_shape[0], 1, 1)
+                if len(input_shape) == 1 and input_dtype == np.int8:
+                    config_input_shape = (input_shape[0], 1, 1)
+                if len(output0_shape) == 1 and output0_dtype == np.int8:
+                    config_output0_shape = (output0_shape[0], 1, 1)
+                if len(output1_shape) == 1 and output1_dtype == np.int8:
+                    config_output1_shape = (output1_shape[0], 1, 1)
 
             # max-batch 8
             emu.create_ensemble_modelconfig(
                 pair[0], models_dir, 8, model_version,
-                input_shape, output0_shape, output1_shape,
+                config_input_shape, config_output0_shape, config_output1_shape,
                 input_dtype, output0_dtype, output1_dtype,
                 output0_label_cnt, version_policy)
             emu.create_ensemble_modelfile(
                 pair[0], models_dir, 8, model_version,
-                input_shape, output0_shape, output1_shape,
+                config_input_shape, config_output0_shape, config_output1_shape,
                 input_dtype, output0_dtype, output1_dtype)
             # max-batch 0
             emu.create_ensemble_modelconfig(
                 pair[0], models_dir, 0, model_version,
-                input_shape, output0_shape, output1_shape,
+                config_input_shape, config_output0_shape, config_output1_shape,
                 input_dtype, output0_dtype, output1_dtype,
                 output0_label_cnt, version_policy)
             emu.create_ensemble_modelfile(
                 pair[0], models_dir, 0, model_version,
-                input_shape, output0_shape, output1_shape,
+                config_input_shape, config_output0_shape, config_output1_shape,
                 input_dtype, output0_dtype, output1_dtype)
 
 
 def create_fixed_models(
         models_dir, input_dtype, output0_dtype, output1_dtype, version_policy=None):
-    input_size = 16
-
-    if FLAGS.tensorrt:
-        create_models(models_dir, input_dtype, output0_dtype, output1_dtype,
-                      (input_size, 1, 1), (input_size, 1, 1), (input_size, 1, 1),
-                      input_size, version_policy)
-    else:
-        create_models(models_dir, input_dtype, output0_dtype, output1_dtype,
-                      (input_size,), (input_size,), (input_size,),
-                      input_size, version_policy)
+    input_size = 16  
+    create_models(models_dir, input_dtype, output0_dtype, output1_dtype,
+            (input_size,), (input_size,), (input_size,),
+            input_size, version_policy)
 
 
 if __name__ == '__main__':
@@ -1217,15 +1593,26 @@ if __name__ == '__main__':
                                             (16,), (16,), (16,), vt, vt, vt, swap=True)
 
         if FLAGS.tensorrt:
-            for vt in [np.float32,]:
+            for vt in [np.float32, np.float16, np.int32]:
                 create_plan_modelfile(FLAGS.models_dir, 8, 2,
-                                            (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+                                            (16,), (16,), (16,), vt, vt, vt, swap=True)
                 create_plan_modelfile(FLAGS.models_dir, 8, 3,
-                                            (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+                                            (16,), (16,), (16,), vt, vt, vt, swap=True)
                 create_plan_modelfile(FLAGS.models_dir, 0, 2,
-                                            (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+                                            (16,), (16,), (16,), vt, vt, vt, swap=True)
                 create_plan_modelfile(FLAGS.models_dir, 0, 3,
-                                            (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+                                            (16,), (16,), (16,), vt, vt, vt, swap=True)
+                
+            vt = np.int8
+            #handle INT8 separately as it doesn't allow 1d tensors
+            create_plan_modelfile(FLAGS.models_dir, 8, 2,
+                                        (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+            create_plan_modelfile(FLAGS.models_dir, 8, 3,
+                                        (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+            create_plan_modelfile(FLAGS.models_dir, 0, 2,
+                                        (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
+            create_plan_modelfile(FLAGS.models_dir, 0, 3,
+                                        (16,1,1), (16,1,1), (16,1,1), vt, vt, vt, swap=True)
 
         if FLAGS.onnx:
             for vt in [np.float16, np.float32, np.int8, np.int16, np.int32]:
@@ -1250,8 +1637,8 @@ if __name__ == '__main__':
 
         if FLAGS.ensemble:
             for pair in emu.platform_types_and_validation():
-                shape = (16, 1, 1) if pair[0] == "plan" else (16,)
                 for vt in [np.float16, np.float32, np.int8, np.int16, np.int32]:
+                    shape = (16, 1, 1) if (pair[0] == "plan" and vt == np.int8) else (16,)
                     if not pair[1](vt, vt, vt, shape, shape, shape):
                         continue
                     emu.create_ensemble_modelfile(pair[0], FLAGS.models_dir, 8, 2,
@@ -1265,7 +1652,7 @@ if __name__ == '__main__':
 
     # Tests with models that accept variable-shape input/output tensors
     if FLAGS.variable:
-        create_models(FLAGS.models_dir, np.float32, np.float32, np.float32, (-1,), (16,), (16,), 16)
+        create_models(FLAGS.models_dir, np.float32, np.float32, np.float32, (-1,), (-1,), (-1,), 16)
         create_models(FLAGS.models_dir, np.float32, np.int32, np.int32, (-1,-1), (2,8), (2,8), 16)
         create_models(FLAGS.models_dir, np.float32, np.int64, np.int64, (8,-1), (8,4), (8,4), 32)
         create_models(FLAGS.models_dir, np.float32, np.int32, np.int64, (-1,8,-1), (2,8,2), (2,8,2), 32)

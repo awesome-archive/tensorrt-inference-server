@@ -28,8 +28,31 @@
 
 #include <NvInfer.h>
 #include "src/core/model_config.h"
+#include "src/core/status.h"
 
 namespace nvidia { namespace inferenceserver {
+
+// The memory layouts for i/o tensors
+enum class MemoryFormat {
+  // Row major linear format.
+  LINEAR,
+  // Two wide channel vectorized row major format.
+  CHW2,
+  // Four wide channel vectorized row major format.
+  CHW4,
+  // Eight channel format where C is padded to a multiple of 8.
+  HCW8,
+  // Sixteen wide channel vectorized row major format.
+  CHW16,
+  // Thirty-two wide channel vectorized row major format.
+  CHW32,
+  // Invalid Memory format
+  INVALID
+};
+
+MemoryFormat ConvertTrtFmtToFmt(nvinfer1::TensorFormat trt_fmt);
+
+const std::string MemoryFormat_Name(MemoryFormat fmt);
 
 DataType ConvertTrtTypeToDataType(nvinfer1::DataType trt_type);
 
@@ -37,6 +60,33 @@ std::pair<bool, nvinfer1::DataType> ConvertDataTypeToTrtType(
     const DataType& dtype);
 
 bool CompareDims(const nvinfer1::Dims& model_dims, const DimsList& dims);
+
+Status ValidateDimension(
+    const nvinfer1::Dims& this_dims, const nvinfer1::Dims& min_dims,
+    const nvinfer1::Dims& max_dims, const bool skip_first_dimension);
+
+Status ValidateDimension(
+    const DimsList& this_dims, const nvinfer1::Dims& min_dims,
+    const nvinfer1::Dims& max_dims, const bool skip_first_dimension);
+
+Status CompareDimsSupported(
+    const std::string& model_name, const std::string& tensor_name,
+    const nvinfer1::Dims& model_dims, const DimsList& dims,
+    const bool supports_batching, const bool is_dynamic);
+
+Status ValidateControlDimsDynamic(
+    const nvinfer1::Dims& dims, const bool support_batching);
+
+Status MaximumDims(
+    const nvinfer1::Dims& max_profile_dims, const DimsList& dims,
+    const bool support_batching, const int max_batch_size,
+    std::vector<int64_t>* maximum_dims);
+
+void DimsToDimVec(const nvinfer1::Dims& model_dims, std::vector<int64_t>* dims);
+
+bool DimVecToDims(const std::vector<int64_t>& dim_vec, nvinfer1::Dims* dims);
+
+bool ContainsWildcard(const nvinfer1::Dims& dims);
 
 const std::string DimsDebugString(const nvinfer1::Dims& dims);
 

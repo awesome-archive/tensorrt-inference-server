@@ -25,6 +25,18 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+REPO_VERSION=${NVIDIA_TENSORRT_SERVER_VERSION}
+if [ "$#" -ge 1 ]; then
+    REPO_VERSION=$1
+fi
+if [ -z "$REPO_VERSION" ]; then
+    echo -e "Repository version must be specified"
+    echo -e "\n***\n*** Test Failed\n***"
+    exit 1
+fi
+
+export CUDA_VISIBLE_DEVICES=0
+
 CLIENT_LOG_BASE="./client"
 INFER_TEST=infer_test.py
 
@@ -32,7 +44,7 @@ DATADIR=`pwd`/models
 
 SERVER=/opt/tensorrtserver/bin/trtserver
 # Allow more time to exit. Ensemble brings in too many models
-SERVER_ARGS="--model-store=$DATADIR --exit-timeout-secs=120"
+SERVER_ARGS="--model-repository=$DATADIR --exit-timeout-secs=120"
 SERVER_LOG_BASE="./inference_server"
 source ../common/util.sh
 
@@ -58,15 +70,16 @@ for TARGET in cpu gpu; do
         fi
         # set strict readiness=false on CPU-only device to allow
         # unsuccessful load of TensorRT plans, which require GPU.
-        SERVER_ARGS="--model-store=$DATADIR --exit-timeout-secs=120 --strict-readiness=false"
+        SERVER_ARGS="--model-repository=$DATADIR --exit-timeout-secs=120 --strict-readiness=false --exit-on-error=false"
     fi
 
     SERVER_LOG=$SERVER_LOG_BASE.${TARGET}.log
     CLIENT_LOG=$CLIENT_LOG_BASE.${TARGET}.log
 
     rm -fr models && \
-        cp -r /data/inferenceserver/qa_model_repository models && \
-        cp -r /data/inferenceserver/qa_ensemble_model_repository/qa_model_repository/* models/. && \
+        cp -r /data/inferenceserver/${REPO_VERSION}/qa_model_repository models && \
+        cp -r /data/inferenceserver/${REPO_VERSION}/qa_ensemble_model_repository/qa_model_repository/* \
+           models/. && \
         cp -r ../custom_models/custom_float32_* models/. && \
         cp -r ../custom_models/custom_int32_* models/. && \
         cp -r ../custom_models/custom_nobatch_* models/.
@@ -79,12 +92,29 @@ for TARGET in cpu gpu; do
     cp -r ../ensemble_models/* models/.
 
     KIND="KIND_GPU" && [[ "$TARGET" == "cpu" ]] && KIND="KIND_CPU"
-    # Onnx models are handled separately, see below
     for FW in graphdef savedmodel netdef onnx libtorch custom; do
         for MC in `ls models/${FW}*/config.pbtxt`; do
             echo "instance_group [ { kind: ${KIND} }]" >> $MC
         done
     done
+
+    # Modify custom_zero_1_float32 and custom_nobatch_zero_1_float32 for relevant ensembles
+    # This is done after the instance group change above so that identity custom backends
+    # are run on CPU
+    cp -r ../custom_models/custom_zero_1_float32 models/. &&\
+        mkdir -p models/custom_zero_1_float32/1 && \
+        cp `pwd`/libidentity.so models/custom_zero_1_float32/1/. && \
+        (cd models/custom_zero_1_float32 && \
+            echo "default_model_filename: \"libidentity.so\"" >> config.pbtxt && \
+            echo "instance_group [ { kind: KIND_CPU }]" >> config.pbtxt)
+    cp -r models/custom_zero_1_float32 models/custom_nobatch_zero_1_float32 && \
+        (cd models/custom_zero_1_float32 && \
+            sed -i "s/max_batch_size: 1/max_batch_size: 8/" config.pbtxt && \
+            sed -i "s/dims: \[ 1 \]/dims: \[ -1 \]/" config.pbtxt) && \
+        (cd models/custom_nobatch_zero_1_float32 && \
+            sed -i "s/custom_zero_1_float32/custom_nobatch_zero_1_float32/" config.pbtxt && \
+            sed -i "s/max_batch_size: 1/max_batch_size: 0/" config.pbtxt && \
+            sed -i "s/dims: \[ 1 \]/dims: \[ -1, -1 \]/" config.pbtxt)
 
     run_server
     if [ "$SERVER_PID" == "0" ]; then

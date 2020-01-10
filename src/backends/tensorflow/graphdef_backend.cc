@@ -37,26 +37,20 @@
 namespace nvidia { namespace inferenceserver {
 
 Status
-GraphDefBackend::Init(const std::string& path, const ModelConfig& config)
-{
-  RETURN_IF_ERROR(ValidateModelConfig(config, kTensorFlowGraphDefPlatform));
-  RETURN_IF_ERROR(BaseBackend::Init(path, config));
-  return Status::Success;
-}
-
-Status
 GraphDefBackend::CreateTRTISTFModel(
-    const std::shared_ptr<GraphDefBackendFactory::Config>& backend_config,
-    const int gpu_device, const bool has_graph_level, const int graph_level,
+    const GraphDefBackendFactory::Config* backend_config, const int device_id,
+    const bool has_graph_level, const int graph_level,
     const std::string& model_path, TRTISTFModelHandle* trtistf_model,
-    IONameMap* input_name_map, IONameMap* output_name_map)
+    IONameMap* input_name_map, IONameMap* output_name_map,
+    const TRTISTF_TFTRTConfig* tftrt_config)
 {
   TRTISTF_Model* model = nullptr;
   RETURN_IF_TRTISTF_ERROR(TRTISTF_ModelCreateFromGraphDef(
-      &model, model_path.c_str(), model_path.c_str(), gpu_device,
+      &model, model_path.c_str(), model_path.c_str(), device_id,
       has_graph_level, graph_level, backend_config->allow_gpu_memory_growth,
       backend_config->per_process_gpu_memory_fraction,
-      backend_config->allow_soft_placement));
+      backend_config->allow_soft_placement, backend_config->memory_limit_mb,
+      tftrt_config));
 
   trtistf_model->reset(model);
 
@@ -84,11 +78,72 @@ GraphDefBackend::CreateTRTISTFModel(
             std::to_string(potential_inputs.size()));
   }
 
+  // If this is a sequence model then make sure that the required
+  // inputs are present in the model
+  if (Config().has_sequence_batching()) {
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_START, inputs,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_END, inputs,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY, inputs,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateTypedSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_CORRID, inputs,
+        false /* required */));
+  }
+
   for (const auto& io : Config().input()) {
     RETURN_IF_ERROR(CheckAllowedModelInput(io, potential_inputs));
   }
   for (const auto& io : Config().output()) {
     RETURN_IF_ERROR(CheckAllowedModelOutput(io, potential_outputs));
+  }
+
+  return Status::Success;
+}
+
+Status
+GraphDefBackend::ValidateBooleanSequenceControl(
+    const ModelSequenceBatching::Control::Kind control_kind,
+    const TRTISTF_IOList* inputs, bool required)
+{
+  std::string tensor_name;
+  RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
+      Config().sequence_batching(), Name(), control_kind, required,
+      &tensor_name, nullptr, nullptr, nullptr, nullptr, nullptr));
+  if (!tensor_name.empty()) {
+    const TRTISTF_IO* input = FindIOByName(inputs, tensor_name);
+    if (input == nullptr) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "configuration specified sequence control '" + tensor_name +
+              "', but model does not provide that input");
+    }
+  }
+
+  return Status::Success;
+}
+
+Status
+GraphDefBackend::ValidateTypedSequenceControl(
+    const ModelSequenceBatching::Control::Kind control_kind,
+    const TRTISTF_IOList* inputs, bool required)
+{
+  std::string tensor_name;
+  RETURN_IF_ERROR(GetTypedSequenceControlProperties(
+      Config().sequence_batching(), Name(), control_kind, required,
+      &tensor_name, nullptr));
+  if (!tensor_name.empty()) {
+    const TRTISTF_IO* input = FindIOByName(inputs, tensor_name);
+    if (input == nullptr) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "configuration specified sequence control '" + tensor_name +
+              "', but model does not provide that input");
+    }
   }
 
   return Status::Success;

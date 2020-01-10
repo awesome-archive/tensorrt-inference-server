@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,85 +28,91 @@
 
 namespace nvidia { namespace inferenceserver {
 
-bool
-CompareDimsExact(
+Status
+CompareDims(
+    const std::string& model_name, const std::string& tensor_name,
     const TRTISTF_Shape* model_shape, const DimsList& dims,
-    const bool supports_batching)
+    const bool supports_batching, const bool compare_exact)
 {
   // If the model configuration expects batching support in the model,
   // then the tensorflow shape first dimension must be -1.
   if (supports_batching) {
     if ((model_shape->rank_ == 0) || (model_shape->dims_[0] != -1)) {
-      return false;
-    }
-  }
-
-  if (model_shape->rank_ !=
-      (size_t)(dims.size() + (supports_batching ? 1 : 0))) {
-    return false;
-  }
-
-  for (int i = 0; i < dims.size(); ++i) {
-    if (model_shape->dims_[i + (supports_batching ? 1 : 0)] != dims[i]) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-Status
-CompareDimsSupported(
-    const std::string& model_name, const std::string& tensor_name,
-    const TRTISTF_Shape* model_shape, const DimsList& dims,
-    const bool supports_batching)
-{
-  // If the model configuration expects batching support in the model,
-  // then the tensorflow shape first dimension must be -1.
-  if (supports_batching &&
-      ((model_shape->rank_ == 0) || (model_shape->dims_[0] != -1))) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name +
-            "', model configuration supports batching but first dimension of "
-            "tensor '" +
-            tensor_name +
-            "' expected by framework is not a variable-size batch dimension: " +
-            ShapeToString(model_shape) +
-            " whereas model configuration shape is: " + DimsListToString(dims));
-  }
-
-  const int nonbatch_start_idx = (supports_batching ? 1 : 0);
-
-  // Tensor rank in configuration must match what framework expects.
-  if (model_shape->rank_ != (size_t)(dims.size() + nonbatch_start_idx)) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name + "', tensor '" + tensor_name +
-            "' shape expected by framework " +
-            ShapeToString(model_shape, nonbatch_start_idx) +
-            " doesn't match model configuration shape " +
-            DimsListToString(dims));
-  }
-
-  for (int i = 0; i < dims.size(); ++i) {
-    int64_t model_dim = model_shape->dims_[i + nonbatch_start_idx];
-    if (model_dim == -1) {
-      continue;
-    }
-
-    if (model_dim != dims[i]) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "unable to load model '" + model_name + "', tensor '" + tensor_name +
-              "' shape expected by framework " +
-              ShapeToString(model_shape, nonbatch_start_idx) +
-              " doesn't match model configuration shape " +
-              DimsListToString(dims));
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': for the model to support batching the shape should have at "
+              "least 1 dimension and the first dimension must be -1; but shape "
+              "expected by the model is " +
+              ShapeToString(model_shape));
+    }
+
+    DimsList full_dims;
+    full_dims.Add(-1);
+    for (int i = 0; i < dims.size(); ++i) {
+      full_dims.Add(dims[i]);
+    }
+
+    bool succ = (model_shape->rank_ == (size_t)full_dims.size());
+    if (succ) {
+      for (int i = 0; i < full_dims.size(); ++i) {
+        const int64_t model_dim = model_shape->dims_[i];
+        if (compare_exact || (model_dim != -1)) {
+          succ &= (model_dim == full_dims[i]);
+        }
+      }
+    }
+
+    if (!succ) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': the model expects " + std::to_string(model_shape->rank_) +
+              " dimensions (shape " + ShapeToString(model_shape) +
+              ") but the model configuration specifies " +
+              std::to_string(full_dims.size()) +
+              " dimensions (an initial batch dimension because max_batch_size "
+              "> 0 followed by the explicit tensor shape, making complete "
+              "shape " +
+              DimsListToString(full_dims) + ")");
+    }
+  } else {
+    // ! supports_batching
+    bool succ = (model_shape->rank_ == (size_t)dims.size());
+    if (succ) {
+      for (int i = 0; i < dims.size(); ++i) {
+        const int64_t model_dim = model_shape->dims_[i];
+        if (compare_exact || (model_dim != -1)) {
+          succ &= (model_dim == dims[i]);
+        }
+      }
+    }
+
+    if (!succ) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': the model expects " + std::to_string(model_shape->rank_) +
+              " dimensions (shape " + ShapeToString(model_shape) +
+              ") but the model configuration specifies " +
+              std::to_string(dims.size()) + " dimensions (shape " +
+              DimsListToString(dims) + ")");
     }
   }
 
   return Status::Success;
+}
+
+const TRTISTF_IO*
+FindIOByName(const TRTISTF_IOList* ios, const std::string& name)
+{
+  for (const TRTISTF_IOList* itr = ios; itr != nullptr; itr = itr->next_) {
+    if (itr->io_->name_ == name) {
+      return itr->io_;
+    }
+  }
+
+  return nullptr;
 }
 
 std::string
@@ -114,15 +120,11 @@ ShapeToString(const TRTISTF_Shape* shape, const size_t start_idx)
 {
   std::string str("[");
   for (size_t idx = start_idx; idx < shape->rank_; idx++) {
-    const int64_t dim = shape->dims_[idx];
-    if (idx >= start_idx) {
-      if (idx > start_idx) {
-        str += ",";
-      }
-      str += std::to_string(dim);
+    if (idx > start_idx) {
+      str += ",";
     }
 
-    idx++;
+    str += std::to_string(shape->dims_[idx]);
   }
 
   str += "]";

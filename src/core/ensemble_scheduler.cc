@@ -29,10 +29,12 @@
 #include <mutex>
 #include "src/core/api.pb.h"
 #include "src/core/backend.h"
+#include "src/core/cuda_utils.h"
 #include "src/core/logging.h"
 #include "src/core/provider_utils.h"
 #include "src/core/server.h"
 #include "src/core/server_status.h"
+#include "src/core/trtserver.h"
 
 namespace nvidia { namespace inferenceserver {
 
@@ -43,10 +45,12 @@ namespace {
 struct Step {
   Step(size_t step_idx) : step_idx_(step_idx) {}
 
-  std::shared_ptr<InferenceServer::InferBackendHandle> backend_;
+  std::shared_ptr<InferenceBackend> backend_;
   std::shared_ptr<InferRequestProvider> request_provider_;
-  std::shared_ptr<InternalInferResponseProvider> response_provider_;
-  RequestStatus request_status_;
+  std::shared_ptr<InferResponseProvider> response_provider_;
+  std::unordered_map<std::string, std::shared_ptr<AllocatedSystemMemory>>
+      output_map_;
+  Status infer_status_;
 
   size_t step_idx_;
 };
@@ -67,7 +71,7 @@ class EnsembleContext {
       const std::shared_ptr<ModelInferStats>& stats,
       const std::shared_ptr<InferRequestProvider>& request_provider,
       const std::shared_ptr<InferResponseProvider>& response_provider,
-      std::function<void(Status)> OnComplete);
+      std::function<void(const Status&)> OnComplete, cudaStream_t stream);
 
   // Perform transition on 'context' state given the information of
   // 'completed_step'
@@ -76,9 +80,24 @@ class EnsembleContext {
       const std::shared_ptr<Step>& completed_step = nullptr);
 
  private:
+  static TRTSERVER_Error* ResponseAlloc(
+      TRTSERVER_ResponseAllocator* allocator, const char* tensor_name,
+      size_t byte_size, TRTSERVER_Memory_Type preferred_memory_type,
+      int64_t preferred_memory_type_id, void* userp, void** buffer,
+      void** buffer_userp, TRTSERVER_Memory_Type* allocated_memory_type,
+      int64_t* allocated_memory_type_id);
+  static TRTSERVER_Error* ResponseRelease(
+      TRTSERVER_ResponseAllocator* allocator, void* buffer, void* buffer_userp,
+      size_t byte_size, TRTSERVER_Memory_Type memory_type,
+      int64_t memory_type_id);
+
   using StepList = std::vector<std::shared_ptr<Step>>;
-  using VersionMap = std::unordered_map<
-      int64_t, std::shared_ptr<InferenceServer::InferBackendHandle>>;
+  using VersionMap =
+      std::unordered_map<int64_t, std::shared_ptr<InferenceBackend>>;
+  // Storing each tensor's meta data in 1st element, batch size in 2nd
+  // (0 for non-batchable), and the raw data in 3rd.
+  using TensorData =
+      std::tuple<InferRequestHeader::Input, size_t, std::shared_ptr<Memory>>;
 
   // Return the list of step that becomes ready due to tensor update
   // from 'completed_step'
@@ -94,13 +113,13 @@ class EnsembleContext {
   // returns the list of updated tensors in 'updated_tensors'
   Status UpdateEnsembleState(
       const std::shared_ptr<Step>& completed_step,
-      std::vector<size_t>& updated_tensors);
+      std::vector<std::string>& updated_tensors);
 
   // Helper function that returns a list of 'steps' that should be run under
   // current ensemble state. 'updated_tensors' is used so that we don't need to
   // iterate all the tensors to determine which step can be run.
   Status GetNextSteps(
-      const std::vector<size_t>& updated_tensors, StepList& steps);
+      const std::vector<std::string>& updated_tensors, StepList& steps);
 
   // Helper function that completes the response of the ensemble request
   Status FinishEnsemble();
@@ -114,9 +133,20 @@ class EnsembleContext {
   // Return error if some of the required outputs are not set (deadlock)
   Status CheckAndSetEnsembleOutput();
 
+  // Helper function to reshape the given tensor according to the
+  // config shape and batching info and its actual shape and batching info.
+  // Returns the batch size to be used after the reshape.
+  size_t ReshapeTensorDims(
+      const DimsList& config_dims, const bool allow_batching,
+      const size_t tensor_batch_size, DimsList* mutable_dims);
+
   InferenceServer* is_;
 
   EnsembleInfo* info_;
+
+  // All EnsembleContext will use the same CUDA stream managed by
+  // the ensemble scheduler
+  cudaStream_t stream_;
 
   // Mutex to avoid concurrent call on 'PrepareSteps' where ensemble state
   // are being modified
@@ -124,10 +154,12 @@ class EnsembleContext {
 
   size_t inflight_step_counter_;
 
-  // Storing each tensor's shape, data type and the data
-  std::vector<
-      std::pair<InferRequestHeader::Input, std::shared_ptr<SystemMemory>>>
-      tensor_data_;
+  // pointer that either points to 'pruned_tensor_to_step_' or to
+  // 'info_->tensor_to_step_' if all ensemble outputs are requested
+  std::unordered_map<std::string, std::set<size_t>>* tensor_to_step_;
+
+  std::unordered_map<std::string, std::set<size_t>> pruned_tensor_to_step_;
+  std::unordered_map<std::string, TensorData> tensor_data_;
 
   // Handle to all backend that may be used in the ensemble
   std::unordered_map<std::string, VersionMap> handles_;
@@ -143,10 +175,16 @@ class EnsembleContext {
   std::shared_ptr<ModelInferStats> stats_;
   std::shared_ptr<InferRequestProvider> request_provider_;
   std::shared_ptr<InferResponseProvider> response_provider_;
-  std::function<void(Status)> OnComplete_;
+  std::function<void(const Status&)> OnComplete_;
 
   // Output tensors whose labels are not provided by the ensemble
-  std::unordered_map<size_t, std::string> no_label_tensors_;
+  std::set<std::string> no_label_tensors_;
+
+  // The allocator that will be used to allocate buffers for the
+  // inference result tensors.
+  std::unique_ptr<
+      TRTSERVER_ResponseAllocator, decltype(&TRTSERVER_ResponseAllocatorDelete)>
+      allocator_;
 };
 
 EnsembleContext::EnsembleContext(
@@ -154,11 +192,11 @@ EnsembleContext::EnsembleContext(
     const std::shared_ptr<ModelInferStats>& stats,
     const std::shared_ptr<InferRequestProvider>& request_provider,
     const std::shared_ptr<InferResponseProvider>& response_provider,
-    std::function<void(Status)> OnComplete)
-    : is_(is), info_(info), inflight_step_counter_(0),
-      tensor_data_(info_->tensor_to_step_.size()), stats_(stats),
-      request_provider_(request_provider),
-      response_provider_(response_provider), OnComplete_(OnComplete)
+    std::function<void(const Status&)> OnComplete, cudaStream_t stream)
+    : is_(is), info_(info), stream_(stream), inflight_step_counter_(0),
+      stats_(stats), request_provider_(request_provider),
+      response_provider_(response_provider), OnComplete_(OnComplete),
+      allocator_(nullptr, TRTSERVER_ResponseAllocatorDelete)
 {
   // Obtain backend handles of all models in ensemble request such that
   // they have the same lifetime as the ensemble request to avoid unloading
@@ -171,15 +209,63 @@ EnsembleContext::EnsembleContext(
     }
     auto ver_it = it->second.find(step_info.model_version_);
     if (ver_it == it->second.end()) {
-      std::shared_ptr<InferenceServer::InferBackendHandle> backend = nullptr;
-      ensemble_status_ = InferenceServer::InferBackendHandle::Create(
-          is_, step_info.model_name_, step_info.model_version_, &backend);
+      std::shared_ptr<InferenceBackend> backend = nullptr;
+      ensemble_status_ = is_->GetInferenceBackend(
+          step_info.model_name_, step_info.model_version_, &backend);
       if (!ensemble_status_.IsOk()) {
         break;
       }
 
       it->second.emplace(std::make_pair(step_info.model_version_, backend));
     }
+  }
+
+  // Prune ensemble first if not all outputs are requested
+  std::set<std::string> ignored_tensor;
+  for (const auto& ensemble_output : info_->ensemble_output_shape_) {
+    ignored_tensor.insert(ensemble_output.first);
+  }
+  for (const auto& output : request_provider_->RequestHeader().output()) {
+    ignored_tensor.erase(output.name());
+  }
+  if (ignored_tensor.empty()) {
+    tensor_to_step_ = &(info_->tensor_to_step_);
+  } else {
+    pruned_tensor_to_step_ = info_->tensor_to_step_;
+    tensor_to_step_ = &pruned_tensor_to_step_;
+    // Backward traversal
+    std::unordered_map<size_t, size_t> step_requested_output_count;
+    while (!ignored_tensor.empty()) {
+      std::set<std::string> new_ignored_tensor;
+      for (const auto& output : ignored_tensor) {
+        auto step_idx = info_->tensor_to_prev_step_[output];
+        auto& step = info_->steps_[step_idx];
+        auto it = step_requested_output_count.find(step_idx);
+        if (it == step_requested_output_count.end()) {
+          auto output_count = step.output_to_tensor_.size();
+          it =
+              step_requested_output_count.emplace(step_idx, output_count).first;
+        }
+        // If none of the outputs of the step is requested,
+        // then the step can be pruned
+        if (--it->second == 0) {
+          for (const auto& input : step.input_to_tensor_) {
+            auto& step_set = pruned_tensor_to_step_[input.second];
+            step_set.erase(step_idx);
+            // If all steps depend on a tensor are pruned,
+            // then the tensor can be ignored.
+            if (step_set.empty()) {
+              new_ignored_tensor.insert(input.second);
+            }
+          }
+        }
+      }
+      ignored_tensor.swap(new_ignored_tensor);
+    }
+  }
+
+  for (const auto& pair : *tensor_to_step_) {
+    tensor_data_.emplace(pair.first, TensorData());
   }
 
   if (ensemble_status_.IsOk()) {
@@ -190,11 +276,12 @@ EnsembleContext::EnsembleContext(
     flags_ = request_header.flags();
 
     for (const auto& input : request_header.input()) {
-      auto it = info_->ensemble_input_to_tensor_.find(input.name());
-      if (it != info_->ensemble_input_to_tensor_.end()) {
-        auto& tensor_data = tensor_data_[it->second];
-        tensor_data.first = input;
-        request_provider_->GetSystemMemory(it->first, &(tensor_data.second));
+      auto it = tensor_data_.find(input.name());
+      if (it != tensor_data_.end()) {
+        auto& tensor_data = it->second;
+        std::get<0>(tensor_data) = input;
+        std::get<1>(tensor_data) = (info_->allow_batching_ ? batch_size_ : 0);
+        request_provider_->GetMemory(it->first, &(std::get<2>(tensor_data)));
       } else {
         ensemble_status_ = Status(
             RequestStatusCode::INVALID_ARG,
@@ -207,13 +294,72 @@ EnsembleContext::EnsembleContext(
   if (ensemble_status_.IsOk()) {
     const std::shared_ptr<LabelProvider>& label_provider =
         response_provider_->GetLabelProvider();
-    for (const auto& pair : info_->ensemble_output_to_tensor_) {
+    for (const auto& pair : info_->ensemble_output_shape_) {
       const auto& label = label_provider->GetLabel(pair.first, 0);
       if (label == "") {
-        no_label_tensors_[pair.second] = pair.first;
+        no_label_tensors_.emplace(pair.first);
       }
     }
   }
+
+  TRTSERVER_ResponseAllocator* allocator;
+  TRTSERVER_Error* err = TRTSERVER_ResponseAllocatorNew(
+      &allocator, ResponseAlloc, ResponseRelease);
+  if (err != nullptr) {
+    ensemble_status_ = Status(
+        TrtServerCodeToRequestStatus(TRTSERVER_ErrorCode(err)),
+        TRTSERVER_ErrorMessage(err));
+    TRTSERVER_ErrorDelete(err);
+  } else {
+    allocator_.reset(allocator);
+  }
+}
+
+TRTSERVER_Error*
+EnsembleContext::ResponseAlloc(
+    TRTSERVER_ResponseAllocator* allocator, const char* tensor_name,
+    size_t byte_size, TRTSERVER_Memory_Type preferred_memory_type,
+    int64_t preferred_memory_type_id, void* userp, void** buffer,
+    void** buffer_userp, TRTSERVER_Memory_Type* allocated_memory_type,
+    int64_t* allocated_memory_type_id)
+{
+  auto tensor_data_map = reinterpret_cast<
+      std::unordered_map<std::string, std::shared_ptr<AllocatedSystemMemory>>*>(
+      userp);
+
+  *buffer = nullptr;
+  *buffer_userp = nullptr;
+
+  auto allocated_buffer = std::make_shared<AllocatedSystemMemory>(
+      byte_size, preferred_memory_type, preferred_memory_type_id);
+
+  auto mutable_buffer = allocated_buffer->MutableBuffer(
+      allocated_memory_type, allocated_memory_type_id);
+  if ((mutable_buffer != nullptr) || (byte_size == 0)) {
+    if (byte_size != 0) {
+      *buffer = static_cast<void*>(mutable_buffer);
+    }
+    tensor_data_map->emplace(tensor_name, std::move(allocated_buffer));
+    LOG_VERBOSE(1) << "Internal response allocation: " << tensor_name
+                   << ", size " << byte_size << ", addr " << *buffer
+                   << ", memory type " << *allocated_memory_type << ", type id "
+                   << *allocated_memory_type_id;
+  }
+
+  return nullptr;  // Success
+}
+
+TRTSERVER_Error*
+EnsembleContext::ResponseRelease(
+    TRTSERVER_ResponseAllocator* allocator, void* buffer, void* buffer_userp,
+    size_t byte_size, TRTSERVER_Memory_Type memory_type, int64_t memory_type_id)
+{
+  LOG_VERBOSE(1) << "Internal response release: "
+                 << "size " << byte_size << ", addr " << buffer;
+
+  // Don't do anything when releasing a buffer since ResponseAlloc
+  // passes the ownership of the data to ensemble context.
+  return nullptr;  // Success
 }
 
 void
@@ -242,7 +388,7 @@ EnsembleContext::PrepareSteps(
 
     if (ensemble_status_.IsOk()) {
       StepList res;
-      std::vector<size_t> updated_tensors;
+      std::vector<std::string> updated_tensors;
       ensemble_status_ = UpdateEnsembleState(completed_step, updated_tensors);
       if (ensemble_status_.IsOk()) {
         ensemble_status_ = GetNextSteps(updated_tensors, res);
@@ -262,73 +408,72 @@ EnsembleContext::PrepareSteps(
 Status
 EnsembleContext::UpdateEnsembleState(
     const std::shared_ptr<Step>& completed_step,
-    std::vector<size_t>& updated_tensors)
+    std::vector<std::string>& updated_tensors)
 {
   updated_tensors.clear();
   if (completed_step == nullptr) {
-    for (size_t i = 0; i < tensor_data_.size(); i++) {
-      if (tensor_data_[i].second != nullptr) {
-        updated_tensors.push_back(i);
+    for (const auto& pair : tensor_data_) {
+      if (std::get<2>(pair.second) != nullptr) {
+        updated_tensors.push_back(pair.first);
       }
     }
   } else {
     inflight_step_counter_--;
-    if (completed_step->request_status_.code() != RequestStatusCode::SUCCESS) {
-      return Status(
-          completed_step->request_status_.code(),
-          completed_step->request_status_.msg());
-    } else {
-      auto step_idx = completed_step->step_idx_;
-      RETURN_IF_ERROR(completed_step->response_provider_->FinalizeResponse(
-          *(completed_step->backend_->GetInferenceBackend())));
-      const auto& response_header =
-          completed_step->response_provider_->ResponseHeader();
-      for (const auto& output : response_header.output()) {
-        if (output.has_raw()) {
-          auto it =
-              info_->steps_[step_idx].output_to_tensor_.find(output.name());
-          if (it != info_->steps_[step_idx].output_to_tensor_.end()) {
-            auto& tensor_data = tensor_data_[it->second];
-            *(tensor_data.first.mutable_dims()) = output.raw().dims();
-            tensor_data.first.set_batch_byte_size(
-                output.raw().batch_byte_size());
+    RETURN_IF_ERROR(completed_step->infer_status_);
 
-            RETURN_IF_ERROR(completed_step->response_provider_->GetSystemMemory(
-                it->first, &(tensor_data.second)));
-            updated_tensors.push_back(it->second);
+    auto step_idx = completed_step->step_idx_;
+    RETURN_IF_ERROR(completed_step->response_provider_->FinalizeResponse(
+        *(completed_step->backend_)));
+    const auto& response_header =
+        completed_step->response_provider_->ResponseHeader();
+    const bool allow_batching =
+        (completed_step->backend_->Config().max_batch_size() > 0);
+    const size_t batch_size =
+        (allow_batching ? response_header.batch_size() : 0);
+    for (const auto& output : response_header.output()) {
+      if (output.has_raw()) {
+        auto it = info_->steps_[step_idx].output_to_tensor_.find(output.name());
+        if (it != info_->steps_[step_idx].output_to_tensor_.end()) {
+          auto& tensor_data = tensor_data_[it->second];
+          auto& meta_data = std::get<0>(tensor_data);
+          *(meta_data.mutable_dims()) = output.raw().dims();
+          meta_data.set_batch_byte_size(output.raw().batch_byte_size());
 
-            auto tensor_it = no_label_tensors_.find(it->second);
-            if (tensor_it != no_label_tensors_.end()) {
-              // Check the inner model's lookup map first in case it is also an
-              // ensemble model. In that case, the label of the inner model may
-              // come from another model.
-              InferResponseProvider::SecondaryLabelProvider provider;
-              if (completed_step->response_provider_->GetSecondaryLabelProvider(
-                      it->first, &provider)) {
-                response_provider_->SetSecondaryLabelProvider(
-                    tensor_it->second, provider);
-              } else {
-                const std::shared_ptr<LabelProvider>& label_provider =
-                    completed_step->response_provider_->GetLabelProvider();
-                response_provider_->SetSecondaryLabelProvider(
-                    tensor_it->second,
-                    std::make_pair(it->first, label_provider));
-              }
-              no_label_tensors_.erase(tensor_it);
+          std::get<1>(tensor_data) = batch_size;
+
+          std::get<2>(tensor_data) =
+              std::move(completed_step->output_map_[it->first]);
+          updated_tensors.push_back(it->second);
+
+          auto tensor_it = no_label_tensors_.find(it->second);
+          if (tensor_it != no_label_tensors_.end()) {
+            // Check the inner model's lookup map first in case it is also an
+            // ensemble model. In that case, the label of the inner model may
+            // come from another model.
+            InferResponseProvider::SecondaryLabelProvider provider;
+            if (completed_step->response_provider_->GetSecondaryLabelProvider(
+                    it->first, &provider)) {
+              response_provider_->SetSecondaryLabelProvider(
+                  *tensor_it, provider);
+            } else {
+              const std::shared_ptr<LabelProvider>& label_provider =
+                  completed_step->response_provider_->GetLabelProvider();
+              response_provider_->SetSecondaryLabelProvider(
+                  *tensor_it, std::make_pair(it->first, label_provider));
             }
-          } else {
-            return Status(
-                RequestStatusCode::INTERNAL,
-                "internal response header specified output '" + output.name() +
-                    "' that does not map to any ensemble tensors");
+            no_label_tensors_.erase(tensor_it);
           }
         } else {
           return Status(
               RequestStatusCode::INTERNAL,
-              "internal response header should return output '" +
-                  output.name() +
-                  "' as raw data instead of classification result");
+              "internal response header specified output '" + output.name() +
+                  "' that does not map to any ensemble tensors");
         }
+      } else {
+        return Status(
+            RequestStatusCode::INTERNAL,
+            "internal response header should return output '" + output.name() +
+                "' as raw data instead of classification result");
       }
     }
   }
@@ -337,18 +482,18 @@ EnsembleContext::UpdateEnsembleState(
 
 Status
 EnsembleContext::GetNextSteps(
-    const std::vector<size_t>& updated_tensors, StepList& steps)
+    const std::vector<std::string>& updated_tensors, StepList& steps)
 {
   steps.clear();
 
   std::set<size_t> next_step_idx;
   // Get steps whose tensors used for input are set
-  for (const auto tensor_idx : updated_tensors) {
-    const auto& step_idx = info_->tensor_to_step_[tensor_idx];
+  for (const auto tensor_name : updated_tensors) {
+    const auto& step_idx = (*tensor_to_step_)[tensor_name];
     for (const auto& idx : step_idx) {
       bool ready = true;
       for (const auto& input_pair : info_->steps_[idx].input_to_tensor_) {
-        if (tensor_data_[input_pair.second].second == nullptr) {
+        if (std::get<2>(tensor_data_[input_pair.second]) == nullptr) {
           ready = false;
           break;
         }
@@ -371,25 +516,40 @@ EnsembleContext::GetNextSteps(
 Status
 EnsembleContext::InitStep(size_t step_idx, std::shared_ptr<Step>* step)
 {
-  std::unordered_map<std::string, std::shared_ptr<SystemMemory>> input_map;
+  std::unordered_map<std::string, std::shared_ptr<Memory>> input_map;
   InferRequestHeader request_header;
   auto& version_map = handles_[info_->steps_[step_idx].model_name_];
   auto& backend = version_map[info_->steps_[step_idx].model_version_];
 
-  request_header.set_correlation_id(correlation_id_);
-  request_header.set_batch_size(batch_size_);
-  request_header.set_flags(flags_);
+  const bool allow_batching = (backend->Config().max_batch_size() > 0);
+  size_t batch_size = (allow_batching ? batch_size_ : 0);
+
+  // Set inputs in request header and prepare input map
   for (const auto& pair : info_->steps_[step_idx].input_to_tensor_) {
     auto input = request_header.add_input();
-    *input = tensor_data_[pair.second].first;
+    *input = std::get<0>(tensor_data_[pair.second]);
     input->set_name(pair.first);
-    input_map[pair.first] = tensor_data_[pair.second].second;
+
+    // If the actual shape and config shape agree with each other without
+    // considering batch size, non-batch / batch conversion are not required
+    const ModelInput* input_config;
+    backend->GetInput(pair.first, &input_config);
+    batch_size = ReshapeTensorDims(
+        input_config->dims(), allow_batching,
+        std::get<1>(tensor_data_[pair.second]), input->mutable_dims());
+
+    input_map[pair.first] = std::get<2>(tensor_data_[pair.second]);
   }
+
+  // Set requested outputs in request header
   for (const auto& pair : info_->steps_[step_idx].output_to_tensor_) {
     request_header.add_output()->set_name(pair.first);
   }
-  RETURN_IF_ERROR(
-      NormalizeRequestHeader(*backend->GetInferenceBackend(), request_header));
+
+  request_header.set_correlation_id(correlation_id_);
+  request_header.set_flags(flags_);
+  request_header.set_batch_size((batch_size == 0 ? 1 : batch_size));
+  RETURN_IF_ERROR(NormalizeRequestHeader(*backend, request_header));
 
   step->reset(new Step(step_idx));
   (*step)->backend_ = backend;
@@ -399,19 +559,50 @@ EnsembleContext::InitStep(size_t step_idx, std::shared_ptr<Step>* step)
       &((*step)->request_provider_)));
   // Request header is stored in response provider as reference, so use
   // header from request provider as the providers have same lifetime
-  RETURN_IF_ERROR(InternalInferResponseProvider::Create(
-      *((*step)->backend_->GetInferenceBackend()),
+  RETURN_IF_ERROR(InferResponseProvider::Create(
       (*step)->request_provider_->RequestHeader(),
-      (*step)->backend_->GetInferenceBackend()->GetLabelProvider(),
+      (*step)->backend_->GetLabelProvider(), allocator_.get(), ResponseAlloc,
+      &((*step)->output_map_), ResponseRelease,
       &((*step)->response_provider_)));
 
   return Status::Success;
 }
 
+size_t
+EnsembleContext::ReshapeTensorDims(
+    const DimsList& config_dims, const bool allow_batching,
+    const size_t tensor_batch_size, DimsList* mutable_dims)
+{
+  size_t batch_size = tensor_batch_size;
+  // If the actual shape and config shape agree with each other without
+  // considering batch size, non-batch / batch conversion are not required.
+  if (!CompareDimsWithWildcard(*mutable_dims, config_dims)) {
+    // Only reshape if one setting is batchable while the other is not,
+    // otherwise the shape mismatch can not be recovered with reshape
+    // and should have caused error during validation.
+    if (allow_batching != (tensor_batch_size != 0)) {
+      if (allow_batching) {
+        // assume first dim is batch dim and extract it.
+        auto bit = mutable_dims->begin();
+        batch_size = *bit;
+        mutable_dims->erase(bit);
+      } else {
+        // insert batch size as first dim
+        mutable_dims->Add(tensor_batch_size);
+        mutable_dims->SwapElements(0, (mutable_dims->size() - 1));
+        batch_size = 0;
+      }
+    }
+  }
+  return batch_size;
+}
+
 Status
 EnsembleContext::FinishEnsemble()
 {
+#ifdef TRTIS_ENABLE_STATS
   stats_->SetModelExecutionCount(1);
+#endif  // TRTIS_ENABLE_STATS
   if (ensemble_status_.IsOk()) {
     ensemble_status_ = CheckAndSetEnsembleOutput();
   }
@@ -423,64 +614,104 @@ EnsembleContext::FinishEnsemble()
   }
   OnComplete_(ensemble_status_);
 
-  // Reset stats_ to make sure the timers are stopped even though
-  // there may be other internal requests (i.e. invoke FinishEnsemble()
-  // because of failure in one of the internal requests)
-  stats_.reset();
   return ensemble_status_;
 }
 
 Status
 EnsembleContext::CheckAndSetEnsembleOutput()
 {
-  for (const auto& output_pair : info_->ensemble_output_to_tensor_) {
+  bool cuda_async_copy = false;
+  for (const auto& output_pair : info_->ensemble_output_shape_) {
     if (!response_provider_->RequiresOutput(output_pair.first)) {
       continue;
     }
     // Check if output is ready
-    const auto& tensor_data = tensor_data_[output_pair.second];
-    if (tensor_data.second == nullptr) {
+    const auto& tensor_data = tensor_data_[output_pair.first];
+    const auto& meta_data = std::get<0>(tensor_data);
+    const auto& memory_block = std::get<2>(tensor_data);
+    if (memory_block == nullptr) {
       return Status(
           RequestStatusCode::INVALID_ARG,
           "unexpected deadlock, output '" + output_pair.first +
               "' is not set while no more ensemble steps can be made");
-    } else if (
-        tensor_data.first.batch_byte_size() !=
-        tensor_data.second->TotalByteSize()) {
+    } else if (meta_data.batch_byte_size() != memory_block->TotalByteSize()) {
       return Status(
           RequestStatusCode::INTERNAL,
           "unexpected size for output '" + output_pair.first + "', byte-size " +
-              std::to_string(tensor_data.first.batch_byte_size()) +
-              " does not equal " +
-              std::to_string(tensor_data.second->TotalByteSize()));
+              std::to_string(meta_data.batch_byte_size()) + " does not equal " +
+              std::to_string(memory_block->TotalByteSize()));
     }
 
     // copy data to ensemble response provider
-    size_t expected_byte_size = tensor_data.first.batch_byte_size();
+    size_t expected_byte_size = meta_data.batch_byte_size();
+    DimsList output_dims = meta_data.dims();
+
+    ReshapeTensorDims(
+        output_pair.second, info_->allow_batching_, std::get<1>(tensor_data),
+        &output_dims);
+
     std::vector<int64_t> shape;
     if (info_->allow_batching_) {
       shape.push_back(batch_size_);
     }
-    for (const auto& dim : tensor_data.first.dims()) {
+    for (const auto& dim : output_dims) {
       shape.push_back(dim);
     }
 
+    // Use the memory type of the memory block as preferred memory type
+    TRTSERVER_Memory_Type dst_memory_type, allocated_memory_type;
+    int64_t dst_memory_type_id;
+    size_t content_size;
+    memory_block->BufferAt(
+        0, &content_size, &dst_memory_type, &dst_memory_type_id);
+
     void* buffer;
+    int64_t allocated_memory_type_id;
     RETURN_IF_ERROR(response_provider_->AllocateOutputBuffer(
-        output_pair.first, &buffer, expected_byte_size, shape));
+        output_pair.first, &buffer, expected_byte_size, shape, dst_memory_type,
+        dst_memory_type_id, &allocated_memory_type, &allocated_memory_type_id));
+
+    // Done with this output if 'expected_byte_size' is 0
+    if (expected_byte_size == 0) {
+      continue;
+    } else if (buffer == nullptr) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "failed to allocate buffer for output '" + output_pair.first + "'");
+    }
 
     size_t content_offset = 0;
     size_t content_idx = 0;
-    size_t content_size;
-    const char* content =
-        tensor_data.second->BufferAt(content_idx, &content_size);
+    TRTSERVER_Memory_Type src_memory_type;
+    int64_t src_memory_type_id;
+
+    const char* content = memory_block->BufferAt(
+        content_idx, &content_size, &src_memory_type, &src_memory_type_id);
+    bool cuda_used = false;
     while (content != nullptr) {
-      memcpy(((char*)buffer) + content_offset, content, content_size);
+      RETURN_IF_ERROR(CopyBuffer(
+          output_pair.first, src_memory_type, src_memory_type_id,
+          allocated_memory_type, allocated_memory_type_id, content_size,
+          content, ((char*)buffer) + content_offset, stream_, &cuda_used));
+      cuda_async_copy |= cuda_used;
+
       content_offset += content_size;
       content_idx++;
-      content = tensor_data.second->BufferAt(content_idx, &content_size);
+      content = memory_block->BufferAt(
+          content_idx, &content_size, &src_memory_type, &src_memory_type_id);
     }
   }
+
+  if (cuda_async_copy) {
+#ifdef TRTIS_ENABLE_GPU
+    cudaStreamSynchronize(stream_);
+#else
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "unexpected CUDA copy flag set while GPU is not supported");
+#endif  // TRTIS_ENABLE_GPU
+  }
+
   return Status::Success;
 }
 
@@ -489,23 +720,51 @@ EnsembleContext::ScheduleSteps(
     const std::shared_ptr<EnsembleContext>& context, const StepList& steps)
 {
   for (const auto& step : steps) {
-    InferenceBackend* backend = step->backend_->GetInferenceBackend();
-
+#ifdef TRTIS_ENABLE_STATS
     auto infer_stats = std::make_shared<ModelInferStats>(
-        context->is_->StatusManager(), backend->Name());
-    auto timer = std::make_shared<ModelInferStats::ScopedTimer>();
-    infer_stats->StartRequestTimer(timer.get());
-    infer_stats->SetRequestedVersion(backend->Version());
-    infer_stats->SetMetricReporter(backend->MetricReporter());
+        context->is_->StatusManager(), step->backend_->Name());
+    infer_stats->CaptureTimestamp(
+        ModelInferStats::TimestampKind::kRequestStart);
+    infer_stats->SetRequestedVersion(step->backend_->Version());
+    infer_stats->SetMetricReporter(step->backend_->MetricReporter());
     infer_stats->SetBatchSize(
         step->request_provider_->RequestHeader().batch_size());
+    infer_stats->SetFailed(true);
 
-    context->is_->HandleInfer(
-        &(step->request_status_), step->backend_, step->request_provider_,
-        step->response_provider_, infer_stats,
-        [context, step, infer_stats, timer]() mutable {
-          timer.reset();
-          infer_stats.reset();
+    // Passing trace-related objects down
+    infer_stats->SetTraceManager(context->stats_->GetTraceManager());
+    infer_stats->NewTrace(context->stats_->GetTrace());
+#else
+    auto infer_stats = std::make_shared<ModelInferStats>();
+#endif  // TRTIS_ENABLE_STATS
+
+    context->is_->InferAsync(
+        step->backend_, step->request_provider_, step->response_provider_,
+        infer_stats,
+        [context, step, infer_stats](const Status& status) mutable {
+          if (!status.IsOk()) {
+            LOG_VERBOSE(1) << "Ensemble infer failed: " << status.Message();
+          }
+
+#ifdef TRTIS_ENABLE_STATS
+          infer_stats->SetFailed(!status.IsOk());
+          infer_stats->CaptureTimestamp(
+              ModelInferStats::TimestampKind::kRequestEnd);
+          infer_stats->Report();
+#endif  // TRTIS_ENABLE_STATS
+
+          step->infer_status_ = status;
+
+#ifdef TRTIS_ENABLE_STATS
+          {
+            std::lock_guard<std::mutex> lk(context->mutex_);
+            // Accumulate the queue and compute durations from this
+            // composing model
+            context->stats_->IncrementQueueDuration(*infer_stats);
+            context->stats_->IncrementComputeDuration(*infer_stats);
+          }
+#endif  // TRTIS_ENABLE_STATS
+
           Proceed(context, step);
         });
   }
@@ -515,9 +774,10 @@ EnsembleContext::ScheduleSteps(
 
 Status
 EnsembleScheduler::Create(
-    const ModelConfig& config, std::unique_ptr<Scheduler>* scheduler)
+    InferenceServer* const server, const ModelConfig& config,
+    std::unique_ptr<Scheduler>* scheduler)
 {
-  scheduler->reset(new EnsembleScheduler(config));
+  scheduler->reset(new EnsembleScheduler(server, config));
   return Status::Success;
 }
 
@@ -526,67 +786,85 @@ EnsembleScheduler::Enqueue(
     const std::shared_ptr<ModelInferStats>& stats,
     const std::shared_ptr<InferRequestProvider>& request_provider,
     const std::shared_ptr<InferResponseProvider>& response_provider,
-    std::function<void(Status)> OnComplete)
+    std::function<void(const Status&)> OnComplete)
 {
   std::shared_ptr<EnsembleContext> context(new EnsembleContext(
-      is_, info_.get(), stats, request_provider, response_provider,
-      OnComplete));
+      is_, info_.get(), stats, request_provider, response_provider, OnComplete,
+      stream_));
   EnsembleContext::Proceed(context);
 }
 
-EnsembleScheduler::EnsembleScheduler(const ModelConfig& config)
+EnsembleScheduler::EnsembleScheduler(
+    InferenceServer* const server, const ModelConfig& config)
+    : is_(server), stream_(nullptr)
 {
+#ifdef TRTIS_ENABLE_GPU
+  // create CUDA stream
+  auto cuerr = cudaStreamCreate(&stream_);
+  if (cuerr != cudaSuccess) {
+    stream_ = nullptr;
+    LOG_ERROR << "unable to create stream for " << config.name() << ": "
+              << cudaGetErrorString(cuerr);
+  }
+#endif  // TRTIS_ENABLE_GPU
+
   // Set 'info_' based on 'config'
   info_.reset(new EnsembleInfo());
 
   info_->ensemble_name_ = config.name();
   info_->allow_batching_ = (config.max_batch_size() != 0);
 
-  std::unordered_map<std::string, size_t> name_to_idx;
-  // Reserve slot for ensemble inputs and outputs
   for (const auto& input : config.input()) {
-    size_t idx = info_->tensor_to_step_.size();
-    info_->ensemble_input_to_tensor_[input.name()] = idx;
-    name_to_idx[input.name()] = idx;
-    info_->tensor_to_step_.emplace_back();
+    info_->tensor_to_step_.emplace(input.name(), std::set<size_t>());
   }
   for (const auto& output : config.output()) {
-    size_t idx = info_->tensor_to_step_.size();
-    info_->ensemble_output_to_tensor_[output.name()] = idx;
-    name_to_idx[output.name()] = idx;
-    info_->tensor_to_step_.emplace_back();
+    info_->tensor_to_step_.emplace(output.name(), std::set<size_t>());
+
+    if (output.has_reshape()) {
+      info_->ensemble_output_shape_[output.name()] = output.reshape().shape();
+    } else {
+      info_->ensemble_output_shape_[output.name()] = output.dims();
+    }
   }
 
   for (const auto& element : config.ensemble_scheduling().step()) {
     size_t step_idx = info_->steps_.size();
     info_->steps_.emplace_back(element.model_name(), element.model_version());
     for (const auto& pair : element.input_map()) {
-      size_t idx = info_->tensor_to_step_.size();
-      auto it = name_to_idx.find(pair.second);
-      if (it == name_to_idx.end()) {
-        name_to_idx[pair.second] = idx;
-        info_->tensor_to_step_.emplace_back();
-      } else {
-        idx = it->second;
+      auto it = info_->tensor_to_step_.find(pair.second);
+      if (it == info_->tensor_to_step_.end()) {
+        it = info_->tensor_to_step_.emplace(pair.second, std::set<size_t>())
+                 .first;
       }
-      info_->tensor_to_step_[idx].insert(step_idx);
+      it->second.insert(step_idx);
       info_->steps_[step_idx].input_to_tensor_.emplace(
-          std::make_pair(pair.first, idx));
+          std::make_pair(pair.first, pair.second));
     }
 
     for (const auto& pair : element.output_map()) {
-      size_t idx = info_->tensor_to_step_.size();
-      auto it = name_to_idx.find(pair.second);
-      if (it == name_to_idx.end()) {
-        name_to_idx[pair.second] = idx;
-        info_->tensor_to_step_.emplace_back();
-      } else {
-        idx = it->second;
+      auto it = info_->tensor_to_step_.find(pair.second);
+      if (it == info_->tensor_to_step_.end()) {
+        it = info_->tensor_to_step_.emplace(pair.second, std::set<size_t>())
+                 .first;
       }
       info_->steps_[step_idx].output_to_tensor_.emplace(
-          std::make_pair(pair.first, idx));
+          std::make_pair(pair.first, pair.second));
+
+      info_->tensor_to_prev_step_.emplace(pair.second, step_idx);
     }
   }
+}
+
+EnsembleScheduler::~EnsembleScheduler()
+{
+#ifdef TRTIS_ENABLE_GPU
+  if (stream_ != nullptr) {
+    cudaError_t err = cudaStreamDestroy(stream_);
+    if (err != cudaSuccess) {
+      LOG_ERROR << "Failed to destroy cuda stream: " << cudaGetErrorString(err);
+    }
+  }
+#endif  // TRTIS_ENABLE_GPU
 }
 
 }}  // namespace nvidia::inferenceserver

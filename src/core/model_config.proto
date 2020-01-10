@@ -109,6 +109,16 @@ message ModelInstanceGroup
     //@@       CPU.
     //@@
     KIND_CPU = 2;
+
+    //@@    .. cpp:enumerator:: Kind::KIND_MODEL = 3
+    //@@
+    //@@       This instance group represents instances that should run on the
+    //@@       CPU and/or GPU(s) as specified by the model or backend itself.
+    //@@       The inference server will not override the model/backend
+    //@@       settings.
+    //@@       Currently, this option is supported only for Tensorflow models.
+    //@@
+    KIND_MODEL = 3;
   }
 
   //@@  .. cpp:var:: string name
@@ -124,8 +134,8 @@ message ModelInstanceGroup
   //@@
   //@@     The kind of this instance group. Default is KIND_AUTO. If
   //@@     KIND_AUTO or KIND_GPU then both 'count' and 'gpu' are valid and
-  //@@     may be specified. If KIND_CPU only 'count' is valid and 'gpu'
-  //@@     cannot be specified.
+  //@@     may be specified. If KIND_CPU or KIND_MODEL only 'count' is valid
+  //@@     and 'gpu' cannot be specified.
   //@@
   Kind kind = 4;
 
@@ -144,6 +154,18 @@ message ModelInstanceGroup
   //@@     available GPUs.
   //@@
   repeated int32 gpus = 3;
+
+  //@@  .. cpp:var:: string profile (repeated)
+  //@@
+  //@@     For TensorRT models, using inputs with dynamic shape, this
+  //@@     parameter specifies a set of optimization profiles available to this
+  //@@     instance group. The inference server will choose the optimal profile
+  //@@     based on the shapes of the input tensors. This field should lie
+  //@@     between 0 and <TotalNumberOfOptimizationProfilesInPlanModel> - 1
+  //@@     and be specified only for TensorRT backend, otherwise an error will
+  //@@     be generated.
+  //@@
+  repeated string profile = 5;
 }
 
 //@@
@@ -422,6 +444,92 @@ message ModelOptimizationPolicy
     bool graphs = 1;
   }
 
+  //@@
+  //@@  .. cpp:var:: message ExecutionAccelerators
+  //@@
+  //@@     Specify the preferred execution accelerators to be used to execute
+  //@@     the model. Currently only recognized by ONNX Runtime backend and
+  //@@     TensorFlow backend.
+  //@@
+  //@@     For ONNX Runtime backend, it will deploy the model with the execution
+  //@@     accelerators by priority, the priority is determined based on the
+  //@@     order that they are set, i.e. the provider at the front has highest
+  //@@     priority. Overall, the priority will be in the following order:
+  //@@         <gpu_execution_accelerator> (if instance is on GPU)
+  //@@         CUDA Execution Provider     (if instance is on GPU)
+  //@@         <cpu_execution_accelerator>
+  //@@         Default CPU Execution Provider
+  //@@
+  message ExecutionAccelerators
+  {
+    //@@
+    //@@  .. cpp:var:: message Accelerator
+    //@@
+    //@@     Specify the accelerator to be used to execute the model.
+    //@@     Accelerator with the same name may accept different parameters
+    //@@     depending on the backends.
+    //@@
+    message Accelerator
+    {
+      //@@    .. cpp:var:: string name
+      //@@
+      //@@       The name of the execution accelerator.
+      //@@
+      string name = 1;
+
+      //@@    .. cpp:var:: map<string, string> parameters
+      //@@
+      //@@       Additional paremeters used to configure the accelerator.
+      //@@
+      map<string, string> parameters = 2;
+    }
+
+    //@@    .. cpp:var:: Accelerator gpu_execution_accelerator (repeated)
+    //@@
+    //@@       The preferred execution provider to be used if the model instance
+    //@@       is deployed on GPU.
+    //@@
+    //@@       For ONNX Runtime backend, possible value is "tensorrt" as name,
+    //@@       and no parameters are required.
+    //@@
+    //@@       For TensorFlow backend, possible values are "tensorrt", "gpu_io".
+    //@@
+    //@@       For "tensorrt", the following parameters can be specified:
+    //@@         "precision_mode": The precision used for optimization.
+    //@@         Allowed values are "FP32" and "FP16". Default value is "FP32".
+    //@@
+    //@@         "max_cached_engines": The maximum number of cached TensorRT
+    //@@         engines in dynamic TensorRT ops. Default value is 100.
+    //@@
+    //@@         "minimum_segment_size": The smallest model subgraph that will
+    //@@         be considered for optimization by TensorRT. Default value is 3.
+    //@@
+    //@@         "max_workspace_size_bytes": The maximum GPU memory the model
+    //@@         can use temporarily during execution. Default value is 1GB.
+    //@@
+    //@@       For "gpu_io", no parameters are required. If set, the model will
+    //@@       be executed using TensorFlow Callable API to set input and output
+    //@@       tensors in GPU memory if possible, which can reduce data transfer
+    //@@       overhead if the model is used in ensemble. However, the Callable
+    //@@       object will be created on model creation and it will request all
+    //@@       outputs for every model execution, which may impact the
+    //@@       performance if a request does not require all outputs. This
+    //@@       optimization will only take affect if the model instance is
+    //@@       created with KIND_GPU.
+    //@@
+    repeated Accelerator gpu_execution_accelerator = 1;
+
+    //@@    .. cpp:var:: Accelerator cpu_execution_accelerator (repeated)
+    //@@
+    //@@       The preferred execution provider to be used if the model instance
+    //@@       is deployed on CPU.
+    //@@
+    //@@       For ONNX Runtime backend, possible value is "openvino" as name,
+    //@@       and no parameters are required.
+    //@@
+    repeated Accelerator cpu_execution_accelerator = 2;
+  }
+
   //@@  .. cpp:var:: Graph graph
   //@@
   //@@     The graph optimization setting for the model. Optional.
@@ -439,6 +547,12 @@ message ModelOptimizationPolicy
   //@@     CUDA-specific optimization settings. Optional.
   //@@
   Cuda cuda = 3;
+
+  //@@  .. cpp:var:: ExecutionAccelerators execution_accelerators
+  //@@
+  //@@     The accelerators used for the model. Optional.
+  //@@
+  ExecutionAccelerators execution_accelerators = 4;
 }
 
 //@@
@@ -465,6 +579,20 @@ message ModelDynamicBatching
   //@@     batching. Default is 0.
   //@@
   uint64 max_queue_delay_microseconds = 2;
+
+  //@@  .. cpp:var:: bool preserve_ordering
+  //@@
+  //@@     Should the dynamic batcher preserve the ordering of responses to
+  //@@     match the order of requests received by the scheduler. Default is
+  //@@     false. If true, the responses will be returned in the same order as
+  //@@     the order of requests sent to the scheduler. If false, the responses
+  //@@     may be returned in arbitrary order. This option is specifically
+  //@@     needed when a sequence of related inference requests (i.e. inference
+  //@@     requests with the same correlation ID) are sent to the dynamic
+  //@@     batcher to ensure that the sequence responses are in the correct
+  //@@     order.
+  //@@
+  bool preserve_ordering = 3;
 }
 
 //@@
@@ -475,21 +603,10 @@ message ModelDynamicBatching
 //@@
 message ModelSequenceBatching
 {
-  //@@  .. cpp:var:: uint64 max_sequence_idle_microseconds
-  //@@
-  //@@     The maximum time, in microseconds, that a sequence is allowed to
-  //@@     be idle before it is aborted. The inference server considers a
-  //@@     sequence idle when it does not have any inference request queued
-  //@@     for the sequence. If this limit is exceeded, the inference server
-  //@@     will free the batch slot allocated by the sequence and make it
-  //@@     available for another sequence. If not specified (or specified as
-  //@@     zero) a default value of 1000000 (1 second) is used.
-  //@@
-  uint64 max_sequence_idle_microseconds = 1;
-
   //@@  .. cpp:var:: message Control
   //@@
-  //@@     A control is a binary signal to a backend.
+  //@@     A control is a signal that the sequence batcher uses to
+  //@@     communicate with a backend.
   //@@
   message Control
   {
@@ -502,7 +619,9 @@ message ModelSequenceBatching
       //@@      .. cpp:enumerator:: Kind::CONTROL_SEQUENCE_START = 0
       //@@
       //@@         A new sequence is/is-not starting. If true a sequence is
-      //@@         starting, if false a sequence is continuing.
+      //@@         starting, if false a sequence is continuing. Must
+      //@@         specify either int32_false_true or fp32_false_true for
+      //@@         this control. This control is optional.
       //@@
       CONTROL_SEQUENCE_START = 0;
 
@@ -511,9 +630,31 @@ message ModelSequenceBatching
       //@@         A sequence is/is-not ready for inference. If true the
       //@@         input tensor data is valid and should be used. If false
       //@@         the input tensor data is invalid and inferencing should
-      //@@         be "skipped".
+      //@@         be "skipped".  Must specify either int32_false_true or
+      //@@         fp32_false_true for this control. This control is optional.
       //@@
       CONTROL_SEQUENCE_READY = 1;
+
+      //@@      .. cpp:enumerator:: Kind::CONTROL_SEQUENCE_END = 2
+      //@@
+      //@@         A sequence is/is-not ending. If true a sequence is
+      //@@         ending, if false a sequence is continuing. Must
+      //@@         specify either int32_false_true or fp32_false_true for
+      //@@         this control. This control is optional.
+      //@@
+      CONTROL_SEQUENCE_END = 2;
+
+      //@@      .. cpp:enumerator:: Kind::CONTROL_SEQUENCE_CORRID = 3
+      //@@
+      //@@         The correlation ID of the sequence. The correlation ID
+      //@@         is an uint64_t value that is communicated in whole or
+      //@@         in part by the tensor. The tensor's datatype must be
+      //@@         specified by data_type and must be TYPE_UINT64, TYPE_INT64,
+      //@@         TYPE_UINT32 or TYPE_INT32. If a 32-bit datatype is specified
+      //@@         the correlation ID will be truncated to the low-order 32
+      //@@         bits. This control is optional.
+      //@@
+      CONTROL_SEQUENCE_CORRID = 3;
     }
 
     //@@    .. cpp:var:: Kind kind
@@ -541,6 +682,12 @@ message ModelSequenceBatching
     //@@       first the false value and the second the true value.
     //@@
     repeated float fp32_false_true = 3;
+
+    //@@    .. cpp:var:: DataType data_type
+    //@@
+    //@@       The control's datatype.
+    //@@
+    DataType data_type = 4;
   }
 
   //@@  .. cpp:var:: message ControlInput
@@ -562,6 +709,89 @@ message ModelSequenceBatching
     //@@
     repeated Control control = 2;
   }
+
+  //@@  .. cpp:var:: message StrategyDirect
+  //@@
+  //@@     The sequence batcher uses a specific, unique batch
+  //@@     slot for each sequence. All inference requests in a
+  //@@     sequence are directed to the same batch slot in the same
+  //@@     model instance over the lifetime of the sequence. This
+  //@@     is the default strategy.
+  //@@
+  message StrategyDirect {}
+
+  //@@  .. cpp:var:: message StrategyOldest
+  //@@
+  //@@     The sequence batcher maintains up to 'max_candidate_sequences'
+  //@@     candidate sequences. 'max_candidate_sequences' can be greater
+  //@@     than the model's 'max_batch_size'. For inferencing the batcher
+  //@@     chooses from the candidate sequences up to 'max_batch_size'
+  //@@     inference requests. Requests are chosen in an oldest-first
+  //@@     manner across all candidate sequences. A given sequence is
+  //@@     not guaranteed to be assigned to the same batch slot for
+  //@@     all inference requests of that sequence.
+  //@@
+  message StrategyOldest
+  {
+    //@@    .. cpp:var:: int32 max_candidate_sequences
+    //@@
+    //@@       Maximum number of candidate sequences that the batcher
+    //@@       maintains. Excess seqences are kept in an ordered backlog
+    //@@       and become candidates when existing candidate sequences
+    //@@       complete.
+    //@@
+    int32 max_candidate_sequences = 1;
+
+    //@@    .. cpp:var:: int32 preferred_batch_size (repeated)
+    //@@
+    //@@       Preferred batch sizes for dynamic batching of candidate
+    //@@       sequences. If a batch of one of these sizes can be formed
+    //@@       it will be executed immediately.  If not specified a
+    //@@       preferred batch size will be chosen automatically
+    //@@       based on model and GPU characteristics.
+    //@@
+    repeated int32 preferred_batch_size = 2;
+
+    //@@    .. cpp:var:: uint64 max_queue_delay_microseconds
+    //@@
+    //@@       The maximum time, in microseconds, a candidate request
+    //@@       will be delayed in the dynamic batch scheduling queue to
+    //@@       wait for additional requests for batching. Default is 0.
+    //@@
+    uint64 max_queue_delay_microseconds = 3;
+  }
+
+  //@@  .. cpp:var:: oneof strategy_choice
+  //@@
+  //@@     The strategy used by the sequence batcher. Default strategy
+  //@@     is 'direct'.
+  //@@
+  oneof strategy_choice
+  {
+    //@@    .. cpp:var:: StrategyDirect direct
+    //@@
+    //@@       StrategyDirect scheduling strategy.
+    //@@
+    StrategyDirect direct = 3;
+
+    //@@    .. cpp:var:: StrategyOldest oldest
+    //@@
+    //@@       StrategyOldest scheduling strategy.
+    //@@
+    StrategyOldest oldest = 4;
+  }
+
+  //@@  .. cpp:var:: uint64 max_sequence_idle_microseconds
+  //@@
+  //@@     The maximum time, in microseconds, that a sequence is allowed to
+  //@@     be idle before it is aborted. The inference server considers a
+  //@@     sequence idle when it does not have any inference request queued
+  //@@     for the sequence. If this limit is exceeded, the inference server
+  //@@     will free the sequence slot allocated by the sequence and make it
+  //@@     available for another sequence. If not specified (or specified as
+  //@@     zero) a default value of 1000000 (1 second) is used.
+  //@@
+  uint64 max_sequence_idle_microseconds = 1;
 
   //@@  .. cpp:var:: ControlInput control_input (repeated)
   //@@
@@ -641,6 +871,91 @@ message ModelParameter
   //@@     The string value of the parameter.
   //@@
   string string_value = 1;
+}
+
+//@@
+//@@.. cpp:var:: message ModelWarmup
+//@@
+//@@   Settings used to construct the request sample for model warmup.
+//@@
+message ModelWarmup
+{
+  //@@
+  //@@  .. cpp:var:: message Input
+  //@@
+  //@@     Meta data associated with an input.
+  //@@
+  message Input
+  {
+    //@@    .. cpp:var:: DataType data_type
+    //@@
+    //@@       The data-type of the input.
+    //@@
+    DataType data_type = 1;
+
+    //@@    .. cpp:var:: int64 dims (repeated)
+    //@@
+    //@@       The shape of the input tensor, not including the batch dimension.
+    //@@
+    repeated int64 dims = 2;
+
+    //@@    .. cpp:var:: oneof input_data_type
+    //@@
+    //@@       Specify how the input data is generated. If the input has STRING
+    //@@       data type and 'random_data' is set, the data generation will fall
+    //@@       back to 'zero_data'.
+    //@@
+    oneof input_data_type
+    {
+      //@@
+      //@@    .. cpp:var:: bool zero_data
+      //@@
+      //@@       The identifier for using zeros as input data. Note that the
+      //@@       value of 'zero_data' will not be checked, instead, zero data
+      //@@       will be used as long as the field is set.
+      //@@
+      bool zero_data = 3;
+
+      //@@
+      //@@    .. cpp:var:: bool random_data
+      //@@
+      //@@       The identifier for using random data as input data. Note that
+      //@@       the value of 'random_data' will not be checked, instead,
+      //@@       random data will be used as long as the field is set.
+      //@@
+      bool random_data = 4;
+
+      //@@    .. cpp:var:: string input_data_file
+      //@@
+      //@@       The file whose content will be used as raw input data in
+      //@@       row-major order. The file must be provided in a sub-directory
+      //@@       'warmup' under the model directory.
+      //@@
+      string input_data_file = 5;
+    }
+  }
+
+  //@@  .. cpp:var:: string name
+  //@@
+  //@@     The name of the request sample.
+  //@@
+  string name = 1;
+
+  //@@  .. cpp:var:: uint32 batch_size
+  //@@
+  //@@     The batch size of the inference request. This must be >= 1. For
+  //@@     models that don't support batching, batch_size must be 1. If
+  //@@     batch_size > 1, the 'inputs' specified below will be duplicated to
+  //@@     match the batch size requested.
+  //@@
+  uint32 batch_size = 2;
+
+  //@@  .. cpp:var:: map<string, Input> inputs
+  //@@
+  //@@     The warmup meta data associated with every model input, including
+  //@@     control tensors.
+  //@@
+  map<string, Input> inputs = 3;
 }
 
 //@@
@@ -760,7 +1075,7 @@ message ModelConfig
   //@@
   //@@     Optional filename of the model file to use if a
   //@@     compute-capability specific model is not specified in
-  //@@     :cpp:var:`cc_model_names`. If not specified the default name
+  //@@     :cpp:var:`cc_model_filenames`. If not specified the default name
   //@@     is 'model.graphdef', 'model.savedmodel', 'model.plan' or
   //@@     'model.netdef' depending on the model type.
   //@@
@@ -788,4 +1103,14 @@ message ModelConfig
   //@@     are made available to custom backends.
   //@@
   map<string, ModelParameter> parameters = 14;
+
+  //@@  .. cpp:var:: ModelWarmup model_warmup (repeated)
+  //@@
+  //@@     Warmup setting of this model. If specified, all instances
+  //@@     will be run with the request samples in sequence before
+  //@@     serving the model.
+  //@@     This field can only be specified if the model is not an ensemble
+  //@@     model.
+  //@@
+  repeated ModelWarmup model_warmup = 16;
 }

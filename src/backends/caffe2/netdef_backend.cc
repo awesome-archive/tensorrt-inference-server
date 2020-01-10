@@ -86,31 +86,13 @@ ConvertDataType(DataType dtype)
 
 NetDefBackend::Context::Context(
     const std::string& name, const int gpu_device, const int max_batch_size)
-    : name_(name), gpu_device_(gpu_device), max_batch_size_(max_batch_size)
+    : BackendContext(name, gpu_device, max_batch_size)
 {
-}
-
-NetDefBackend::Context::Context(Context&& o)
-    : name_(std::move(o.name_)), gpu_device_(o.gpu_device_),
-      max_batch_size_(o.max_batch_size_)
-{
-  o.gpu_device_ = NO_GPU_DEVICE;
-  o.max_batch_size_ = NO_BATCHING;
-  workspace_.swap(o.workspace_);
 }
 
 NetDefBackend::Context::~Context()
 {
   LOG_VERBOSE(1) << "~NetDefBackend::Context ";
-}
-
-Status
-NetDefBackend::Init(const std::string& path, const ModelConfig& config)
-{
-  RETURN_IF_ERROR(ValidateModelConfig(config, kCaffe2NetDefPlatform));
-  RETURN_IF_ERROR(SetModelConfig(path, config));
-
-  return Status::Success;
 }
 
 Status
@@ -223,8 +205,10 @@ NetDefBackend::CreateExecutionContext(
   const int mbs = (Config().max_batch_size() <= 0) ? Context::NO_BATCHING
                                                    : Config().max_batch_size();
 
-  contexts_.emplace_back(instance_name, gpu_device, mbs);
-  Context& context = contexts_.back();
+  contexts_.emplace_back(new Context(instance_name, gpu_device, mbs));
+  Context* context = static_cast<Context*>(contexts_.back().get());
+
+  RETURN_IF_ERROR(context->CreateCudaStream());
 
   // Extract input and output names from the config...
   std::vector<std::string> input_names;
@@ -236,12 +220,21 @@ NetDefBackend::CreateExecutionContext(
     output_names.push_back(io.name());
   }
 
-  // If this is a sequence model then add the required inputs...
+  // If this is a sequence model then make sure the require control
+  // inputs are available in the model.
   if (Config().has_sequence_batching()) {
-    RETURN_IF_ERROR(ValidateSequenceControl(
-        ModelSequenceBatching::Control::CONTROL_SEQUENCE_START, &input_names));
-    RETURN_IF_ERROR(ValidateSequenceControl(
-        ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY, &input_names));
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_START, &input_names,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_END, &input_names,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateBooleanSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY, &input_names,
+        false /* required */));
+    RETURN_IF_ERROR(ValidateTypedSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_CORRID, &input_names,
+        false /* required */));
   }
 
   try {
@@ -256,7 +249,7 @@ NetDefBackend::CreateExecutionContext(
       return Status(RequestStatusCode::INTERNAL, err.Message());
     }
 
-    context.workspace_.reset(c2ws);
+    context->workspace_.reset(c2ws);
   }
   catch (const std::exception& ex) {
     return Status(
@@ -264,22 +257,40 @@ NetDefBackend::CreateExecutionContext(
         "load failed for '" + Config().name() + "': " + ex.what());
   }
 
-  RETURN_IF_ERROR(context.ValidateInputs(Config().input()));
-  RETURN_IF_ERROR(context.ValidateOutputs(Config().output()));
+  RETURN_IF_ERROR(context->ValidateInputs(Config().input()));
+  RETURN_IF_ERROR(context->ValidateOutputs(Config().output()));
 
   return Status::Success;
 }
 
 Status
-NetDefBackend::ValidateSequenceControl(
+NetDefBackend::ValidateBooleanSequenceControl(
     const ModelSequenceBatching::Control::Kind control_kind,
-    std::vector<std::string>* input_names)
+    std::vector<std::string>* input_names, bool required)
 {
   std::string tensor_name;
-  RETURN_IF_ERROR(GetSequenceControlProperties(
-      Config().sequence_batching(), Name(), control_kind, true /* required */,
+  RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
+      Config().sequence_batching(), Name(), control_kind, required,
       &tensor_name, nullptr, nullptr, nullptr, nullptr, nullptr));
-  input_names->push_back(tensor_name);
+  if (!tensor_name.empty()) {
+    input_names->push_back(tensor_name);
+  }
+
+  return Status::Success;
+}
+
+Status
+NetDefBackend::ValidateTypedSequenceControl(
+    const ModelSequenceBatching::Control::Kind control_kind,
+    std::vector<std::string>* input_names, bool required)
+{
+  std::string tensor_name;
+  RETURN_IF_ERROR(GetTypedSequenceControlProperties(
+      Config().sequence_batching(), Name(), control_kind, required,
+      &tensor_name, nullptr));
+  if (!tensor_name.empty()) {
+    input_names->push_back(tensor_name);
+  }
 
   return Status::Success;
 }
@@ -331,43 +342,12 @@ NetDefBackend::Context::ValidateOutputs(
   return Status::Success;
 }
 
-void
-NetDefBackend::Run(
-    uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-    std::function<void(Status)> OnCompleteQueuedPayloads)
-{
-  // Each runner executes using the corresponding context...
-  if (runner_idx >= contexts_.size()) {
-    OnCompleteQueuedPayloads(Status(
-        RequestStatusCode::INTERNAL,
-        "unexpected runner index" + std::to_string(runner_idx) +
-            ", max allowed " + std::to_string(contexts_.size())));
-    return;
-  }
-
-  std::vector<ModelInferStats::ScopedTimer> compute_timers;
-  for (auto& payload : *payloads) {
-    // Stop queue timer when the payload is scheduled to run
-    if (payload.queue_timer_ != nullptr) {
-      payload.queue_timer_.reset();
-    }
-
-    if (payload.stats_ != nullptr) {
-      compute_timers.emplace_back();
-      payload.stats_->StartComputeTimer(&compute_timers.back());
-      payload.stats_->SetGPUDevice(contexts_[runner_idx].gpu_device_);
-    }
-  }
-
-  OnCompleteQueuedPayloads(contexts_[runner_idx].Run(this, payloads));
-}
-
 Status
 NetDefBackend::Context::SetFixedSizedInputTensor(
     const std::string& name, const std::vector<int64_t>& shape,
     const Caffe2Workspace::DataType dtype, const size_t batch1_byte_size,
     const size_t total_byte_size, std::vector<Scheduler::Payload>* payloads,
-    std::vector<std::unique_ptr<char[]>>* input_buffers)
+    std::vector<std::unique_ptr<char[]>>* input_buffers, bool* cuda_copy)
 {
   // The entire input tensor must be delivered as a single
   // contiguous chunk so create a buffer large enough to hold the
@@ -375,59 +355,18 @@ NetDefBackend::Context::SetFixedSizedInputTensor(
   input_buffers->emplace_back(new char[total_byte_size]);
   char* buffer = input_buffers->back().get();
 
-  size_t buffer_copy_offset = 0;
-
   // Visit the payloads in order and copy the input tensors to
   // 'buffer'.
+  std::vector<size_t> expected_byte_sizes;
   for (auto& payload : *payloads) {
     const InferRequestHeader& request_header =
         payload.request_provider_->RequestHeader();
-    const size_t expected_byte_size =
-        request_header.batch_size() * batch1_byte_size;
-
-    size_t copied_byte_size = 0;
-    while (payload.status_.IsOk()) {
-      const void* content;
-      size_t content_byte_size = expected_byte_size - copied_byte_size;
-      payload.status_ = payload.request_provider_->GetNextInputContent(
-          name, &content, &content_byte_size, false);
-      if (!payload.status_.IsOk()) {
-        break;
-      }
-
-      // No more input content available then done with copying...
-      if (content == nullptr) {
-        break;
-      }
-
-      if ((buffer_copy_offset + copied_byte_size + content_byte_size) >
-          total_byte_size) {
-        payload.status_ = Status(
-            RequestStatusCode::INVALID_ARG,
-            "unexpected size " +
-                std::to_string(
-                    buffer_copy_offset + copied_byte_size + content_byte_size) +
-                " for inference input '" + name + "', expecting " +
-                std::to_string(total_byte_size));
-        break;
-      }
-
-      memcpy(
-          static_cast<char*>(buffer) + buffer_copy_offset + copied_byte_size,
-          content, content_byte_size);
-      copied_byte_size += content_byte_size;
-    }
-
-    if (payload.status_.IsOk() && (copied_byte_size != expected_byte_size)) {
-      payload.status_ = Status(
-          RequestStatusCode::INTERNAL,
-          "expected " + std::to_string(expected_byte_size) +
-              " bytes of data for inference input '" + name + "', got " +
-              std::to_string(copied_byte_size));
-    }
-
-    buffer_copy_offset += expected_byte_size;
+    expected_byte_sizes.push_back(
+        request_header.batch_size() * batch1_byte_size);
   }
+
+  *cuda_copy |= SetInputBuffer(
+      name, expected_byte_sizes, payloads, TRTSERVER_MEMORY_CPU, 0, buffer);
 
   Caffe2Workspace::Error err = workspace_->SetInputTensor(
       name, shape, dtype, static_cast<const char*>(buffer), total_byte_size);
@@ -442,7 +381,8 @@ Status
 NetDefBackend::Context::ReadFixedSizedOutputTensor(
     const std::string& name, const Caffe2Workspace::DataType dtype,
     const size_t dtype_byte_size, const size_t total_batch_size,
-    std::vector<Scheduler::Payload>* payloads, const DimsList& dims)
+    const DimsList& dims, std::vector<Scheduler::Payload>* payloads,
+    bool* cuda_copy)
 {
   std::vector<int64_t> content_shape;
   const char* content = nullptr;
@@ -462,9 +402,8 @@ NetDefBackend::Context::ReadFixedSizedOutputTensor(
         return Status(
             RequestStatusCode::INVALID_ARG,
             "unexpected shape for output '" + name +
-                "', model configuration shape is " +
-                DimsListToString(content_shape) + ", inference shape is " +
-                DimsListToString(dims));
+                "', model configuration shape is " + DimsListToString(dims) +
+                ", inference shape is " + DimsListToString(content_shape));
       }
     }
   }
@@ -482,34 +421,16 @@ NetDefBackend::Context::ReadFixedSizedOutputTensor(
             std::to_string(batch1_byte_size));
   }
 
-  size_t content_offset = 0;
-
-  for (auto& payload : *payloads) {
-    const InferRequestHeader& request_header =
-        payload.request_provider_->RequestHeader();
-    const size_t expected_byte_size =
-        request_header.batch_size() * batch1_byte_size;
-
-    // If 'payload' requested this output then copy it from
-    // 'content'. If it did not request this output then just
-    // skip it in the 'content'.
-    if ((payload.response_provider_ != nullptr) &&
-        payload.response_provider_->RequiresOutput(name)) {
-      void* buffer;
-      Status status = payload.response_provider_->AllocateOutputBuffer(
-          name, &buffer, expected_byte_size, content_shape);
-      if (status.IsOk()) {
-        memcpy(buffer, content + content_offset, expected_byte_size);
-      }
-
-      if (!status.IsOk()) {
-        payload.status_ = status;
-      }
-    }
-
-    content_offset += expected_byte_size;
-  }
-
+  // [TODO] use the following statement. Right now we always create
+  // netdef workspace with inputs / outputs on CPU node
+  // auto content_memory_type = (gpu_device_ == NO_GPU_DEVICE)
+  //                                ? TRTSERVER_MEMORY_CPU
+  //                                : TRTSERVER_MEMORY_GPU;
+  auto content_memory_type = TRTSERVER_MEMORY_CPU;
+  int64_t memory_type_id = 0;
+  *cuda_copy |= SetFixedSizeOutputBuffer(
+      name, batch1_byte_size, content, content_shape, content_memory_type,
+      memory_type_id, payloads);
   return Status::Success;
 }
 
@@ -517,7 +438,7 @@ Status
 NetDefBackend::Context::SetInput(
     const std::string& name, const DataType datatype, const DimsList& dims,
     const size_t total_batch_size, std::vector<Scheduler::Payload>* payloads,
-    std::vector<std::unique_ptr<char[]>>* input_buffers)
+    std::vector<std::unique_ptr<char[]>>* input_buffers, bool* cuda_copy)
 {
   // Get the shape of the input. The provider has already checked that
   // the request shape is valid so don't need to do it here.
@@ -544,12 +465,12 @@ NetDefBackend::Context::SetInput(
 
   return SetFixedSizedInputTensor(
       name, shape, dtype, batch1_byte_size, total_byte_size, payloads,
-      input_buffers);
+      input_buffers, cuda_copy);
 }
 
 Status
 NetDefBackend::Context::Run(
-    const NetDefBackend* base, std::vector<Scheduler::Payload>* payloads)
+    const InferenceBackend* base, std::vector<Scheduler::Payload>* payloads)
 {
   LOG_VERBOSE(1) << "Running " << name_ << " with " << payloads->size()
                  << " request payloads";
@@ -601,6 +522,7 @@ NetDefBackend::Context::Run(
   // into the corresponding tensor.
 
   // Inputs from the request...
+  bool cuda_copy = false;
   for (const auto& input : input_request_provider->RequestHeader().input()) {
     const std::string& name = input.name();
 
@@ -609,22 +531,35 @@ NetDefBackend::Context::Run(
 
     RETURN_IF_ERROR(SetInput(
         name, input_config->data_type(), input.dims(), total_batch_size,
-        payloads, &input_buffers));
+        payloads, &input_buffers, &cuda_copy));
   }
 
   // Additional inputs added to the provider...
-  const std::shared_ptr<InferRequestProvider::InputOverrideMap>&
-      input_override_map = input_request_provider->GetInputOverride();
-  if (input_override_map != nullptr) {
-    for (const auto& pr : *input_override_map) {
+  const InferRequestProvider::InputOverrideMapVec& input_override_maps =
+      input_request_provider->GetInputOverrides();
+  for (const auto& ovr_map : input_override_maps) {
+    for (const auto& pr : *ovr_map) {
       const std::string& name = pr.first;
-      const std::shared_ptr<InferRequestProvider::InputOverride>& override =
-          pr.second;
+      const InferRequestProvider::InputOverride& override = pr.second;
       RETURN_IF_ERROR(SetInput(
-          name, override->datatype_, override->dims_, total_batch_size,
-          payloads, &input_buffers));
+          name, override.datatype_, override.dims_, total_batch_size, payloads,
+          &input_buffers, &cuda_copy));
     }
   }
+#ifdef TRTIS_ENABLE_GPU
+  if (cuda_copy) {
+    cudaStreamSynchronize(stream_);
+  }
+#endif  // TRTIS_ENABLE_GPU
+
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeInputEnd);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
 
   // Run...
   Caffe2Workspace::Error err = workspace_->Run();
@@ -632,8 +567,18 @@ NetDefBackend::Context::Run(
     return Status(RequestStatusCode::INTERNAL, err.Message());
   }
 
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeOutputStart);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
   // Make sure each output is of the expected size and copy it into
   // the payload responses.
+  cuda_copy = false;
   for (const auto& output : base->Config().output()) {
     const std::string& name = output.name();
 
@@ -651,8 +596,13 @@ NetDefBackend::Context::Run(
 
     RETURN_IF_ERROR(ReadFixedSizedOutputTensor(
         name, dtype, GetDataTypeByteSize(output_config->data_type()),
-        total_batch_size, payloads, output_dims));
+        total_batch_size, output_dims, payloads, &cuda_copy));
   }
+#ifdef TRTIS_ENABLE_GPU
+  if (cuda_copy) {
+    cudaStreamSynchronize(stream_);
+  }
+#endif  // TRTIS_ENABLE_GPU
 
   return Status::Success;
 }
@@ -663,10 +613,10 @@ operator<<(std::ostream& out, const NetDefBackend& pb)
   out << "name=" << pb.Name() << std::endl;
   out << "contexts:" << std::endl;
   for (const auto& context : pb.contexts_) {
-    out << "  name=" << context.name_ << ", gpu="
-        << ((context.gpu_device_ == NetDefBackend::Context::NO_GPU_DEVICE)
+    out << "  name=" << context->name_ << ", gpu="
+        << ((context->gpu_device_ == NetDefBackend::Context::NO_GPU_DEVICE)
                 ? "<none>"
-                : std::to_string(context.gpu_device_));
+                : std::to_string(context->gpu_device_));
   }
 
   return out;

@@ -39,11 +39,39 @@
 #include <cuda_runtime_api.h>
 #endif  // TRTIS_ENABLE_GPU
 
+namespace {
+
+CustomMemoryType
+ToCustomMemoryType(TRTSERVER_Memory_Type memory_type)
+{
+  switch (memory_type) {
+    case TRTSERVER_MEMORY_GPU:
+      return CUSTOM_MEMORY_GPU;
+    default:
+      break;
+  }
+  return CUSTOM_MEMORY_CPU;
+}
+
+TRTSERVER_Memory_Type
+ToTRTServerMemoryType(CustomMemoryType memory_type)
+{
+  switch (memory_type) {
+    case CUSTOM_MEMORY_GPU:
+      return TRTSERVER_MEMORY_GPU;
+    default:
+      break;
+  }
+  return TRTSERVER_MEMORY_CPU;
+}
+
+}  // namespace
+
 namespace nvidia { namespace inferenceserver {
 
 CustomBackend::Context::Context(
     const std::string& name, const int gpu_device, const int max_batch_size)
-    : name_(name), gpu_device_(gpu_device), max_batch_size_(max_batch_size),
+    : BackendContext(name, gpu_device, max_batch_size),
       library_handle_(nullptr), library_context_handle_(nullptr),
       InitializeFn_(nullptr), FinalizeFn_(nullptr), ErrorStringFn_(nullptr),
       ExecuteFn_(nullptr)
@@ -72,11 +100,8 @@ CustomBackend::Init(
     const std::string& path, const std::vector<std::string>& server_params,
     const ModelConfig& config)
 {
-  RETURN_IF_ERROR(ValidateModelConfig(config, kCustomPlatform));
-  RETURN_IF_ERROR(SetModelConfig(path, config));
-
+  RETURN_IF_ERROR(InferenceBackend::Init(path, config, kCustomPlatform));
   server_params_ = server_params;
-
   return Status::Success;
 }
 
@@ -116,7 +141,7 @@ CustomBackend::CreateExecutionContexts(
       [this](
           uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
           std::function<void(Status)> func) {
-        RunBackend(runner_idx, payloads, func);
+        Run(runner_idx, payloads, func);
       }));
 
   LOG_VERBOSE(1) << "custom backend for " << Name() << std::endl << *this;
@@ -176,7 +201,7 @@ CustomBackend::CreateExecutionContext(
                                                    : Config().max_batch_size();
 
   contexts_.emplace_back(new Context(instance_name, gpu_device, mbs));
-  const std::unique_ptr<Context>& context = contexts_.back();
+  Context* context = static_cast<Context*>(contexts_.back().get());
 
   // 'mn_itr->second' is the path to the shared library file to use
   // for that context (e.g. model_name/1/libcustom.so). Load that
@@ -184,7 +209,14 @@ CustomBackend::CreateExecutionContext(
   RETURN_IF_ERROR(LoadCustom(
       mn_itr->second, &(context->library_handle_), &(context->InitializeFn_),
       &(context->FinalizeFn_), &(context->ErrorStringFn_),
-      &(context->ExecuteFn_)));
+      &(context->ExecuteFn_), &(context->ExecuteV2Fn_),
+      &(context->custom_version_)));
+
+  // Only create stream on V1 as backend is not aware of different memory
+  // types. For other version, the backend should handle this explicitly.
+  if (context->custom_version_ == 1) {
+    RETURN_IF_ERROR(context->CreateCudaStream());
+  }
 
   return Status::Success;
 }
@@ -200,7 +232,7 @@ CustomBackend::InitBackend(uint32_t runner_idx)
             ", max allowed " + std::to_string(contexts_.size()));
   }
 
-  const auto& context = contexts_[runner_idx];
+  Context* context = static_cast<Context*>(contexts_[runner_idx].get());
 
   // Call the initialization function to get the custom context
   // associated with this specific instance.
@@ -227,7 +259,12 @@ CustomBackend::InitBackend(uint32_t runner_idx)
 
   int err =
       context->InitializeFn_(&init_data, &(context->library_context_handle_));
-  if (err != 0) {
+  if (context->library_context_handle_ == nullptr) {
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "initialize error for '" + Name() +
+            "': failed to create instance, error code: " + std::to_string(err));
+  } else if (err != 0) {
     return Status(
         RequestStatusCode::INTERNAL, "initialize error for '" + Name() +
                                          "': (" + std::to_string(err) + ") " +
@@ -237,40 +274,9 @@ CustomBackend::InitBackend(uint32_t runner_idx)
   return Status::Success;
 }
 
-void
-CustomBackend::RunBackend(
-    uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-    std::function<void(Status)> OnCompleteQueuedPayloads)
-{
-  // Each runner executes using the corresponding context...
-  if (runner_idx >= contexts_.size()) {
-    OnCompleteQueuedPayloads(Status(
-        RequestStatusCode::INTERNAL,
-        "unexpected runner index" + std::to_string(runner_idx) +
-            ", max allowed " + std::to_string(contexts_.size())));
-    return;
-  }
-
-  std::vector<ModelInferStats::ScopedTimer> compute_timers;
-  for (auto& payload : *payloads) {
-    // Stop queue timer when the payload is scheduled to run
-    if (payload.queue_timer_ != nullptr) {
-      payload.queue_timer_.reset();
-    }
-
-    if (payload.stats_ != nullptr) {
-      compute_timers.emplace_back();
-      payload.stats_->StartComputeTimer(&compute_timers.back());
-      payload.stats_->SetGPUDevice(contexts_[runner_idx]->gpu_device_);
-    }
-  }
-
-  OnCompleteQueuedPayloads(contexts_[runner_idx]->Run(this, payloads));
-}
-
 Status
 CustomBackend::Context::Run(
-    CustomBackend* base, std::vector<Scheduler::Payload>* payloads)
+    const InferenceBackend* base, std::vector<Scheduler::Payload>* payloads)
 {
   LOG_VERBOSE(1) << "Running " << name_ << " with " << payloads->size()
                  << " request payloads";
@@ -415,12 +421,56 @@ CustomBackend::Context::Run(
     custom_payload.error_code = 0;
   }
 
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeInputEnd);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
   // Execute the custom backend which will use CustomGetOutput to get
   // the output buffers into which it will write the results for the
   // requested outputs.
-  int err = ExecuteFn_(
-      library_context_handle_, custom_payloads.size(), &custom_payloads[0],
-      CustomGetNextInput, CustomGetOutput);
+  int err = 0;
+  switch (custom_version_) {
+    case 2:
+      err = ExecuteV2Fn_(
+          library_context_handle_, custom_payloads.size(), &custom_payloads[0],
+          CustomGetNextInputV2, CustomGetOutputV2);
+      break;
+    default:
+      err = ExecuteFn_(
+          library_context_handle_, custom_payloads.size(), &custom_payloads[0],
+          CustomGetNextInput, CustomGetOutput);
+      break;
+  }
+
+#ifdef TRTIS_ENABLE_GPU
+  // Transfer data to actual buffer if internal buffer is created.
+  // This happens in the case where V1 interface is used and actual buffer is
+  // on GPU.
+  for (auto& work_io_context : work_io_contexts) {
+    for (auto& output_buffer : work_io_context.output_buffers_) {
+      auto dst = std::get<0>(output_buffer);
+      auto src = std::get<1>(output_buffer).get();
+      auto byte_size = std::get<2>(output_buffer);
+      cudaMemcpyAsync(dst, src, byte_size, cudaMemcpyHostToDevice, stream_);
+    }
+  }
+  cudaStreamSynchronize(stream_);
+#endif  // TRTIS_ENABLE_GPU
+
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeOutputStart);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
   if (err != 0) {
     return Status(
         RequestStatusCode::INTERNAL, "execute error for '" + name_ + "': (" +
@@ -447,11 +497,55 @@ CustomBackend::Context::GetNextInput(
     GetInputOutputContext* input_context, const char* cname,
     const void** content, uint64_t* content_byte_size)
 {
+  auto src_memory_type = CUSTOM_MEMORY_CPU;
+  int64_t src_memory_type_id = 0;
+  bool ok = GetNextInput(
+      input_context, cname, content, content_byte_size, &src_memory_type,
+      &src_memory_type_id);
+
+#ifdef TRTIS_ENABLE_GPU
+  // If the memory type is on GPU, implicitly copying it to CPU memory
+  // to ensure backward capability
+  if (ok && (src_memory_type == CUSTOM_MEMORY_GPU)) {
+    input_context->input_buffers_.emplace_back();
+    auto& buffer_unique_ptr = input_context->input_buffers_.back();
+    buffer_unique_ptr.reset(new char[*content_byte_size]);
+    cudaError_t err = cudaMemcpyAsync(
+        buffer_unique_ptr.get(), *content, *content_byte_size,
+        cudaMemcpyDeviceToHost, stream_);
+    if (err == cudaSuccess) {
+      *content = buffer_unique_ptr.get();
+      // Use cudaMemcpyAsync to avoid synchronization on default stream,
+      // but stream synchronization must be done per copy to ensure that
+      // the data is ready.
+      cudaStreamSynchronize(stream_);
+    }
+
+    return (err == cudaSuccess);
+  }
+#endif  // TRTIS_ENABLE_GPU
+
+  return ok;
+}
+
+bool
+CustomBackend::Context::GetNextInput(
+    GetInputOutputContext* input_context, const char* cname,
+    const void** content, uint64_t* content_byte_size,
+    CustomMemoryType* memory_type, int64_t* memory_type_id)
+{
   const std::string name(cname);
   Scheduler::Payload* payload = input_context->payload_;
 
+  auto src_memory_type = ToTRTServerMemoryType(*memory_type);
   Status status = payload->request_provider_->GetNextInputContent(
-      name, content, content_byte_size, false);
+      name, content, content_byte_size, &src_memory_type, memory_type_id);
+  *memory_type = ToCustomMemoryType(src_memory_type);
+
+  if (!status.IsOk()) {
+    LOG_VERBOSE(1) << status.AsString();
+  }
+
   return status.IsOk();
 }
 
@@ -461,6 +555,33 @@ CustomBackend::Context::GetOutput(
     size_t shape_dim_cnt, int64_t* shape_dims, uint64_t content_byte_size,
     void** content)
 {
+  auto dst_memory_type = CUSTOM_MEMORY_CPU;
+  int64_t dst_memory_type_id = 0;
+  bool ok = GetOutput(
+      output_context, cname, shape_dim_cnt, shape_dims, content_byte_size,
+      content, &dst_memory_type, &dst_memory_type_id);
+
+#ifdef TRTIS_ENABLE_GPU
+  // If the actual memory type is GPU, returns a CPU memory buffer and
+  // implicitly copying the content to actual memory buffer after run.
+  if (ok && (dst_memory_type == CUSTOM_MEMORY_GPU)) {
+    std::unique_ptr<char[]> internal_buffer(new char[content_byte_size]);
+    void* internal_ptr = internal_buffer.get();
+    output_context->output_buffers_.emplace_back(
+        *content, std::move(internal_buffer), content_byte_size);
+    *content = internal_ptr;
+  }
+#endif  // TRTIS_ENABLE_GPU
+
+  return ok;
+}
+
+bool
+CustomBackend::Context::GetOutput(
+    GetInputOutputContext* output_context, const char* cname,
+    size_t shape_dim_cnt, int64_t* shape_dims, uint64_t content_byte_size,
+    void** content, CustomMemoryType* memory_type, int64_t* memory_type_id)
+{
   const std::string name(cname);
   Scheduler::Payload* payload = output_context->payload_;
 
@@ -468,14 +589,35 @@ CustomBackend::Context::GetOutput(
 
   // If there is no response provider return content == nullptr with
   // OK status as an indication that the output should not be written.
-  if (payload->response_provider_ != nullptr) {
+  if ((payload->response_provider_ != nullptr) &&
+      payload->response_provider_->RequiresOutput(std::string(cname))) {
     std::vector<int64_t> shape;
     if (shape_dim_cnt > 0) {
       shape.assign(shape_dims, shape_dims + shape_dim_cnt);
     }
 
+    TRTSERVER_Memory_Type actual_memory_type;
+    int64_t actual_memory_type_id;
     Status status = payload->response_provider_->AllocateOutputBuffer(
-        name, content, content_byte_size, shape);
+        name, content, content_byte_size, shape,
+        ToTRTServerMemoryType(*memory_type), *memory_type_id,
+        &actual_memory_type, &actual_memory_type_id);
+
+    // Done with this output if 'content_byte_size' is 0
+    if (content_byte_size == 0) {
+      *content = nullptr;
+    } else if (*content == nullptr) {
+      return false;
+    }
+
+    // Update memory type with actual memory type
+    *memory_type = ToCustomMemoryType(actual_memory_type);
+    *memory_type_id = actual_memory_type_id;
+
+    if (!status.IsOk()) {
+      LOG_VERBOSE(1) << status.AsString();
+    }
+
     return status.IsOk();
   }
 
@@ -533,6 +675,33 @@ CustomGetOutput(
           output_context);
   return ocontext->context_->GetOutput(
       ocontext, name, shape_dim_cnt, shape_dims, content_byte_size, content);
+}
+
+bool
+CustomGetNextInputV2(
+    void* input_context, const char* name, const void** content,
+    uint64_t* content_byte_size, CustomMemoryType* memory_type,
+    int64_t* memory_type_id)
+{
+  CustomBackend::Context::GetInputOutputContext* icontext =
+      static_cast<CustomBackend::Context::GetInputOutputContext*>(
+          input_context);
+  return icontext->context_->GetNextInput(
+      icontext, name, content, content_byte_size, memory_type, memory_type_id);
+}
+
+bool
+CustomGetOutputV2(
+    void* output_context, const char* name, size_t shape_dim_cnt,
+    int64_t* shape_dims, uint64_t content_byte_size, void** content,
+    CustomMemoryType* memory_type, int64_t* memory_type_id)
+{
+  CustomBackend::Context::GetInputOutputContext* ocontext =
+      static_cast<CustomBackend::Context::GetInputOutputContext*>(
+          output_context);
+  return ocontext->context_->GetOutput(
+      ocontext, name, shape_dim_cnt, shape_dims, content_byte_size, content,
+      memory_type, memory_type_id);
 }
 
 }}  // namespace nvidia::inferenceserver

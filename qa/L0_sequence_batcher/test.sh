@@ -25,10 +25,20 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+REPO_VERSION=${NVIDIA_TENSORRT_SERVER_VERSION}
+if [ "$#" -ge 1 ]; then
+    REPO_VERSION=$1
+fi
+if [ -z "$REPO_VERSION" ]; then
+    echo -e "Repository version must be specified"
+    echo -e "\n***\n*** Test Failed\n***"
+    exit 1
+fi
+
 CLIENT_LOG="./client.log"
 BATCHER_TEST=sequence_batcher_test.py
 
-DATADIR=/data/inferenceserver
+DATADIR=/data/inferenceserver/${REPO_VERSION}
 
 SERVER=/opt/tensorrtserver/bin/trtserver
 source ../common/util.sh
@@ -39,8 +49,8 @@ RET=0
 # can fail when the requests are distributed to multiple devices.
 export CUDA_VISIBLE_DEVICES=0
 
-# Setup non-variable-size model stores. The same models are in each
-# store but they are configured as:
+# Setup non-variable-size model repositories. The same models are in each
+# repository but they are configured as:
 #   models0 - four instance with non-batching model
 #   models1 - one instance with batch-size 4
 #   models2 - two instances with batch-size 2
@@ -50,14 +60,17 @@ for m in \
         $DATADIR/qa_sequence_model_repository/plan_sequence_float32 \
         $DATADIR/qa_sequence_model_repository/netdef_sequence_int32 \
         $DATADIR/qa_sequence_model_repository/graphdef_sequence_object \
+        $DATADIR/qa_sequence_model_repository/graphdef_sequence_int32 \
         $DATADIR/qa_sequence_model_repository/savedmodel_sequence_float32 \
         $DATADIR/qa_sequence_model_repository/onnx_sequence_int32 \
+        $DATADIR/qa_sequence_model_repository/libtorch_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_plan_sequence_float32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_netdef_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_graphdef_sequence_object \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_savedmodel_sequence_float32 \
-        ../custom_models/custom_sequence_int32 \
-        $DATADIR/qa_sequence_model_repository/libtorch_sequence_int32 ; do
+        $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_onnx_sequence_int32 \
+        $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_libtorch_sequence_int32 \
+        ../custom_models/custom_sequence_int32 ; do
     cp -r $m models1/. && \
         (cd models1/$(basename $m) && \
             sed -i "s/^max_batch_size:.*/max_batch_size: 4/" config.pbtxt && \
@@ -79,31 +92,38 @@ for m in \
         $DATADIR/qa_sequence_model_repository/plan_nobatch_sequence_float32 \
         $DATADIR/qa_sequence_model_repository/netdef_nobatch_sequence_int32 \
         $DATADIR/qa_sequence_model_repository/graphdef_nobatch_sequence_object \
+        $DATADIR/qa_sequence_model_repository/graphdef_nobatch_sequence_int32 \
         $DATADIR/qa_sequence_model_repository/savedmodel_nobatch_sequence_float32 \
         $DATADIR/qa_sequence_model_repository/onnx_nobatch_sequence_int32 \
+        $DATADIR/qa_sequence_model_repository/libtorch_nobatch_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_plan_nobatch_sequence_float32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_netdef_nobatch_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_graphdef_nobatch_sequence_object \
+        $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_graphdef_nobatch_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_savedmodel_nobatch_sequence_float32 \
-        $DATADIR/qa_sequence_model_repository/libtorch_nobatch_sequence_int32 ; do
+        $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_onnx_nobatch_sequence_int32 \
+        $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_libtorch_nobatch_sequence_int32 ; do
     cp -r $m models0/. && \
         (cd models0/$(basename $m) && \
             sed -i "s/kind: KIND_GPU/kind: KIND_GPU\\ncount: 4/" config.pbtxt && \
             sed -i "s/kind: KIND_CPU/kind: KIND_CPU\\ncount: 4/" config.pbtxt)
 done
 
-# Setup variable-size model store.
 #   modelsv - one instance with batch-size 4
 rm -fr modelsv && mkdir modelsv
 for m in \
+        $DATADIR/qa_variable_sequence_model_repository/plan_sequence_float32 \
         $DATADIR/qa_variable_sequence_model_repository/netdef_sequence_int32 \
         $DATADIR/qa_variable_sequence_model_repository/graphdef_sequence_object \
         $DATADIR/qa_variable_sequence_model_repository/savedmodel_sequence_float32 \
         $DATADIR/qa_variable_sequence_model_repository/onnx_sequence_int32 \
+        $DATADIR/qa_variable_sequence_model_repository/libtorch_sequence_int32 \
+        $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_plan_sequence_float32 \
         $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_netdef_sequence_int32 \
         $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_graphdef_sequence_object \
         $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_savedmodel_sequence_float32 \
-        $DATADIR/qa_variable_sequence_model_repository/libtorch_sequence_int32 ; do
+        $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_onnx_sequence_int32 \
+        $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_libtorch_sequence_int32 ; do
     cp -r $m modelsv/. && \
         (cd modelsv/$(basename $m) && \
             sed -i "s/^max_batch_size:.*/max_batch_size: 4/" config.pbtxt && \
@@ -113,7 +133,7 @@ done
 
 # Same test work on all models since they all have same total number
 # of batch slots.
-for model_trial in v 0 1 2 4 ; do
+for model_trial in v 0 1 2 4; do
     export NO_BATCHING=1 &&
         [[ "$model_trial" != "0" ]] && export NO_BATCHING=0
     export MODEL_INSTANCES=1 &&
@@ -125,10 +145,10 @@ for model_trial in v 0 1 2 4 ; do
     cp -r $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/nop_* `pwd`/$MODEL_DIR/.
     create_nop_modelfile `pwd`/libidentity.so `pwd`/$MODEL_DIR
 
-    # Need to launch the server for each test so that the model status is
-    # reset (which is used to make sure the correctly batch size was used
-    # for execution). Test everything with fixed-tensor-size models and
-    # variable-tensor-size models.
+    # Need to launch the server for each test so that the model status
+    # is reset (which is used to make sure the correct batch size was
+    # used for execution). Test everything with fixed-tensor-size
+    # models and variable-tensor-size models.
     export BATCHER_TYPE="VARIABLE" &&
         [[ "$model_trial" != "v" ]] && export BATCHER_TYPE="FIXED"
 
@@ -140,7 +160,7 @@ for model_trial in v 0 1 2 4 ; do
             test_no_sequence_start2 \
             test_no_sequence_end \
             test_no_correlation_id ; do
-        SERVER_ARGS="--model-store=`pwd`/$MODEL_DIR"
+        SERVER_ARGS="--model-repository=`pwd`/$MODEL_DIR"
         SERVER_LOG="./$i.$MODEL_DIR.serverlog"
         run_server
         if [ "$SERVER_PID" == "0" ]; then
@@ -149,12 +169,13 @@ for model_trial in v 0 1 2 4 ; do
             exit 1
         fi
 
-        echo "Test: $i" >>$CLIENT_LOG
+        echo "Test: $i, repository $MODEL_DIR" >>$CLIENT_LOG
 
         set +e
         python $BATCHER_TEST SequenceBatcherTest.$i >>$CLIENT_LOG 2>&1
         if [ $? -ne 0 ]; then
-            echo -e "\n***\n*** Test Failed\n***"
+            echo -e "\n***\n*** Test $i Failed\n***" >>$CLIENT_LOG
+            echo -e "\n***\n*** Test $i Failed\n***"
             RET=1
         fi
         set -e
@@ -166,7 +187,7 @@ for model_trial in v 0 1 2 4 ; do
     # Tests that require TRTSERVER_DELAY_SCHEDULER so that the
     # scheduler is delayed and requests can collect in the queue.
     for i in \
-        test_backlog_fill \
+            test_backlog_fill \
             test_backlog_fill_no_end \
             test_backlog_same_correlation_id \
             test_backlog_same_correlation_id_no_end \
@@ -185,7 +206,7 @@ for model_trial in v 0 1 2 4 ; do
             [[ "$i" != "test_backlog_same_correlation_id_no_end" ]] && export TRTSERVER_DELAY_SCHEDULER=8 &&
             [[ "$i" != "test_half_batch" ]] && export TRTSERVER_DELAY_SCHEDULER=4 &&
             [[ "$i" != "test_backlog_sequence_timeout" ]] && export TRTSERVER_DELAY_SCHEDULER=12
-        SERVER_ARGS="--model-store=`pwd`/$MODEL_DIR"
+        SERVER_ARGS="--model-repository=`pwd`/$MODEL_DIR"
         SERVER_LOG="./$i.$MODEL_DIR.serverlog"
         run_server
         if [ "$SERVER_PID" == "0" ]; then
@@ -194,12 +215,13 @@ for model_trial in v 0 1 2 4 ; do
             exit 1
         fi
 
-        echo "Test: $i" >>$CLIENT_LOG
+        echo "Test: $i, repository $MODEL_DIR" >>$CLIENT_LOG
 
         set +e
         python $BATCHER_TEST SequenceBatcherTest.$i >>$CLIENT_LOG 2>&1
         if [ $? -ne 0 ]; then
-            echo -e "\n***\n*** Test Failed\n***"
+            echo -e "\n***\n*** Test $i Failed\n***" >>$CLIENT_LOG
+            echo -e "\n***\n*** Test $i Failed\n***"
             RET=1
         fi
         set -e

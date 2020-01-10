@@ -46,17 +46,28 @@ struct EnsembleTensor {
 /// \return The error status.
 Status GetModelVersionFromPath(const std::string& path, int64_t* version);
 
-/// Get the tensor name, false value, and true value for a sequence
-/// batcher control kind. If 'required' is true then must find a
-/// tensor for the control. If 'required' is false, return
+/// Get the tensor name, false value, and true value for a boolean
+/// sequence batcher control kind. If 'required' is true then must
+/// find a tensor for the control. If 'required' is false, return
 /// 'tensor_name' as empty-string if the control is not mapped to any
 /// tensor.
-Status GetSequenceControlProperties(
+Status GetBooleanSequenceControlProperties(
     const ModelSequenceBatching& batcher, const std::string& model_name,
     const ModelSequenceBatching::Control::Kind control_kind,
     const bool required, std::string* tensor_name, DataType* tensor_datatype,
     float* fp32_false_value, float* fp32_true_value, int32_t* int32_false_value,
     int32_t* int32_true_value);
+
+/// Get the tensor name and datatype for a non-boolean sequence
+/// batcher control kind. If 'required' is true then must find a
+/// tensor for the control. If 'required' is false, return
+/// 'tensor_name' as empty-string if the control is not mapped to any
+/// tensor. 'tensor_datatype' returns the required datatype for the
+/// control.
+Status GetTypedSequenceControlProperties(
+    const ModelSequenceBatching& batcher, const std::string& model_name,
+    const ModelSequenceBatching::Control::Kind control_kind,
+    const bool required, std::string* tensor_name, DataType* tensor_datatype);
 
 /// Read a ModelConfig and normalize it as expected by model backends.
 /// \param path The full-path to the directory containing the
@@ -130,5 +141,45 @@ Status ValidateModelOutput(const ModelOutput& io, int32_t max_batch_size);
 /// is not valid.
 Status CheckAllowedModelOutput(
     const ModelOutput& io, const std::set<std::string>& allowed);
+
+/// Parse the 'value' of the parameter 'key' into a boolean value.
+/// \param key The name of the parameter.
+/// \param value The value of the parameter in string.
+/// \param parsed_value Return the boolean of the parameter.
+/// \return The error status. A non-OK status indicates failure on parsing the
+/// value.
+Status ParseBoolParameter(
+    const std::string& key, std::string value, bool* parsed_value);
+
+/// Parse the 'value' of the parameter 'key' into a long long integer value.
+/// \param key The name of the parameter.
+/// \param value The value of the parameter in string.
+/// \param parsed_value Return the numerical value of the parameter.
+/// \return The error status. A non-OK status indicates failure on parsing the
+/// value.
+Status ParseLongLongParameter(
+    const std::string& key, const std::string& value, int64_t* parsed_value);
+
+#ifdef TRTIS_ENABLE_GPU
+/// Validates the compute capability of the GPU indexed
+/// \param The index of the target GPU.
+/// \return The error status. A non-OK status means the target GPU is
+///  not supported
+Status CheckGPUCompatibility(const int gpu_id);
+
+/// Obtains a set of gpu ids that is supported by TRTIS.
+/// \param The set of integers which is populated by ids of
+///  supported GPUS
+/// \return The error status. A non-ok status means there were
+/// errors encountered while querying GPU devices.
+Status GetSupportedGPUs(std::set<int>& supported_gpus);
+#endif
+
+/// Obtain the 'profile_index' of the 'profile_name'.
+/// \param profile_name The name of the profile.
+/// \param profile_index Return the index of the profile.
+/// \return The error status. A non-OK status indicates failure on getting the
+/// value.
+Status GetProfileIndex(const std::string& profile_name, int* profile_index);
 
 }}  // namespace nvidia::inferenceserver

@@ -36,6 +36,8 @@ import test_util as tu
 from tensorrtserver.api import *
 import os
 
+TEST_SYSTEM_SHARED_MEMORY = bool(int(os.environ.get('TEST_SYSTEM_SHARED_MEMORY', 0)))
+TEST_CUDA_SHARED_MEMORY = bool(int(os.environ.get('TEST_CUDA_SHARED_MEMORY', 0)))
 CPU_ONLY = (os.environ.get('TENSORRT_SERVER_CPU_ONLY') is not None)
 
 np_dtype_string = np.dtype(object)
@@ -59,14 +61,18 @@ class InferTest(unittest.TestCase):
                                     model_version, swap,
                                     outputs, use_http, use_grpc,
                                     skip_request_id_check, use_streaming,
-                                    correlation_id)
+                                    correlation_id,
+                                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
                 # model that supports batching
                 iu.infer_exact(tester, pf, tensor_shape, bs,
                                input_dtype, output0_dtype, output1_dtype,
                                output0_raw, output1_raw,
                                model_version, swap, outputs, use_http, use_grpc,
                                skip_request_id_check, use_streaming,
-                               correlation_id)
+                               correlation_id,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
         input_size = 16
 
@@ -97,9 +103,14 @@ class InferTest(unittest.TestCase):
         if not CPU_ONLY and tu.validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
                                     (input_size,1,1), (input_size,1,1), (input_size,1,1)):
             for prefix in ensemble_prefix:
-                _infer_exact_helper(self, prefix + 'plan', (input_size, 1, 1), 8,
-                                input_dtype, output0_dtype, output1_dtype,
-                                output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+                if input_dtype == np.int8:
+                    _infer_exact_helper(self, prefix + 'plan', (input_size, 1, 1), 8,
+                                    input_dtype, output0_dtype, output1_dtype,
+                                    output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+                else:
+                    _infer_exact_helper(self, prefix + 'plan', (input_size,), 8,
+                                    input_dtype, output0_dtype, output1_dtype,
+                                    output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
 
         # the custom model is src/custom/addsub... it does not swap
         # the inputs so always set to False
@@ -112,17 +123,17 @@ class InferTest(unittest.TestCase):
 
         if tu.validate_for_onnx_model(input_dtype, output0_dtype, output1_dtype,
                                     (input_size,), (input_size,), (input_size,)):
-            # No basic ensemble models are created against onnx models for now [TODO]
-            _infer_exact_helper(self, 'onnx', (input_size,), 8,
-                            input_dtype, output0_dtype, output1_dtype,
-                            output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
-            
+            for prefix in ensemble_prefix:
+                _infer_exact_helper(self, prefix + 'onnx', (input_size,), 8,
+                                input_dtype, output0_dtype, output1_dtype,
+                                output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+
         if tu.validate_for_libtorch_model(input_dtype, output0_dtype, output1_dtype,
                                     (input_size,), (input_size,), (input_size,)):
-            # No basic ensemble models are created wuth libtorch models for now [TODO]
-            _infer_exact_helper(self, 'libtorch', (input_size,), 8,
-                            input_dtype, output0_dtype, output1_dtype,
-                            output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
+            for prefix in ensemble_prefix:
+                _infer_exact_helper(self, prefix + 'libtorch', (input_size,), 8,
+                                input_dtype, output0_dtype, output1_dtype,
+                                output0_raw=output0_raw, output1_raw=output1_raw, swap=swap)
 
     def test_raw_bbb(self):
         self._full_exact(np.int8, np.int8, np.int8,
@@ -164,11 +175,11 @@ class InferTest(unittest.TestCase):
         self._full_exact(np.int32, np.float16, np.int16,
                          output0_raw=True, output1_raw=True, swap=False)
 
-    def test_raw_oii(self):
-        self._full_exact(np_dtype_string, np.int32, np.int32,
-                         output0_raw=True, output1_raw=True, swap=False)
     def test_raw_ooo(self):
         self._full_exact(np_dtype_string, np_dtype_string, np_dtype_string,
+                         output0_raw=True, output1_raw=True, swap=False)
+    def test_raw_oii(self):
+        self._full_exact(np_dtype_string, np.int32, np.int32,
                          output0_raw=True, output1_raw=True, swap=False)
     def test_raw_oio(self):
         self._full_exact(np_dtype_string, np.int32, np_dtype_string,
@@ -186,43 +197,45 @@ class InferTest(unittest.TestCase):
         self._full_exact(np.int32, np_dtype_string, np.int32,
                          output0_raw=True, output1_raw=True, swap=False)
 
-    def test_class_bbb(self):
-        self._full_exact(np.int8, np.int8, np.int8,
-                         output0_raw=False, output1_raw=False, swap=True)
-    def test_class_sss(self):
-        self._full_exact(np.int16, np.int16, np.int16,
-                         output0_raw=False, output1_raw=False, swap=True)
-    def test_class_iii(self):
-        self._full_exact(np.int32, np.int32, np.int32,
-                         output0_raw=False, output1_raw=False, swap=True)
-    def test_class_lll(self):
-        self._full_exact(np.int64, np.int64, np.int64,
-                         output0_raw=False, output1_raw=False, swap=False)
-    def test_class_fff(self):
-        self._full_exact(np.float32, np.float32, np.float32,
-                         output0_raw=False, output1_raw=False, swap=True)
-    def test_class_iff(self):
-        self._full_exact(np.int32, np.float32, np.float32,
-                         output0_raw=False, output1_raw=False, swap=False)
+    # shared memory does not support class output
+    if not (TEST_SYSTEM_SHARED_MEMORY or TEST_CUDA_SHARED_MEMORY):
+        def test_class_bbb(self):
+            self._full_exact(np.int8, np.int8, np.int8,
+                             output0_raw=False, output1_raw=False, swap=True)
+        def test_class_sss(self):
+            self._full_exact(np.int16, np.int16, np.int16,
+                             output0_raw=False, output1_raw=False, swap=True)
+        def test_class_iii(self):
+            self._full_exact(np.int32, np.int32, np.int32,
+                             output0_raw=False, output1_raw=False, swap=True)
+        def test_class_lll(self):
+            self._full_exact(np.int64, np.int64, np.int64,
+                             output0_raw=False, output1_raw=False, swap=False)
+        def test_class_fff(self):
+            self._full_exact(np.float32, np.float32, np.float32,
+                             output0_raw=False, output1_raw=False, swap=True)
+        def test_class_iff(self):
+            self._full_exact(np.int32, np.float32, np.float32,
+                             output0_raw=False, output1_raw=False, swap=False)
 
-    def test_mix_bbb(self):
-        self._full_exact(np.int8, np.int8, np.int8,
-                         output0_raw=True, output1_raw=False, swap=True)
-    def test_mix_sss(self):
-        self._full_exact(np.int16, np.int16, np.int16,
-                         output0_raw=False, output1_raw=True, swap=True)
-    def test_mix_iii(self):
-        self._full_exact(np.int32, np.int32, np.int32,
-                         output0_raw=True, output1_raw=False, swap=True)
-    def test_mix_lll(self):
-        self._full_exact(np.int64, np.int64, np.int64,
-                         output0_raw=False, output1_raw=True, swap=False)
-    def test_mix_fff(self):
-        self._full_exact(np.float32, np.float32, np.float32,
-                         output0_raw=True, output1_raw=False, swap=True)
-    def test_mix_iff(self):
-        self._full_exact(np.int32, np.float32, np.float32,
-                         output0_raw=False, output1_raw=True, swap=False)
+        def test_mix_bbb(self):
+            self._full_exact(np.int8, np.int8, np.int8,
+                             output0_raw=True, output1_raw=False, swap=True)
+        def test_mix_sss(self):
+            self._full_exact(np.int16, np.int16, np.int16,
+                             output0_raw=False, output1_raw=True, swap=True)
+        def test_mix_iii(self):
+            self._full_exact(np.int32, np.int32, np.int32,
+                             output0_raw=True, output1_raw=False, swap=True)
+        def test_mix_lll(self):
+            self._full_exact(np.int64, np.int64, np.int64,
+                             output0_raw=False, output1_raw=True, swap=False)
+        def test_mix_fff(self):
+            self._full_exact(np.float32, np.float32, np.float32,
+                             output0_raw=True, output1_raw=False, swap=True)
+        def test_mix_iff(self):
+            self._full_exact(np.int32, np.float32, np.float32,
+                             output0_raw=False, output1_raw=True, swap=False)
 
     def test_raw_version_latest_1(self):
         input_size = 16
@@ -234,7 +247,9 @@ class InferTest(unittest.TestCase):
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.int8, np.int8, np.int8,
-                               model_version=1, swap=False)
+                               model_version=1, swap=False,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -243,7 +258,9 @@ class InferTest(unittest.TestCase):
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.int8, np.int8, np.int8,
-                               model_version=2, swap=True)
+                               model_version=2, swap=True,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -251,7 +268,9 @@ class InferTest(unittest.TestCase):
 
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int8, np.int8, np.int8,
-                           model_version=3, swap=True)
+                           model_version=3, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_raw_version_latest_2(self):
         input_size = 16
@@ -263,7 +282,9 @@ class InferTest(unittest.TestCase):
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.int16, np.int16, np.int16,
-                               model_version=1, swap=False)
+                               model_version=1, swap=False,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -271,10 +292,14 @@ class InferTest(unittest.TestCase):
 
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int16, np.int16, np.int16,
-                           model_version=2, swap=True)
+                           model_version=2, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int16, np.int16, np.int16,
-                           model_version=3, swap=True)
+                           model_version=3, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_raw_version_all(self):
         input_size = 16
@@ -285,13 +310,19 @@ class InferTest(unittest.TestCase):
         for platform in ('graphdef', 'savedmodel', 'netdef'):
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int32, np.int32, np.int32,
-                           model_version=1, swap=False)
+                           model_version=1, swap=False,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int32, np.int32, np.int32,
-                           model_version=2, swap=True)
+                           model_version=2, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.int32, np.int32, np.int32,
-                           model_version=3, swap=True)
+                           model_version=3, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_raw_version_specific_1(self):
         input_size = 16
@@ -302,12 +333,16 @@ class InferTest(unittest.TestCase):
         for platform in ('graphdef', 'savedmodel'):
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.float16, np.float16, np.float16,
-                           model_version=1, swap=False)
+                           model_version=1, swap=False,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.float16, np.float16, np.float16,
-                               model_version=2, swap=True)
+                               model_version=2, swap=True,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -316,7 +351,9 @@ class InferTest(unittest.TestCase):
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.float16, np.float16, np.float16,
-                               model_version=3, swap=True)
+                               model_version=3, swap=True,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -330,15 +367,19 @@ class InferTest(unittest.TestCase):
         for platform in ('graphdef', 'savedmodel', 'netdef', 'plan'):
             if platform == 'plan' and CPU_ONLY:
                 continue
-            tensor_shape = (input_size, 1, 1) if platform == 'plan' else (input_size,)
+            tensor_shape = (input_size,)
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.float32, np.float32, np.float32,
-                           model_version=1, swap=False)
+                           model_version=1, swap=False,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
             try:
                 iu.infer_exact(self, platform, tensor_shape, 1,
                                np.float32, np.float32, np.float32,
-                               model_version=2, swap=True)
+                               model_version=2, swap=True,
+                               use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                               use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
             except InferenceServerException as ex:
                 self.assertEqual("inference:0", ex.server_id())
                 self.assertTrue(
@@ -346,7 +387,9 @@ class InferTest(unittest.TestCase):
 
             iu.infer_exact(self, platform, tensor_shape, 1,
                            np.float32, np.float32, np.float32,
-                           model_version=3, swap=True)
+                           model_version=3, swap=True,
+                           use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                           use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_ensemble_mix_platform(self):
         # Skip on CPU only machine as TensorRT model is used in this ensemble
@@ -354,41 +397,76 @@ class InferTest(unittest.TestCase):
             return
         for bs in (1, 8):
             iu.infer_exact(self, "mix_platform", (16,), bs,
-                np.float32, np.float32, np.float32)
+                np.float32, np.float32, np.float32,
+                use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_ensemble_mix_type(self):
         for bs in (1, 8):
             iu.infer_exact(self, "mix_type", (16,), bs,
-                np.int32, np.float32, np.float32)
+                np.int32, np.float32, np.float32,
+                use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
     def test_ensemble_mix_ensemble(self):
         for bs in (1, 8):
             iu.infer_exact(self, "mix_ensemble", (16,), bs,
-                np.int32, np.float32, np.float32)
+                np.int32, np.float32, np.float32,
+                use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
-    def test_ensemble_label_lookup(self):
-        # Ensemble needs to look up label from the actual model
+    def test_ensemble_mix_batch_nobatch(self):
+        base_names = ["batch_to_nobatch", "nobatch_to_batch"]
+        for name in base_names:
+            for bs in (1, 8):
+                iu.infer_exact(self, name, (16,), bs,
+                    np.float32, np.float32, np.float32,
+                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
+            iu.infer_exact(self, name + "_nobatch", (8, 16,), 1,
+                np.float32, np.float32, np.float32,
+                use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
+
+        # batch -> nobatch -> batch
         for bs in (1, 8):
-            iu.infer_exact(self, "mix_platform", (16,), bs,
-                np.float32, np.float32, np.float32, output0_raw=False, output1_raw=False)
+            iu.infer_exact(self, "mix_nobatch_batch", (16,), bs,
+                np.float32, np.float32, np.float32,
+                use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
-        # Label from the actual model will be passed along the nested ensemble
-        for bs in (1, 8):
-            iu.infer_exact(self, "mix_ensemble", (16,), bs,
-                np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False)
+    if not (TEST_SYSTEM_SHARED_MEMORY or TEST_CUDA_SHARED_MEMORY):
+        def test_ensemble_label_lookup(self):
+            # Ensemble needs to look up label from the actual model
+            for bs in (1, 8):
+                iu.infer_exact(self, "mix_platform", (16,), bs,
+                    np.float32, np.float32, np.float32, output0_raw=False, output1_raw=False,
+                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
-        # If label file is provided, it will use the provided label file directly
-        try:
-            iu.infer_exact(self, "wrong_label", (16,), 1,
-                np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False)
-        except AssertionError:
-            # Sanity check that infer_exact failed since this ensemble is provided
-            # with unexpected labels
-            pass
+            # Label from the actual model will be passed along the nested ensemble
+            for bs in (1, 8):
+                iu.infer_exact(self, "mix_ensemble", (16,), bs,
+                    np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False,
+                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
-        for bs in (1, 8):
-            iu.infer_exact(self, "label_override", (16,), bs,
-                np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False)
+            # If label file is provided, it will use the provided label file directly
+            try:
+                iu.infer_exact(self, "wrong_label", (16,), 1,
+                    np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False,
+                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
+            except AssertionError:
+                # Sanity check that infer_exact failed since this ensemble is provided
+                # with unexpected labels
+                pass
+
+            for bs in (1, 8):
+                iu.infer_exact(self, "label_override", (16,), bs,
+                    np.int32, np.float32, np.float32, output0_raw=False, output1_raw=False,
+                    use_system_shared_memory=TEST_SYSTEM_SHARED_MEMORY,
+                    use_cuda_shared_memory=TEST_CUDA_SHARED_MEMORY)
 
 
 if __name__ == '__main__':

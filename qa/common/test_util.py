@@ -110,18 +110,20 @@ def validate_for_c2_model(input_dtype, output0_dtype, output1_dtype,
 def validate_for_trt_model(input_dtype, output0_dtype, output1_dtype,
                            input_shape, output0_shape, output1_shape):
     """Return True if input and output dtypes are supported by a TRT model."""
-
-    # TRT supports limited datatypes as of TRT 5.0. Input can be FP16 or
-    # FP32, output must be FP32.
-    if (input_dtype != np.float16) and (input_dtype != np.float32):
+    supported_datatypes = [np.int8, np.int32, np.float16, np.float32]
+    if not input_dtype in supported_datatypes:
         return False
-    if (output0_dtype != np.float32) or (output1_dtype != np.float32):
+    if not output0_dtype in supported_datatypes:
+        return False
+    if not output1_dtype in supported_datatypes:
         return False
 
-    # Input and output shapes must be fixed-size.
-    if (not shape_is_fixed(input_shape) or
-        not shape_is_fixed(output0_shape) or
-        not shape_is_fixed(output1_shape)):
+    datatype_set = set([input_dtype, output0_dtype, output1_dtype])
+
+    # Incompatible datatype conversions
+    if (np.int32 in datatype_set) and (np.int8 in datatype_set):
+        return False
+    if (np.float32 in datatype_set) and (np.int32 in datatype_set):
         return False
 
     return True
@@ -200,6 +202,9 @@ def get_model_name(pf, input_dtype, output0_dtype, output1_dtype):
 
 def get_sequence_model_name(pf, dtype):
     return "{}_sequence_{}".format(pf, np.dtype(dtype).name)
+
+def get_dyna_sequence_model_name(pf, dtype):
+    return "{}_dyna_sequence_{}".format(pf, np.dtype(dtype).name)
 
 def get_zero_model_name(pf, io_cnt, dtype):
     return "{}_zero_{}_{}".format(pf, io_cnt, np.dtype(dtype).name)

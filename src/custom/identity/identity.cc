@@ -27,9 +27,14 @@
 #include <chrono>
 #include <string>
 #include <thread>
-#include "src/backends/custom/custom.h"
+
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
+#include "src/custom/sdk/custom_instance.h"
+
+#ifdef TRTIS_ENABLE_GPU
+#include <cuda_runtime_api.h>
+#endif  // TRTIS_ENABLE_GPU
 
 #define LOG_ERROR std::cerr
 #define LOG_INFO std::cout
@@ -44,75 +49,122 @@
 namespace nvidia { namespace inferenceserver { namespace custom {
 namespace identity {
 
-// Integer error codes. TRTIS requires that success must be 0. All
-// other codes are interpreted by TRTIS as failures.
-enum ErrorCodes {
-  kSuccess,
-  kUnknown,
-  kInvalidModelConfig,
-  kGpuNotSupported,
-  kInputOutput,
-  kInputOutputName,
-  kInputOutputDataType,
-  kInputContents,
-  kInputSize,
-  kRequestOutput,
-  kOutputBuffer
-};
-
 // Context object. All state must be kept in this object.
-class Context {
+class Context : public CustomInstance {
  public:
   Context(
       const std::string& instance_name, const ModelConfig& config,
       const int gpu_device);
-  ~Context();
+  ~Context() = default;
 
-  // Initialize the context. Validate that the model configuration,
-  // etc. is something that we can handle.
+  // Validate the model configuration for the derived backend instance
   int Init();
 
-  // Perform custom execution on the payloads.
+#ifdef TRTIS_ENABLE_GPU
+  // Version 2 interface may need to deal with data in GPU memory,
+  // which requires CUDA support.
   int Execute(
       const uint32_t payload_cnt, CustomPayload* payloads,
-      CustomGetNextInputFn_t input_fn, CustomGetOutputFn_t output_fn);
+      CustomGetNextInputV2Fn_t input_fn,
+      CustomGetOutputV2Fn_t output_fn) override;
+#else
+  int Execute(
+      const uint32_t payload_cnt, CustomPayload* payloads,
+      CustomGetNextInputFn_t input_fn, CustomGetOutputFn_t output_fn) override;
+#endif  // TRTIS_ENABLE_GPU
 
  private:
-  // The name of this instance of the backend.
-  const std::string instance_name_;
-
-  // The model configuration.
-  const ModelConfig model_config_;
-
-  // The GPU device ID to execute on or CUSTOM_NO_GPU_DEVICE if should
-  // execute on CPU.
-  const int gpu_device_;
+  // Delay to introduce into execution, in milliseconds.
+  int execute_delay_ms_;
 
   struct CopyInfo {
     std::string input_name_;
     DataType datatype_;
   };
 
+#ifdef TRTIS_ENABLE_GPU
+  cudaStream_t stream_;
+#endif  // TRTIS_ENABLE_GPU
+
   // Map from output name to information needed to copy input into
   // that output.
   std::unordered_map<std::string, CopyInfo> copy_map_;
+
+  // local Error Codes
+  const int kGpuNotSupported = RegisterError("execution on GPU not supported");
+  const int kInputOutput = RegisterError(
+      "model must have equal input/output pairs with matching shape");
+  const int kInputOutputName = RegisterError(
+      "model input/output pairs must be named 'INPUTn' and 'OUTPUTn'");
+  const int kInputOutputDataType =
+      RegisterError("model input/output pairs must have same data-type");
+  const int kInputContents = RegisterError("unable to get input tensor values");
+  const int kInputSize = RegisterError("unexpected size for input tensor");
+  const int kRequestOutput =
+      RegisterError("inference request for unknown output");
+  const int kOutputBuffer =
+      RegisterError("unable to get buffer for output tensor values");
+  const int kCopyBuffer = RegisterError("unable to copy data to output buffer");
 };
 
 Context::Context(
     const std::string& instance_name, const ModelConfig& model_config,
     const int gpu_device)
-    : instance_name_(instance_name), model_config_(model_config),
-      gpu_device_(gpu_device)
+    : CustomInstance(instance_name, model_config, gpu_device),
+      execute_delay_ms_(0)
 {
-}
+  if (model_config_.parameters_size() > 0) {
+    const auto itr = model_config_.parameters().find("execute_delay_ms");
+    if (itr != model_config_.parameters().end()) {
+      execute_delay_ms_ = std::stoi(itr->second.string_value());
 
-Context::~Context() {}
+      // Apply delay multiplier based on instance index, this is not taking
+      // multiple devices into consideration, so the behavior is best controlled
+      // in single device case.
+      const auto mitr =
+          model_config_.parameters().find("instance_wise_delay_multiplier");
+      if (mitr != model_config_.parameters().end()) {
+        int multiplier = std::stoi(mitr->second.string_value());
+
+        size_t suffix_pos;
+        if (gpu_device == CUSTOM_NO_GPU_DEVICE) {
+          static std::string cpu_suffix = "_cpu";
+          suffix_pos = instance_name.rfind(cpu_suffix);
+        } else {
+          static std::string gpu_suffix = "_gpu";
+          suffix_pos = instance_name.rfind(gpu_suffix);
+        }
+        auto idx_pos = instance_name.rfind('_', suffix_pos - 1) + 1;
+
+        multiplier *=
+            std::stoi(instance_name.substr(idx_pos, suffix_pos - idx_pos));
+        execute_delay_ms_ *= std::max(multiplier, 1);
+      }
+    }
+  }
+#ifdef TRTIS_ENABLE_GPU
+  int device_cnt;
+  auto cuerr = cudaGetDeviceCount(&device_cnt);
+  // Do nothing if there is no CUDA device since all data transfer will be done
+  // within CPU memory
+  if ((cuerr != cudaErrorNoDevice) && (cuerr != cudaErrorInsufficientDriver)) {
+    if (cuerr == cudaSuccess) {
+      cuerr = cudaStreamCreate(&stream_);
+    }
+    if (cuerr != cudaSuccess) {
+      stream_ = nullptr;
+    }
+  }
+#endif  // TRTIS_ENABLE_GPU
+}
 
 int
 Context::Init()
 {
   // Execution on GPUs not supported since only a trivial amount of
   // computation is required.
+  // Note that this is the use case where the context is on CPU but
+  // GPU input / output is possible.
   if (gpu_device_ != CUSTOM_NO_GPU_DEVICE) {
     return kGpuNotSupported;
   }
@@ -151,14 +203,161 @@ Context::Init()
         model_config_.input(i).name(), model_config_.output(i).data_type()};
   }
 
-  return kSuccess;
+  return ErrorCodes::Success;
 }
 
+#ifdef TRTIS_ENABLE_GPU
+int
+Context::Execute(
+    const uint32_t payload_cnt, CustomPayload* payloads,
+    CustomGetNextInputV2Fn_t input_fn, CustomGetOutputV2Fn_t output_fn)
+{
+  // Delay if requested...
+  if (execute_delay_ms_ > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(execute_delay_ms_));
+  }
+
+  bool cuda_copy = false;
+  for (uint32_t pidx = 0; pidx < payload_cnt; ++pidx) {
+    CustomPayload& payload = payloads[pidx];
+
+    for (uint32_t output_idx = 0; output_idx < payload.output_cnt;
+         ++output_idx) {
+      if (payload.error_code != 0) {
+        break;
+      }
+
+      const char* output_cname = payload.required_output_names[output_idx];
+      const auto itr = copy_map_.find(output_cname);
+      if (itr == copy_map_.end()) {
+        payload.error_code = kRequestOutput;
+        break;
+      }
+
+      const std::string& input_name = itr->second.input_name_;
+      const DataType datatype = itr->second.datatype_;
+
+      std::vector<int64_t> shape;
+      if (model_config_.max_batch_size() != 0) {
+        shape.push_back(payload.batch_size);
+      }
+      for (uint32_t input_idx = 0; input_idx < payload.input_cnt; ++input_idx) {
+        if (!strcmp(payload.input_names[input_idx], input_name.c_str())) {
+          shape.insert(
+              shape.end(), payload.input_shape_dims[input_idx],
+              payload.input_shape_dims[input_idx] +
+                  payload.input_shape_dim_cnts[input_idx]);
+          break;
+        }
+      }
+
+      const int64_t batchn_byte_size = GetByteSize(datatype, shape);
+      if (batchn_byte_size < 0) {
+        payload.error_code = kOutputBuffer;
+        break;
+      }
+
+      // copy....
+      // Peek memory type and id of the input content as
+      // we would like to allocate output buffer on the same device as input
+      CustomMemoryType src_memory_type = CUSTOM_MEMORY_CPU;
+      int64_t src_memory_type_id = 0;
+      const void* content;
+      uint64_t content_byte_size = 128 * 1024;
+      if (!input_fn(
+              payload.input_context, input_name.c_str(), &content,
+              &content_byte_size, &src_memory_type, &src_memory_type_id)) {
+        payload.error_code = kInputContents;
+        break;
+      }
+
+      auto dst_memory_type = src_memory_type;
+      int64_t dst_memory_type_id = src_memory_type_id;
+      void* obuffer;
+      if (!output_fn(
+              payload.output_context, output_cname, shape.size(), &shape[0],
+              batchn_byte_size, &obuffer, &dst_memory_type,
+              &dst_memory_type_id)) {
+        payload.error_code = kOutputBuffer;
+        break;
+      }
+
+      // If no error but the 'obuffer' is returned as nullptr, then
+      // skip writing this output.
+      if (obuffer == nullptr) {
+        continue;
+      }
+
+      char* output_buffer = reinterpret_cast<char*>(obuffer);
+
+      uint64_t total_byte_size = 0;
+      // first consume the content obtained from the peeking above
+      while (true) {
+        // If 'content' returns nullptr we have all the input.
+        if (content == nullptr) {
+          break;
+        }
+
+        auto copy_type = cudaMemcpyHostToHost;
+        if (src_memory_type == dst_memory_type) {
+          if (src_memory_type == CUSTOM_MEMORY_GPU) {
+            copy_type = cudaMemcpyDeviceToDevice;
+          }
+        } else {
+          copy_type = (src_memory_type == CUSTOM_MEMORY_CPU)
+                          ? cudaMemcpyHostToDevice
+                          : cudaMemcpyDeviceToHost;
+        }
+
+        if (copy_type == cudaMemcpyHostToHost) {
+          memcpy(output_buffer + total_byte_size, content, content_byte_size);
+        } else {
+          cudaError_t err;
+          if ((src_memory_type_id != dst_memory_type_id) &&
+              (copy_type == cudaMemcpyDeviceToDevice)) {
+            err = cudaMemcpyPeerAsync(
+                output_buffer + total_byte_size, dst_memory_type_id, content,
+                src_memory_type_id, content_byte_size, stream_);
+          } else {
+            err = cudaMemcpyAsync(
+                output_buffer + total_byte_size, content, content_byte_size,
+                copy_type, stream_);
+          }
+          if (err != cudaSuccess) {
+            payload.error_code = kCopyBuffer;
+            break;
+          } else {
+            cuda_copy = true;
+          }
+        }
+        total_byte_size += content_byte_size;
+
+        if (!input_fn(
+                payload.input_context, input_name.c_str(), &content,
+                &content_byte_size, &src_memory_type, &src_memory_type_id)) {
+          payload.error_code = kInputContents;
+          break;
+        }
+      }
+    }
+  }
+  if (cuda_copy) {
+    cudaStreamSynchronize(stream_);
+  }
+
+  return ErrorCodes::Success;
+}
+#else
 int
 Context::Execute(
     const uint32_t payload_cnt, CustomPayload* payloads,
     CustomGetNextInputFn_t input_fn, CustomGetOutputFn_t output_fn)
 {
+  // Delay if requested...
+  if (execute_delay_ms_ > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(execute_delay_ms_));
+  }
+
   for (uint32_t pidx = 0; pidx < payload_cnt; ++pidx) {
     CustomPayload& payload = payloads[pidx];
 
@@ -236,92 +435,46 @@ Context::Execute(
     }
   }
 
-  return kSuccess;
+  return ErrorCodes::Success;
+}
+#endif  // TRTIS_ENABLE_GPU
+
+
+}  // namespace identity
+
+// Creates a new Indentiy context instance
+int
+CustomInstance::Create(
+    CustomInstance** instance, const std::string& name,
+    const ModelConfig& model_config, int gpu_device,
+    const CustomInitializeData* data)
+{
+  identity::Context* ctx =
+      new identity::Context(name, model_config, gpu_device);
+
+  *instance = ctx;
+
+  if (ctx == nullptr) {
+    return ErrorCodes::CreationFailure;
+  }
+
+  return ctx->Init();
 }
 
 /////////////
 
 extern "C" {
 
-int
-CustomInitialize(const CustomInitializeData* data, void** custom_context)
+uint32_t
+CustomVersion()
 {
-  // Convert the serialized model config to a ModelConfig object.
-  ModelConfig model_config;
-  if (!model_config.ParseFromString(std::string(
-          data->serialized_model_config, data->serialized_model_config_size))) {
-    return kInvalidModelConfig;
-  }
-
-  // Create the context and validate that the model configuration is
-  // something that we can handle.
-  Context* context = new Context(
-      std::string(data->instance_name), model_config, data->gpu_device_id);
-  int err = context->Init();
-  if (err != kSuccess) {
-    return err;
-  }
-
-  *custom_context = static_cast<void*>(context);
-
-  return kSuccess;
-}
-
-int
-CustomFinalize(void* custom_context)
-{
-  if (custom_context != nullptr) {
-    Context* context = static_cast<Context*>(custom_context);
-    delete context;
-  }
-
-  return kSuccess;
-}
-
-const char*
-CustomErrorString(void* custom_context, int errcode)
-{
-  switch (errcode) {
-    case kSuccess:
-      return "success";
-    case kInvalidModelConfig:
-      return "invalid model configuration";
-    case kGpuNotSupported:
-      return "execution on GPU not supported";
-    case kInputOutput:
-      return "model must have equal input/output pairs with matching shape";
-    case kInputOutputName:
-      return "model input/output pairs must be named 'INPUTn' and 'OUTPUTn'";
-    case kInputOutputDataType:
-      return "model input/output pairs must have same data-type";
-    case kInputContents:
-      return "unable to get input tensor values";
-    case kInputSize:
-      return "unexpected size for input tensor";
-    case kRequestOutput:
-      return "inference request for unknown output";
-    case kOutputBuffer:
-      return "unable to get buffer for output tensor values";
-    default:
-      break;
-  }
-
-  return "unknown error";
-}
-
-int
-CustomExecute(
-    void* custom_context, const uint32_t payload_cnt, CustomPayload* payloads,
-    CustomGetNextInputFn_t input_fn, CustomGetOutputFn_t output_fn)
-{
-  if (custom_context == nullptr) {
-    return kUnknown;
-  }
-
-  Context* context = static_cast<Context*>(custom_context);
-  return context->Execute(payload_cnt, payloads, input_fn, output_fn);
+#ifdef TRTIS_ENABLE_GPU
+  return 2;
+#else
+  return 1;
+#endif  // TRTIS_ENABLE_GPU
 }
 
 }  // extern "C"
 
-}}}}  // namespace nvidia::inferenceserver::custom::identity
+}}}  // namespace nvidia::inferenceserver::custom

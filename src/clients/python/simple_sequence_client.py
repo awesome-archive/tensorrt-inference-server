@@ -1,5 +1,4 @@
-#!/usr/bin/python
-
+#!/usr/bin/env python
 # Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -30,10 +29,25 @@ import argparse
 import numpy as np
 import os
 import sys
+import threading
+from functools import partial
 from builtins import range
 from tensorrtserver.api import *
 
+if sys.version_info >= (3, 0):
+  import queue
+else:
+  import Queue as queue
+
 FLAGS = None
+
+class UserData:
+    def __init__(self):
+        self._completed_requests = queue.Queue()
+
+# Callback function used for async_run()
+def completion_callback(user_data, infer_ctx, request_id):
+    user_data._completed_requests.put((infer_ctx, request_id))
 
 def send(ctx, value, start_of_sequence=False, end_of_sequence=False):
     # Create the tensor for INPUT.
@@ -50,7 +64,7 @@ def send(ctx, value, start_of_sequence=False, end_of_sequence=False):
                      batch_size=1, flags=flags)
     return result
 
-def async_send(ctx, value, start_of_sequence=False, end_of_sequence=False):
+def async_send(ctx, value, corr_id, start_of_sequence, end_of_sequence, user_data):
     # Create the tensor for INPUT.
     value_data = np.full(shape=[1], fill_value=value, dtype=np.int32)
 
@@ -60,13 +74,13 @@ def async_send(ctx, value, start_of_sequence=False, end_of_sequence=False):
     if end_of_sequence:
         flags = flags | InferRequestHeader.FLAG_SEQUENCE_END
 
-    request_id = ctx.async_run({ 'INPUT' : (value_data,) },
+    ctx.async_run(partial(completion_callback, user_data),
+                               { 'INPUT' : (value_data,) },
                                { 'OUTPUT' : InferContext.ResultFormat.RAW },
-                               batch_size=1, flags=flags)
-    return request_id
+                               batch_size=1, flags=flags, corr_id=corr_id)
 
 def async_receive(ctx, request_id):
-    return ctx.get_async_run_results(request_id, True)
+    return ctx.get_async_run_results(request_id)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -74,10 +88,12 @@ if __name__ == '__main__':
                         help='Enable verbose output')
     parser.add_argument('-u', '--url', type=str, required=False, default='localhost:8001',
                         help='Inference server URL and it gRPC port. Default is localhost:8001.')
-    parser.add_argument('-a', '--async', action="store_true", required=False, default=False,
-                        help='Enable asynchronous inference')
+    parser.add_argument('-a', '--async', dest="async_set", action="store_true", required=False,
+                        default=False, help='Enable asynchronous inference')
     parser.add_argument('-r', '--reverse', action="store_true", required=False, default=False,
                         help='Enable to run non-streaming context first')
+    parser.add_argument('-o', '--offset', type=int, required=False, default=0,
+                        help='Add offset to correlation ID used')
 
     FLAGS = parser.parse_args()
     protocol = ProtocolType.from_str("grpc")
@@ -95,51 +111,65 @@ if __name__ == '__main__':
     # correlation ID.
     values = [11, 7, 5, 3, 2, 0, 1]
 
-    # For the two different contexts, one is using streaming while the other
-    # isn't. Then we can compare their difference in sync/async runs
-    correlation_id0 = 1000
+    # Create two different contexts, in the sync case we can use one
+    # streaming and one not streaming. In the async case must use
+    # streaming for both since async+non-streaming means that order of
+    # requests reaching inference server is not guaranteed.
+    correlation_id0 = 1000 + FLAGS.offset * 2
     ctx0 = InferContext(FLAGS.url, protocol, model_name, model_version,
-                        correlation_id=correlation_id0, verbose=FLAGS.verbose, streaming=True)
+                        correlation_id=correlation_id0, verbose=FLAGS.verbose,
+                        streaming=True)
 
-    correlation_id1 = 1001
+    correlation_id1 = 1001 + FLAGS.offset * 2
     ctx1 = InferContext(FLAGS.url, protocol, model_name, model_version,
-                        correlation_id=correlation_id1, verbose=FLAGS.verbose, streaming=False)
+                        correlation_id=correlation_id1, verbose=FLAGS.verbose,
+                        streaming=FLAGS.async_set)
 
-    # Now send the inference sequences..
-    ctxs = []
-    if not FLAGS.reverse:
-        ctxs = [ctx0, ctx1]
-    else:
-        ctxs = [ctx1, ctx0]
-
+    # Now send the inference sequences...
     result0_list = []
     result1_list = []
 
-    if FLAGS.async:
-        request0_ids = []
-        request1_ids = []
+    if FLAGS.async_set:
+        user_data_0 = UserData()
+        user_data_1 = UserData()
 
-        request0_ids.append(async_send(ctxs[0], value=0, start_of_sequence=True))
-        request1_ids.append(async_send(ctxs[1], value=100, start_of_sequence=True))
+        async_send(ctx0, value=0, corr_id=correlation_id0, start_of_sequence=True,
+                end_of_sequence=False, user_data=user_data_0)
+        async_send(ctx0, value=100, corr_id=correlation_id1, start_of_sequence=True,
+                end_of_sequence=False, user_data=user_data_1)
         for v in values:
-            request0_ids.append(async_send(ctxs[0], value=v,
-                                           start_of_sequence=False, end_of_sequence=(v == 1)))
-            request1_ids.append(async_send(ctxs[1], value=-v,
-                                           start_of_sequence=False, end_of_sequence=(v == 1)))
-        for request_id in request0_ids:
-            result0_list.append(async_receive(ctxs[0], request_id))
-        for request_id in request1_ids:
-            result1_list.append(async_receive(ctxs[1], request_id))
+            async_send(ctx0, value=v, corr_id=correlation_id0, start_of_sequence=False,
+            end_of_sequence=(v == 1), user_data=user_data_0)
+            async_send(ctx0, value=-v, corr_id=correlation_id1, start_of_sequence=False,
+            end_of_sequence=(v == 1), user_data=user_data_1)
+
+        # Process all the requests
+        while len(result0_list) <= len(values):
+            (infer_ctx, request_id) = user_data_0._completed_requests.get()
+            result0_list.append(async_receive(infer_ctx, request_id))
+        while len(result1_list) <= len(values):
+            (infer_ctx, request_id) = user_data_1._completed_requests.get()
+            result1_list.append(async_receive(infer_ctx, request_id))
+    
     else:
+        ctxs = []
+        if not FLAGS.reverse:
+            ctxs = [ctx0, ctx1]
+        else:
+            ctxs = [ctx1, ctx0]
         result0_list.append(send(ctxs[0], value=0, start_of_sequence=True))
-        result1_list.append(send(ctxs[1], value=100, start_of_sequence=True))
         for v in values:
             result0_list.append(send(ctxs[0], value=v,
                                      start_of_sequence=False, end_of_sequence=(v == 1)))
+
+        result1_list.append(send(ctxs[1], value=100, start_of_sequence=True))
+        for v in values:
             result1_list.append(send(ctxs[1], value=-v,
                                      start_of_sequence=False, end_of_sequence=(v == 1)))
 
-    if not FLAGS.reverse:
+    if FLAGS.async_set:
+        print("streaming : streaming")
+    elif not FLAGS.reverse:
         print("streaming : non-streaming")
     else:
         print("non-streaming : streaming")

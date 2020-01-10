@@ -26,60 +26,156 @@
 
 #include "src/core/provider.h"
 
+#include <deque>
+#include <numeric>
 #include "src/core/backend.h"
 #include "src/core/constants.h"
 #include "src/core/logging.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config_utils.h"
+#include "src/core/pinned_memory_manager.h"
+
+#ifdef TRTIS_ENABLE_GPU
+#include <cuda_runtime_api.h>
+#endif  // TRTIS_ENABLE_GPU
 
 namespace nvidia { namespace inferenceserver {
 
 //
-// SystemMemoryReference
+// MemoryReference
 //
-SystemMemoryReference::SystemMemoryReference() : SystemMemory() {}
+MemoryReference::MemoryReference() : Memory() {}
 
 const char*
-SystemMemoryReference::BufferAt(size_t idx, size_t* byte_size) const
+MemoryReference::BufferAt(
+    size_t idx, size_t* byte_size, TRTSERVER_Memory_Type* memory_type,
+    int64_t* memory_type_id) const
 {
   if (idx >= buffer_.size()) {
     *byte_size = 0;
+    *memory_type = TRTSERVER_MEMORY_CPU;
+    *memory_type_id = 0;
     return nullptr;
   }
-  *byte_size = buffer_[idx].second;
-  return buffer_[idx].first;
+  *memory_type = buffer_[idx].memory_type_;
+  *memory_type_id = buffer_[idx].memory_type_id_;
+  *byte_size = buffer_[idx].byte_size_;
+  return buffer_[idx].buffer_;
 }
 
 size_t
-SystemMemoryReference::AddBuffer(const char* buffer, size_t byte_size)
+MemoryReference::AddBuffer(
+    const char* buffer, size_t byte_size, TRTSERVER_Memory_Type memory_type,
+    int64_t memory_type_id)
 {
   total_byte_size_ += byte_size;
-  buffer_.emplace_back(std::make_pair(buffer, byte_size));
+  buffer_.emplace_back(buffer, byte_size, memory_type, memory_type_id);
   return buffer_.size() - 1;
 }
 
-AllocatedSystemMemory::AllocatedSystemMemory(size_t byte_size) : SystemMemory()
+AllocatedSystemMemory::AllocatedSystemMemory(
+    size_t byte_size, TRTSERVER_Memory_Type memory_type, int64_t memory_type_id)
+    : Memory(), memory_type_(memory_type), memory_type_id_(memory_type_id)
 {
-  total_byte_size_ = byte_size;
-  char* buffer = new char[byte_size];
-  buffer_.reset(buffer);
+  buffer_ = nullptr;
+  if (byte_size != 0) {
+    if (memory_type_ == TRTSERVER_MEMORY_CPU) {
+      auto status =
+          PinnedMemoryManager::Alloc((void**)&buffer_, byte_size, true);
+      if (!status.IsOk()) {
+        LOG_ERROR << status.Message();
+        buffer_ = nullptr;
+      }
+    } else {
+#ifdef TRTIS_ENABLE_GPU
+      int current_device;
+      auto err = cudaGetDevice(&current_device);
+      bool overridden = false;
+      if (err == cudaSuccess) {
+        overridden = (current_device != memory_type_id_);
+        if (overridden) {
+          err = cudaSetDevice(memory_type_id_);
+        }
+      }
+      if (err == cudaSuccess) {
+        err = cudaMalloc((void**)&buffer_, byte_size);
+      }
+      if (err != cudaSuccess) {
+        LOG_ERROR << "failed to allocate GPU memory with byte size" << byte_size
+                  << ": " << std::string(cudaGetErrorString(err));
+        buffer_ = nullptr;
+      }
+      if (overridden) {
+        cudaSetDevice(current_device);
+      }
+#else
+      buffer_ = nullptr;
+#endif  // TRTIS_ENABLE_GPU
+    }
+  }
+  total_byte_size_ = (buffer_ == nullptr) ? 0 : byte_size;
+}
+
+AllocatedSystemMemory::~AllocatedSystemMemory()
+{
+  if (buffer_ != nullptr) {
+    if (memory_type_ == TRTSERVER_MEMORY_CPU) {
+      auto status = PinnedMemoryManager::Free(buffer_);
+      if (!status.IsOk()) {
+        LOG_ERROR << status.Message();
+        buffer_ = nullptr;
+      }
+    } else {
+#ifdef TRTIS_ENABLE_GPU
+      int current_device;
+      auto err = cudaGetDevice(&current_device);
+      bool overridden = false;
+      if (err == cudaSuccess) {
+        overridden = (current_device != memory_type_id_);
+        if (overridden) {
+          err = cudaSetDevice(memory_type_id_);
+        }
+      }
+      if (err == cudaSuccess) {
+        err = cudaFree(buffer_);
+      }
+      if (err != cudaSuccess) {
+        LOG_ERROR << "failed to free GPU memory at address " << buffer_ << ": "
+                  << std::string(cudaGetErrorString(err));
+      }
+      if (overridden) {
+        cudaSetDevice(current_device);
+      }
+#endif  // TRTIS_ENABLE_GPU
+    }
+    buffer_ = nullptr;
+  }
 }
 
 const char*
-AllocatedSystemMemory::BufferAt(size_t idx, size_t* byte_size) const
+AllocatedSystemMemory::BufferAt(
+    size_t idx, size_t* byte_size, TRTSERVER_Memory_Type* memory_type,
+    int64_t* memory_type_id) const
 {
   if (idx != 0) {
     *byte_size = 0;
+    *memory_type = TRTSERVER_MEMORY_CPU;
+    *memory_type_id = 0;
     return nullptr;
   }
   *byte_size = total_byte_size_;
-  return buffer_.get();
+  *memory_type = memory_type_;
+  *memory_type_id = memory_type_id_;
+  return buffer_;
 }
 
 char*
-AllocatedSystemMemory::MutableBuffer()
+AllocatedSystemMemory::MutableBuffer(
+    TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id)
 {
-  return buffer_.get();
+  *memory_type = memory_type_;
+  *memory_type_id = memory_type_id_;
+  return buffer_;
 }
 
 //
@@ -89,7 +185,7 @@ Status
 InferRequestProvider::Create(
     const std::string& model_name, const int64_t model_version,
     const InferRequestHeader& request_header,
-    const std::unordered_map<std::string, std::shared_ptr<SystemMemory>>&
+    const std::unordered_map<std::string, std::shared_ptr<Memory>>&
         input_buffer,
     std::shared_ptr<InferRequestProvider>* provider)
 {
@@ -120,17 +216,20 @@ InferRequestProvider::Create(
   return Status::Success;
 }
 
-const std::shared_ptr<InferRequestProvider::InputOverrideMap>&
-InferRequestProvider::GetInputOverride() const
+const InferRequestProvider::InputOverrideMapVec&
+InferRequestProvider::GetInputOverrides() const
 {
-  return overrides_;
+  return overrides_maps_;
 }
 
 Status
-InferRequestProvider::SetInputOverride(
-    const std::shared_ptr<InputOverrideMap>& override)
+InferRequestProvider::AddInputOverrides(
+    const std::shared_ptr<InputOverrideMap>& overrides)
 {
-  overrides_ = override;
+  if ((overrides != nullptr) && !overrides->empty()) {
+    overrides_maps_.emplace_back(overrides);
+  }
+
   return Status::Success;
 }
 
@@ -138,17 +237,17 @@ bool
 InferRequestProvider::GetInputOverrideContent(
     const std::string& name, const void** content, size_t* content_byte_size)
 {
-  if (overrides_ != nullptr) {
-    const auto& pr = overrides_->find(name);
-    if (pr != overrides_->end()) {
+  for (const auto& override_map : overrides_maps_) {
+    const auto& pr = override_map->find(name);
+    if (pr != override_map->end()) {
       if ((*content_byte_size == 0) ||
           (overrides_consumed_.find(name) != overrides_consumed_.end())) {
         *content = nullptr;
         *content_byte_size = 0;
       } else {
-        std::shared_ptr<InputOverride>& override = pr->second;
-        *content = reinterpret_cast<void*>(&(override->content_[0]));
-        *content_byte_size = override->content_.size();
+        const InputOverride& override = pr->second;
+        *content = reinterpret_cast<const void*>(&(override.content_[0]));
+        *content_byte_size = override.content_.size();
         overrides_consumed_.insert(name);
       }
 
@@ -162,14 +261,17 @@ InferRequestProvider::GetInputOverrideContent(
 Status
 InferRequestProvider::GetNextInputContent(
     const std::string& name, const void** content, size_t* content_byte_size,
-    bool force_contiguous)
+    TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id)
 {
   if (*content_byte_size == 0) {
     *content = nullptr;
     return Status::Success;
   }
 
-  if (!GetInputOverrideContent(name, content, content_byte_size)) {
+  if (GetInputOverrideContent(name, content, content_byte_size)) {
+    *memory_type = TRTSERVER_MEMORY_CPU;
+    *memory_type_id = 0;
+  } else {
     const auto& pr = input_buffer_.find(name);
     if (pr == input_buffer_.end()) {
       return Status(
@@ -177,46 +279,16 @@ InferRequestProvider::GetNextInputContent(
     }
 
     auto& input_content = pr->second;
-
-    bool isLastChunk =
-        (input_content.first->BufferAt(
-             input_content.second + 1, content_byte_size) == nullptr);
-    if (!force_contiguous || isLastChunk) {
-      *content = input_content.first->BufferAt(
-          input_content.second++, content_byte_size);
-    } else {
-      size_t total_size = 0;
-      size_t start_idx = input_content.second;
-      do {
-        *content = input_content.first->BufferAt(
-            input_content.second++, content_byte_size);
-        total_size += *content_byte_size;
-      } while (*content != nullptr);
-
-      contiguous_buffers_.emplace_back();
-      std::vector<char>& buf = contiguous_buffers_.back();
-      buf.reserve(total_size);
-
-      for (size_t i = start_idx; i < input_content.second; i++) {
-        const auto& block = input_content.first->BufferAt(i, content_byte_size);
-        buf.insert(buf.end(), block, block + *content_byte_size);
-      }
-
-      if (buf.size() != total_size) {
-        return Status(RequestStatusCode::INTERNAL, "contiguous input failed");
-      }
-
-      *content = &(buf[0]);
-      *content_byte_size = total_size;
-    }
+    *content = input_content.first->BufferAt(
+        input_content.second++, content_byte_size, memory_type, memory_type_id);
   }
 
   return Status::Success;
 }
 
 Status
-InferRequestProvider::GetSystemMemory(
-    const std::string& name, std::shared_ptr<SystemMemory>* input_buffer)
+InferRequestProvider::GetMemory(
+    const std::string& name, std::shared_ptr<Memory>* input_buffer)
 {
   auto it = input_buffer_.find(name);
   if (it == input_buffer_.end()) {
@@ -237,26 +309,46 @@ std::mutex NULLInferRequestProvider::mu_;
 Status
 NULLInferRequestProvider::GetNextInputContent(
     const std::string& name, const void** content, size_t* content_byte_size,
-    bool force_contiguous)
+    TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id)
 {
+  *memory_type = TRTSERVER_MEMORY_CPU;
+  *memory_type_id = 0;
   if (*content_byte_size == 0) {
     *content = nullptr;
     return Status::Success;
   }
 
   if (!GetInputOverrideContent(name, content, content_byte_size)) {
-    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inputs_remaining_bytes_.find(name);
+    if ((it != inputs_remaining_bytes_.end()) && (it->second == 0)) {
+      *content = nullptr;
+      *content_byte_size = 0;
+    } else {
+      // If it is first time requesting the input, the byte size hint will be
+      // used as the expected input byte size.
+      if (it == inputs_remaining_bytes_.end()) {
+        it = inputs_remaining_bytes_.emplace(name, *content_byte_size).first;
+      }
 
-    // Must return content with all zero data. This is required by
-    // string-datatype tensors where it is interpreted as all empty
-    // strings. Clamp the maximum size that we allow the buffer to
-    // grow to avoid massive allocation.
-    if (buf_.size() < *content_byte_size) {
-      constexpr size_t max_size = 16 * 1024 * 1024;
-      buf_.resize(std::min(max_size, *content_byte_size), 0);
+      std::lock_guard<std::mutex> lock(mu_);
+
+      // Must return content with all zero data. This is required by
+      // string-datatype tensors where it is interpreted as all empty
+      // strings. Clamp the maximum size that we allow the buffer to
+      // grow to avoid massive allocation.
+      if (buf_.size() < *content_byte_size) {
+        constexpr size_t max_size = 16 * 1024 * 1024;
+        buf_.resize(std::min(max_size, *content_byte_size), 0);
+      }
+
+      *content = &(buf_[0]);
+
+      // byte size to be returned is the min of actual buffer size,
+      // expected remaining size (content_byte_size), and actual remaining size
+      *content_byte_size =
+          std::min(std::min(buf_.size(), *content_byte_size), it->second);
+      it->second -= *content_byte_size;
     }
-
-    *content = &(buf_[0]);
   }
 
   return Status::Success;
@@ -312,13 +404,18 @@ AddClassResults(
 //
 InferResponseProvider::InferResponseProvider(
     const InferRequestHeader& request_header,
-    const std::shared_ptr<LabelProvider>& label_provider)
-    : request_header_(request_header), label_provider_(label_provider)
+    const std::shared_ptr<LabelProvider>& label_provider,
+    TRTSERVER_ResponseAllocator* allocator,
+    TRTSERVER_ResponseAllocatorAllocFn_t alloc_fn, void* alloc_userp,
+    TRTSERVER_ResponseAllocatorReleaseFn_t release_fn)
+    : request_header_(request_header), label_provider_(label_provider),
+      allocator_(allocator), alloc_fn_(alloc_fn), alloc_userp_(alloc_userp),
+      release_fn_(release_fn)
 {
   // Create a map from output name to the InferRequestHeader::Output
   // object for that output.
   for (const InferRequestHeader::Output& output : request_header.output()) {
-    output_map_.emplace(std::make_pair(output.name(), &output));
+    output_map_.emplace(std::make_pair(output.name(), output));
   }
 }
 
@@ -330,13 +427,15 @@ InferResponseProvider::RequiresOutput(const std::string& name)
 
 Status
 InferResponseProvider::OutputBufferContents(
-    const std::string& name, const void** content,
-    size_t* content_byte_size) const
+    const std::string& name, const void** content, size_t* content_byte_size,
+    TRTSERVER_Memory_Type* memory_type, int64_t* memory_type_id) const
 {
   for (const auto& output : outputs_) {
     if ((name == output.name_) && (output.cls_count_ == 0)) {
       *content = output.ptr_;
       *content_byte_size = output.byte_size_;
+      *memory_type = output.memory_type_;
+      *memory_type_id = output.memory_type_id_;
       return Status::Success;
     }
   }
@@ -344,38 +443,6 @@ InferResponseProvider::OutputBufferContents(
   return Status(
       RequestStatusCode::UNAVAILABLE,
       "request for unallocated output '" + name + "'");
-}
-
-Status
-InferResponseProvider::CheckAndSetIfBufferedOutput(
-    const std::string& name, void** content, size_t content_byte_size,
-    const std::vector<int64_t>& content_shape, Output** output)
-{
-  const auto& pr = output_map_.find(name);
-  if (pr == output_map_.end()) {
-    return Status(
-        RequestStatusCode::INTERNAL, "unexpected output '" + name + "'");
-  }
-
-  outputs_.emplace_back();
-  Output* loutput = &(outputs_.back());
-  loutput->name_ = name;
-  loutput->shape_ = content_shape;
-  loutput->cls_count_ = 0;
-  loutput->ptr_ = nullptr;
-  loutput->byte_size_ = content_byte_size;
-
-  if (pr->second->has_cls()) {
-    loutput->cls_count_ = pr->second->cls().count();
-    char* buffer = new char[content_byte_size];
-    *content = static_cast<void*>(buffer);
-    loutput->ptr_ = static_cast<void*>(buffer);
-    loutput->buffer_.reset(buffer);
-  }
-
-  *output = loutput;
-
-  return Status::Success;
 }
 
 bool
@@ -449,12 +516,27 @@ InferResponseProvider::FinalizeResponse(const InferenceBackend& is)
       poutput->mutable_raw()->Clear();
       poutput->mutable_raw()->set_batch_byte_size(output.byte_size_);
 
-      // If there is a reshape them we know that output_config dims
-      // are non-variable so use them directly. If there is not a
-      // reshape then use output shape as that will have actual sized
-      // in place of any wildcard dimensions.
+      // If there is a reshape them we need to record corresponding value for
+      // variable-size dimensions so that we can set the output shape correctly.
+      // If there is not a reshape then use output shape as that will have
+      // actual sized in place of any wildcard dimensions.
       if (output_config->has_reshape()) {
-        poutput->mutable_raw()->mutable_dims()->CopyFrom(output_config->dims());
+        std::deque<int64_t> variable_size_values;
+        for (int64_t idx = 0; idx < output_config->reshape().shape_size();
+             idx++) {
+          if (output_config->reshape().shape(idx) == -1) {
+            variable_size_values.push_back(batch1_backend_shape[idx]);
+          }
+        }
+
+        for (const auto& dim : output_config->dims()) {
+          if (dim == -1) {
+            poutput->mutable_raw()->add_dims(variable_size_values.front());
+            variable_size_values.pop_front();
+          } else {
+            poutput->mutable_raw()->add_dims(dim);
+          }
+        }
       } else {
         poutput->mutable_raw()->mutable_dims()->CopyFrom(batch1_backend_shape);
       }
@@ -539,273 +621,178 @@ InferResponseProvider::FinalizeResponse(const InferenceBackend& is)
   return Status::Success;
 }
 
-//
-// InternalInferResponseProvider
-//
 Status
-InternalInferResponseProvider::Create(
-    const InferenceBackend& is, const InferRequestHeader& request_header,
+InferResponseProvider::Create(
+    const InferRequestHeader& request_header,
     const std::shared_ptr<LabelProvider>& label_provider,
-    std::shared_ptr<InternalInferResponseProvider>* infer_provider)
+    TRTSERVER_ResponseAllocator* allocator,
+    TRTSERVER_ResponseAllocatorAllocFn_t alloc_fn, void* alloc_userp,
+    TRTSERVER_ResponseAllocatorReleaseFn_t release_fn,
+    std::shared_ptr<InferResponseProvider>* infer_provider)
 {
-  auto provider =
-      new InternalInferResponseProvider(request_header, label_provider);
+  InferResponseProvider* provider = new InferResponseProvider(
+      request_header, label_provider, allocator, alloc_fn, alloc_userp,
+      release_fn);
   infer_provider->reset(provider);
+
   return Status::Success;
 }
 
+InferResponseProvider::~InferResponseProvider()
+{
+  for (const auto& output : outputs_) {
+    if (output.release_buffer_ != nullptr) {
+#ifdef TRTIS_ENABLE_GPU
+      int current_device;
+      auto cuerr = cudaGetDevice(&current_device);
+      // Ignore error caused by CPU-only system.
+      if ((cuerr != cudaSuccess) && (cuerr != cudaErrorNoDevice) &&
+          (cuerr != cudaErrorInsufficientDriver)) {
+        LOG_ERROR << "unable to get current CUDA device: "
+                  << cudaGetErrorString(cuerr);
+      }
+#endif  // TRTIS_ENABLE_GPU
+      TRTSERVER_Error* err = release_fn_(
+          allocator_, output.release_buffer_, output.release_userp_,
+          output.byte_size_, output.memory_type_, output.memory_type_id_);
+#ifdef TRTIS_ENABLE_GPU
+      cuerr = cudaSetDevice(current_device);
+      if ((cuerr != cudaSuccess) && (cuerr != cudaErrorNoDevice) &&
+          (cuerr != cudaErrorInsufficientDriver)) {
+        LOG_ERROR << "unable to recover current CUDA device: "
+                  << cudaGetErrorString(cuerr);
+      }
+#endif  // TRTIS_ENABLE_GPU
+      if (err != nullptr) {
+        LOG_ERROR << "failed to release result tensor '" << output.name_
+                  << "': " << TRTSERVER_ErrorMessage(err);
+        TRTSERVER_ErrorDelete(err);
+      }
+    }
+  }
+}
+
 const InferResponseHeader&
-InternalInferResponseProvider::ResponseHeader() const
+InferResponseProvider::ResponseHeader() const
 {
   return response_header_;
 }
 
 InferResponseHeader*
-InternalInferResponseProvider::MutableResponseHeader()
+InferResponseProvider::MutableResponseHeader()
 {
   return &response_header_;
 }
 
 Status
-InternalInferResponseProvider::AllocateOutputBuffer(
+InferResponseProvider::AllocateOutputBuffer(
     const std::string& name, void** content, size_t content_byte_size,
-    const std::vector<int64_t>& content_shape)
+    const std::vector<int64_t>& content_shape,
+    const TRTSERVER_Memory_Type preferred_memory_type,
+    const int64_t preferred_memory_type_id,
+    TRTSERVER_Memory_Type* actual_memory_type, int64_t* actual_memory_type_id)
 {
   *content = nullptr;
 
-  Output* output;
-  RETURN_IF_ERROR(CheckAndSetIfBufferedOutput(
-      name, content, content_byte_size, content_shape, &output));
-
-  // Always write output tensor to an output buffer no matter
-  // if output has cls field defined
-  auto it = output_buffer_.find(name);
-  if (it == output_buffer_.end()) {
-    it = output_buffer_
-             .emplace(std::make_pair(
-                 name,
-                 std::make_shared<AllocatedSystemMemory>(content_byte_size)))
-             .first;
-  }
-
-  if (content_byte_size != it->second->TotalByteSize()) {
+  const auto& pr = output_map_.find(name);
+  if (pr == output_map_.end()) {
     return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unexpected size " + std::to_string(it->second->TotalByteSize()) +
-            " for output '" + name + "', expecting " +
-            std::to_string(content_byte_size));
+        RequestStatusCode::INTERNAL, "unexpected output '" + name + "'");
   }
 
-  *content = it->second->MutableBuffer();
-  output->ptr_ = *content;
+  outputs_.emplace_back();
+  Output* loutput = &(outputs_.back());
+  loutput->name_ = name;
+  loutput->shape_ = content_shape;
+  loutput->cls_count_ = 0;
+  loutput->ptr_ = nullptr;
+  loutput->byte_size_ = content_byte_size;
 
-  return Status::Success;
-}
-
-Status
-InternalInferResponseProvider::GetSystemMemory(
-    const std::string& name, std::shared_ptr<SystemMemory>* output_buffer)
-{
-  auto it = output_buffer_.find(name);
-  if (it == output_buffer_.end()) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "output '" + name + "' is not found in response provider");
-  }
-  *output_buffer = std::static_pointer_cast<SystemMemory>(it->second);
-  return Status::Success;
-}
-
-InternalInferResponseProvider::InternalInferResponseProvider(
-    const InferRequestHeader& request_header,
-    const std::shared_ptr<LabelProvider>& label_provider)
-    : InferResponseProvider(request_header, label_provider)
-{
-}
-
-//
-// GRPCInferResponseProvider
-//
-Status
-GRPCInferResponseProvider::Create(
-    const InferRequestHeader& request_header, InferResponse* response,
-    const std::shared_ptr<LabelProvider>& label_provider,
-    std::shared_ptr<GRPCInferResponseProvider>* infer_provider)
-{
-  GRPCInferResponseProvider* provider =
-      new GRPCInferResponseProvider(request_header, response, label_provider);
-  infer_provider->reset(provider);
-
-  return Status::Success;
-}
-
-const InferResponseHeader&
-GRPCInferResponseProvider::ResponseHeader() const
-{
-  return response_->meta_data();
-}
-
-InferResponseHeader*
-GRPCInferResponseProvider::MutableResponseHeader()
-{
-  return response_->mutable_meta_data();
-}
-
-Status
-GRPCInferResponseProvider::AllocateOutputBuffer(
-    const std::string& name, void** content, size_t content_byte_size,
-    const std::vector<int64_t>& content_shape)
-{
-  Output* output;
-  RETURN_IF_ERROR(CheckAndSetIfBufferedOutput(
-      name, content, content_byte_size, content_shape, &output));
-
-  // Must always add a raw output into the list so that the number and
-  // order of raw output entries equals the output meta-data. But
-  // leave empty if not returning raw result for the output.
-  std::string* raw_output = response_->add_raw_output();
-  if (output->ptr_ == nullptr) {
-    raw_output->resize(content_byte_size);
-    *content = static_cast<void*>(&((*raw_output)[0]));
-    output->ptr_ = *content;
-  }
-
-  return Status::Success;
-}
-
-//
-// HTTPInferResponseProvider
-//
-HTTPInferResponseProvider::HTTPInferResponseProvider(
-    evbuffer* output_buffer, const InferRequestHeader& request_header,
-    const std::shared_ptr<LabelProvider>& label_provider)
-    : InferResponseProvider(request_header, label_provider),
-      output_buffer_(output_buffer)
-{
-}
-
-Status
-HTTPInferResponseProvider::Create(
-    evbuffer* output_buffer, const InferenceBackend& is,
-    const InferRequestHeader& request_header,
-    const std::shared_ptr<LabelProvider>& label_provider,
-    std::shared_ptr<HTTPInferResponseProvider>* infer_provider)
-{
-  HTTPInferResponseProvider* provider = new HTTPInferResponseProvider(
-      output_buffer, request_header, label_provider);
-  infer_provider->reset(provider);
-
-  return Status::Success;
-}
-
-const InferResponseHeader&
-HTTPInferResponseProvider::ResponseHeader() const
-{
-  return response_header_;
-}
-
-InferResponseHeader*
-HTTPInferResponseProvider::MutableResponseHeader()
-{
-  return &response_header_;
-}
-
-Status
-HTTPInferResponseProvider::AllocateOutputBuffer(
-    const std::string& name, void** content, size_t content_byte_size,
-    const std::vector<int64_t>& content_shape)
-{
-  *content = nullptr;
-
-  Output* output;
-  RETURN_IF_ERROR(CheckAndSetIfBufferedOutput(
-      name, content, content_byte_size, content_shape, &output));
-
-  if ((output->ptr_ == nullptr) && (content_byte_size > 0)) {
-    // Reserve requested space in evbuffer...
-    struct evbuffer_iovec output_iovec;
-    if (evbuffer_reserve_space(
-            output_buffer_, content_byte_size, &output_iovec, 1) != 1) {
-      return Status(
-          RequestStatusCode::INTERNAL, "failed to reserve " +
-                                           std::to_string(content_byte_size) +
-                                           " bytes in output tensor buffer");
+  // For class result, the provider will be responsible for allocating
+  // the requested memory. The user-provided allocator should only be invoked
+  // once with byte size 0 when the provider allocation is succeed.
+  // For class result, the actual memory type must be CPU. If preferred memory
+  // type is GPU then set actual_memory_type to CPU and proceed. Otherwise,
+  // return success and nullptr to align with the behavior of
+  // 'TRTSERVER_ResponseAllocatorAllocFn_t'
+  const bool is_class = pr->second.has_cls();
+  if (is_class) {
+    // For class result no additional buffer is needed.
+    if (content_byte_size == 0) {
+      Status(
+          RequestStatusCode::INVALID_ARG,
+          "Classification result is requested for output '" + name + "'" +
+              " while its output buffer size is 0");
     }
 
-    if (output_iovec.iov_len < content_byte_size) {
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "reserved " + std::to_string(output_iovec.iov_len) +
-              " bytes in output tensor buffer, need " +
-              std::to_string(content_byte_size));
-    }
-
-    output_iovec.iov_len = content_byte_size;
-    *content = output_iovec.iov_base;
-    output->ptr_ = *content;
-
-    // Immediately commit the buffer space. Some backends will write
-    // async to the just allocated buffer space so we are relying on
-    // evbuffer not to relocate this space. Because we request a
-    // contiguous chunk every time (above by allowing only a single
-    // entry in output_iovec), this seems to be a valid assumption.
-    if (evbuffer_commit_space(output_buffer_, &output_iovec, 1) != 0) {
-      *content = nullptr;
-      output->ptr_ = nullptr;
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "failed to commit output tensors to output buffer");
-    }
-  }
-
-  return Status::Success;
-}
-
-//
-// DelegatingInferResponseProvider
-//
-Status
-DelegatingInferResponseProvider::Create(
-    const InferRequestHeader& request_header,
-    const std::shared_ptr<LabelProvider>& label_provider,
-    std::shared_ptr<DelegatingInferResponseProvider>* infer_provider)
-{
-  DelegatingInferResponseProvider* provider =
-      new DelegatingInferResponseProvider(request_header, label_provider);
-  infer_provider->reset(provider);
-
-  return Status::Success;
-}
-
-const InferResponseHeader&
-DelegatingInferResponseProvider::ResponseHeader() const
-{
-  return response_header_;
-}
-
-InferResponseHeader*
-DelegatingInferResponseProvider::MutableResponseHeader()
-{
-  return &response_header_;
-}
-
-Status
-DelegatingInferResponseProvider::AllocateOutputBuffer(
-    const std::string& name, void** content, size_t content_byte_size,
-    const std::vector<int64_t>& content_shape)
-{
-  *content = nullptr;
-
-  Output* output;
-  RETURN_IF_ERROR(CheckAndSetIfBufferedOutput(
-      name, content, content_byte_size, content_shape, &output));
-
-  if ((output->buffer_ == nullptr) && (content_byte_size > 0)) {
+    loutput->cls_count_ = pr->second.cls().count();
     char* buffer = new char[content_byte_size];
     *content = static_cast<void*>(buffer);
-    output->ptr_ = static_cast<void*>(buffer);
-    output->buffer_.reset(buffer);
+    loutput->ptr_ = static_cast<void*>(buffer);
+    loutput->buffer_.reset(buffer);
   }
+
+  // If a buffer has been allocated for cls result, then no
+  // additional buffer is needed from alloc_fn, but still need to call the
+  // alloc_fn_ with byte-size == 0 since that is what the API requires.
+  const size_t alloc_byte_size = (*content != nullptr) ? 0 : content_byte_size;
+
+  void* buffer = nullptr;
+  void* buffer_userp = nullptr;
+  TRTSERVER_Memory_Type raw_actual_memory_type;
+  int64_t raw_actual_memory_type_id;
+#ifdef TRTIS_ENABLE_GPU
+  int current_device;
+  auto cuerr = cudaGetDevice(&current_device);
+  // Ignore error caused by CPU-only system.
+  if ((cuerr != cudaSuccess) && (cuerr != cudaErrorNoDevice) &&
+      (cuerr != cudaErrorInsufficientDriver)) {
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "unable to get current CUDA device: " +
+            std::string(cudaGetErrorString(cuerr)));
+  }
+#endif  // TRTIS_ENABLE_GPU
+  TRTSERVER_Error* err = alloc_fn_(
+      allocator_, name.c_str(), alloc_byte_size, preferred_memory_type,
+      preferred_memory_type_id, alloc_userp_, &buffer, &buffer_userp,
+      &raw_actual_memory_type, &raw_actual_memory_type_id);
+  if (!is_class) {
+    *content = buffer;
+    loutput->ptr_ = buffer;
+    loutput->memory_type_ = raw_actual_memory_type;
+    loutput->memory_type_id_ = raw_actual_memory_type_id;
+  } else {
+    // If class result, then force the memory type to be CPU
+    loutput->memory_type_ = TRTSERVER_MEMORY_CPU;
+    loutput->memory_type_id_ = 0;
+  }
+
+  Status status;
+#ifdef TRTIS_ENABLE_GPU
+  cuerr = cudaSetDevice(current_device);
+  if ((cuerr != cudaSuccess) && (cuerr != cudaErrorNoDevice) &&
+      (cuerr != cudaErrorInsufficientDriver)) {
+    status = Status(
+        RequestStatusCode::INTERNAL,
+        "unable to recover current CUDA device: " +
+            std::string(cudaGetErrorString(cuerr)));
+  }
+#endif  // TRTIS_ENABLE_GPU
+  if (err != nullptr) {
+    status = Status(
+        TrtServerCodeToRequestStatus(TRTSERVER_ErrorCode(err)),
+        TRTSERVER_ErrorMessage(err));
+    TRTSERVER_ErrorDelete(err);
+  }
+  if (!status.IsOk()) {
+    return status;
+  }
+
+  loutput->release_buffer_ = buffer;
+  loutput->release_userp_ = buffer_userp;
+  *actual_memory_type = loutput->memory_type_;
+  *actual_memory_type_id = loutput->memory_type_id_;
 
   return Status::Success;
 }

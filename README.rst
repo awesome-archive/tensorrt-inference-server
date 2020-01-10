@@ -30,22 +30,17 @@
 NVIDIA TensorRT Inference Server
 ================================
 
-    **NOTICE: The master branch has recently converted to using CMake
-    to build the server, clients and other artifacts. Read the new
-    documentation carefully to understand the new** `build process
-    <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/build.html>`_.
-
     **LATEST RELEASE: You are currently on the master branch which
     tracks under-development progress towards the next release. The
-    latest release of the TensorRT Inference Server is 1.2.0 and
-    is available on branch** `r19.05
-    <https://github.com/NVIDIA/tensorrt-inference-server/tree/r19.05>`_.
+    latest release of the TensorRT Inference Server is 1.9.0 and
+    is available on branch** `r19.12
+    <https://github.com/NVIDIA/tensorrt-inference-server/tree/r19.12>`_.
 
 .. overview-begin-marker-do-not-remove
 
 The NVIDIA TensorRT Inference Server provides a cloud inferencing
 solution optimized for NVIDIA GPUs. The server provides an inference
-service via an HTTP or gRPC endpoint, allowing remote clients to
+service via an HTTP or GRPC endpoint, allowing remote clients to
 request inferencing for any model being managed by the server. The
 inference server provides the following features:
 
@@ -53,10 +48,10 @@ inference server provides the following features:
   <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/model_repository.html#framework-model-definition>`_. The
   server can manage any number and mix of models (limited by system
   disk and memory resources). Supports TensorRT, TensorFlow GraphDef,
-  TensorFlow SavedModel and Caffe2 NetDef model formats. Also supports
-  TensorFlow-TensorRT integrated models. Variable-size input and
-  output tensors are allowed if supported by the framework. See
-  `Capabilities
+  TensorFlow SavedModel, ONNX, PyTorch, and Caffe2 NetDef model
+  formats. Also supports TensorFlow-TensorRT integrated
+  models. Variable-size input and output tensors are allowed if
+  supported by the framework. See `Capabilities
   <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/capabilities.html#capabilities>`_
   for detailed support information for each framework.
 
@@ -92,17 +87,15 @@ inference server provides the following features:
 * Multi-GPU support. The server can distribute inferencing across all
   system GPUs.
 
-* The inference server `monitors the model repository
-  <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/model_repository.html#modifying-the-model-repository>`_
-  for any change and dynamically reloads the model(s) when necessary,
-  without requiring a server restart. Models and model versions can be
-  added and removed, and model configurations can be modified while
-  the server is running.
+* The inference server provides `multiple modes for model management
+  <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/model_management.html>`_. These
+  model management modes allow for both implicit and explicit loading
+  and unloading of models without requiring a server restart.
 
 * `Model repositories
   <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/model_repository.html#>`_
-  may reside on a locally accessible file system (e.g. NFS) or in
-  Google Cloud Storage.
+  may reside on a locally accessible file system (e.g. NFS), in Google
+  Cloud Storage or in Amazon S3.
 
 * Readiness and liveness `health endpoints
   <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/http_grpc_api.html#health>`_
@@ -113,26 +106,31 @@ inference server provides the following features:
   <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/metrics.html>`_
   indicating GPU utilization, server throughput, and server latency.
 
+* `C library inferface
+  <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/library_api.html>`_
+  allows the full functionality of the inference server to be included
+  directly in an application.
+
 .. overview-end-marker-do-not-remove
 
-The current release of the TensorRT Inference Server is 1.2.0 and
-corresponds to the 19.05 release of the tensorrtserver container on
+The current release of the TensorRT Inference Server is 1.9.0 and
+corresponds to the 19.12 release of the tensorrtserver container on
 `NVIDIA GPU Cloud (NGC) <https://ngc.nvidia.com>`_. The branch for
-this release is `r19.05
-<https://github.com/NVIDIA/tensorrt-inference-server/tree/r19.05>`_.
+this release is `r19.12
+<https://github.com/NVIDIA/tensorrt-inference-server/tree/r19.12>`_.
 
 Backwards Compatibility
 -----------------------
 
-Continuing in version 1.2.0 the following interfaces maintain
+Continuing in the latest version the following interfaces maintain
 backwards compatibilty with the 1.0.0 release. If you have model
 configuration files, custom backends, or clients that use the
 inference server HTTP or GRPC APIs (either directly or through the
-client libraries) from releases prior to 1.0.0 (19.03) you should edit
+client libraries) from releases prior to 1.0.0 you should edit
 and rebuild those as necessary to match the version 1.0.0 APIs.
 
-These inferfaces will maintain backwards compatibility for all future
-1.x.y releases (see below for exceptions):
+The following inferfaces will maintain backwards compatibility for all
+future 1.x.y releases (see below for exceptions):
 
 * Model configuration as defined in `model_config.proto
   <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/model_config.proto>`_.
@@ -140,9 +138,10 @@ These inferfaces will maintain backwards compatibility for all future
 * The inference server HTTP and GRPC APIs as defined in `api.proto
   <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/api.proto>`_
   and `grpc_service.proto
-  <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/grpc_service.proto>`_.
+  <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/grpc_service.proto>`_,
+  except as noted below.
 
-* The custom backend interface as defined in `custom.h
+* The V1 custom backend interface as defined in `custom.h
   <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/backends/custom/custom.h>`_.
 
 As new features are introduced they may temporarily have beta status
@@ -151,25 +150,41 @@ ways. When they exit beta they will conform to the
 backwards-compatibility guarantees described above. Currently the
 following features are in beta:
 
-* In the model configuration defined in `model_config.proto
-  <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/model_config.proto>`_
-  the sections related to model ensembling are currently in beta. In
-  particular, the ModelEnsembling message will potentially undergo
+* The inference server library API as defined in `trtserver.h
+  <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/core/trtserver.h>`_
+  is currently in beta and may undergo non-backwards-compatible
+  changes.
+
+* The inference server HTTP and GRPC APIs related to system and CUDA
+  shared memory are currently in beta and may undergo
   non-backwards-compatible changes.
 
+* The V2 custom backend interface as defined in `custom.h
+  <https://github.com/NVIDIA/tensorrt-inference-server/blob/master/src/backends/custom/custom.h>`_
+  is currently in beta and may undergo non-backwards-compatible
+  changes.
+
+* The C++ and Python client libraries are not stictly included in the
+  inference server compatibility guarantees and so should be
+  considered as beta status.
 
 Documentation
 -------------
 
-The User Guide, Developer Guide, and API Reference `documentation
+The User Guide, Developer Guide, and API Reference `documentation for
+the current release
 <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-guide/docs/index.html>`_
-provide guidance on installing, building and running the latest
-release of the TensorRT Inference Server.
+provide guidance on installing, building, and running the TensorRT
+Inference Server.
 
-You can also view the documentation for the `master branch
+You can also view the `documentation for the master branch
 <https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/index.html>`_
 and for `earlier releases
 <https://docs.nvidia.com/deeplearning/sdk/inference-server-archived/index.html>`_.
+
+An `FAQ
+<https://docs.nvidia.com/deeplearning/sdk/tensorrt-inference-server-master-branch-guide/docs/faq.html>`_
+provides answers for frequently asked questions.
 
 READMEs for deployment examples can be found in subdirectories of
 deploy/, for example, `deploy/single_server/README.rst

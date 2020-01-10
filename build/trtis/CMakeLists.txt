@@ -39,15 +39,40 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(${TRTIS_ENABLE_ASAN})
   set(CMAKE_BUILD_TYPE Debug)
+  add_definitions(-DTRTIS_ENABLE_ASAN=1)
 
   set(_ASAN_FLAGS "-static-libstdc++ -static-libasan -fno-omit-frame-pointer -fsanitize=address")
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${_ASAN_FLAGS}")
   set(CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} ${_ASAN_FLAGS}")
 endif() # TRTIS_ENABLE_ASAN
 
+if(${TRTIS_ENABLE_TRACING})
+  add_definitions(-DTRTIS_ENABLE_TRACING=1)
+endif() # TRTIS_ENABLE_TRACING
+
+if(${TRTIS_ENABLE_LOGGING})
+  add_definitions(-DTRTIS_ENABLE_LOGGING=1)
+endif() # TRTIS_ENABLE_LOGGING
+if(${TRTIS_ENABLE_STATS})
+  add_definitions(-DTRTIS_ENABLE_STATS=1)
+endif() # TRTIS_ENABLE_STATS
+
 if(${TRTIS_ENABLE_GPU})
   add_definitions(-DTRTIS_ENABLE_GPU=1)
+  add_definitions(-DTRTIS_MIN_COMPUTE_CAPABILITY=${TRTIS_MIN_COMPUTE_CAPABILITY})
 endif() # TRTIS_ENABLE_GPU
+
+if(${TRTIS_ENABLE_HTTP})
+  add_definitions(-DTRTIS_ENABLE_HTTP=1)
+endif() # TRTIS_ENABLE_HTTP
+
+if(${TRTIS_ENABLE_GRPC})
+  add_definitions(-DTRTIS_ENABLE_GRPC=1)
+endif() # TRTIS_ENABLE_GRPC
+
+if(${TRTIS_ENABLE_HTTP_V2})
+  add_definitions(-DTRTIS_ENABLE_HTTP_V2=1)
+endif() # TRTIS_ENABLE_HTTP_V2
 
 if(${TRTIS_ENABLE_METRICS})
   add_definitions(-DTRTIS_ENABLE_METRICS=1)
@@ -56,6 +81,10 @@ endif() # TRTIS_ENABLE_METRICS
 if(${TRTIS_ENABLE_GCS})
   add_definitions(-DTRTIS_ENABLE_GCS=1)
 endif() # TRTIS_ENABLE_GCS
+
+if(${TRTIS_ENABLE_S3})
+  add_definitions(-DTRTIS_ENABLE_S3=1)
+endif() # TRTIS_ENABLE_S3
 
 if(${TRTIS_ENABLE_TENSORFLOW})
   add_definitions(-DTRTIS_ENABLE_TENSORFLOW=1)
@@ -72,6 +101,10 @@ endif() # TRTIS_ENABLE_CAFFE2
 if(${TRTIS_ENABLE_ONNXRUNTIME})
   add_definitions(-DTRTIS_ENABLE_ONNXRUNTIME=1)
 endif() # TRTIS_ENABLE_ONNXRUNTIME
+
+if(${TRTIS_ENABLE_ONNXRUNTIME_OPENVINO})
+  add_definitions(-DTRTIS_ENABLE_ONNXRUNTIME_OPENVINO=1)
+endif() # TRTIS_ENABLE_ONNXRUNTIME_OPENVINO
 
 if(${TRTIS_ENABLE_PYTORCH})
   add_definitions(-DTRTIS_ENABLE_PYTORCH=1)
@@ -96,19 +129,34 @@ if(${TRTIS_ENABLE_GPU})
   find_package(CUDA REQUIRED)
   message(STATUS "Using CUDA ${CUDA_VERSION}")
   set(CUDA_NVCC_FLAGS -std=c++11)
+
+  if(CUDA_VERSION VERSION_GREATER_EQUAL "10.1")
+    add_definitions(-DTRTIS_ENABLE_CUDA_GRAPH=1)
+  else()
+    message(WARNING "CUDA ${CUDA_VERSION} does not support CUDA graphs.")
+  endif()
 endif() # TRTIS_ENABLE_GPU
+
+#
+# Boost
+#
+find_package(Boost REQUIRED)
+message(STATUS "Using Boost ${Boost_VERSION}")
+include_directories(${Boost_INCLUDE_DIRS})
 
 #
 # libevent
 #
-find_package(Libevent CONFIG REQUIRED)
-message(STATUS "Using libevent ${Libevent_VERSION}")
-include_directories(${LIBEVENT_INCLUDE_DIRS})
+if(${TRTIS_ENABLE_HTTP} OR ${TRTIS_ENABLE_METRICS})
+  find_package(Libevent CONFIG REQUIRED)
+  message(STATUS "Using libevent ${Libevent_VERSION}")
+  include_directories(${LIBEVENT_INCLUDE_DIRS})
+endif()
 
 #
 # Protobuf
 #
-set(protobuf_MODULE_COMPATIBLE TRUE)
+set(protobuf_MODULE_COMPATIBLE TRUE CACHE BOOL "protobuf_MODULE_COMPATIBLE" FORCE)
 find_package(Protobuf CONFIG REQUIRED)
 message(STATUS "Using protobuf ${Protobuf_VERSION}")
 include_directories(${Protobuf_INCLUDE_DIRS})
@@ -116,12 +164,13 @@ include_directories(${Protobuf_INCLUDE_DIRS})
 #
 # GRPC
 #
-find_package(gRPC CONFIG REQUIRED)
-message(STATUS "Using gRPC ${gRPC_VERSION}")
-include_directories($<TARGET_PROPERTY:gRPC::grpc,INTERFACE_INCLUDE_DIRECTORIES>)
+if(${TRTIS_ENABLE_GRPC})
+  find_package(gRPC CONFIG REQUIRED)
+  message(STATUS "Using gRPC ${gRPC_VERSION}")
+  include_directories($<TARGET_PROPERTY:gRPC::grpc,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
 
 add_subdirectory(../../src/core src/core)
-add_subdirectory(../../src/nvrpc src/nvrpc)
 add_subdirectory(../../src/backends/caffe2 src/backends/caffe2)
 add_subdirectory(../../src/backends/custom src/backends/custom)
 add_subdirectory(../../src/backends/ensemble src/backends/ensemble)

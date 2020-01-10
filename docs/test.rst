@@ -46,12 +46,13 @@ model repositories::
 
   $ cd qa/common
   $ ./gen_qa_model_repository
+  $ ./gen_qa_custom_ops
 
-This will server multiple model repositories in /tmp/qa_* (for example
-/tmp/qa_model_repository).  The TensorRT models will be created for
-the GPU on the system that CUDA considers device 0 (zero). If you have
-multiple GPUs on your system see the documentation in the script for
-how to target a specific GPU.
+This will create multiple model repositories in /tmp/<version>/qa_*
+(for example /tmp/19.08/qa_model_repository).  The TensorRT models
+will be created for the GPU on the system that CUDA considers device 0
+(zero). If you have multiple GPUs on your system see the documentation
+in the scripts for how to target a specific GPU.
 
 Build QA Container
 ------------------
@@ -59,9 +60,9 @@ Build QA Container
 Next you need to build a QA version of the inference server
 container. This container will contain the inference server, the QA
 tests, and all the dependencies needed to run the QA tests. You must
-first build the tensorrtserver_client, tensorrtserver_build and
-tensorrtserver containers as described in
-:ref:`section-getting-the-client-libraries-and-examples` and
+first build the tensorrtserver_client, tensorrtserver_cbe,
+tensorrtserver_build and tensorrtserver containers as described in
+:ref:`section-getting-the-client-libraries` and
 :ref:`section-building` and then build the QA container::
 
   $ docker build -t tensorrtserver_qa -f Dockerfile.QA .

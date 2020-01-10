@@ -1,4 +1,4 @@
-// Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2019-2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -28,6 +28,8 @@
 
 namespace nvidia { namespace inferenceserver {
 
+const OrtApi* ort_api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+
 namespace {
 
 Status
@@ -38,21 +40,23 @@ InputOutputNames(
 
   size_t num_nodes;
   if (is_input) {
-    RETURN_IF_ORT_ERROR(OrtSessionGetInputCount(session, &num_nodes));
+    RETURN_IF_ORT_ERROR(ort_api->SessionGetInputCount(session, &num_nodes));
   } else {
-    RETURN_IF_ORT_ERROR(OrtSessionGetOutputCount(session, &num_nodes));
+    RETURN_IF_ORT_ERROR(ort_api->SessionGetOutputCount(session, &num_nodes));
   }
 
   // iterate over all input / output nodes
   OrtAllocator* allocator;
-  RETURN_IF_ORT_ERROR(OrtCreateDefaultAllocator(&allocator));
+  RETURN_IF_ORT_ERROR(ort_api->GetAllocatorWithDefaultOptions(&allocator));
   OrtStatus* onnx_status = nullptr;
   for (size_t i = 0; i < num_nodes; i++) {
     char* node_name;
     if (is_input) {
-      onnx_status = OrtSessionGetInputName(session, i, allocator, &node_name);
+      onnx_status =
+          ort_api->SessionGetInputName(session, i, allocator, &node_name);
     } else {
-      onnx_status = OrtSessionGetOutputName(session, i, allocator, &node_name);
+      onnx_status =
+          ort_api->SessionGetOutputName(session, i, allocator, &node_name);
     }
 
     if (onnx_status != nullptr) {
@@ -60,7 +64,6 @@ InputOutputNames(
     }
     names.emplace(node_name);
   }
-  OrtReleaseAllocator(allocator);
   RETURN_IF_ORT_ERROR(onnx_status);
 
   return Status::Success;
@@ -75,42 +78,46 @@ InputOutputInfos(
 
   size_t num_nodes;
   if (is_input) {
-    RETURN_IF_ORT_ERROR(OrtSessionGetInputCount(session, &num_nodes));
+    RETURN_IF_ORT_ERROR(ort_api->SessionGetInputCount(session, &num_nodes));
   } else {
-    RETURN_IF_ORT_ERROR(OrtSessionGetOutputCount(session, &num_nodes));
+    RETURN_IF_ORT_ERROR(ort_api->SessionGetOutputCount(session, &num_nodes));
   }
 
   // iterate over all nodes
   for (size_t i = 0; i < num_nodes; i++) {
     char* name;
     if (is_input) {
-      RETURN_IF_ORT_ERROR(OrtSessionGetInputName(session, i, allocator, &name));
+      RETURN_IF_ORT_ERROR(
+          ort_api->SessionGetInputName(session, i, allocator, &name));
     } else {
       RETURN_IF_ORT_ERROR(
-          OrtSessionGetOutputName(session, i, allocator, &name));
+          ort_api->SessionGetOutputName(session, i, allocator, &name));
     }
 
     OrtTypeInfo* typeinfo;
     if (is_input) {
-      RETURN_IF_ORT_ERROR(OrtSessionGetInputTypeInfo(session, i, &typeinfo));
+      RETURN_IF_ORT_ERROR(
+          ort_api->SessionGetInputTypeInfo(session, i, &typeinfo));
     } else {
-      RETURN_IF_ORT_ERROR(OrtSessionGetOutputTypeInfo(session, i, &typeinfo));
+      RETURN_IF_ORT_ERROR(
+          ort_api->SessionGetOutputTypeInfo(session, i, &typeinfo));
     }
 
     OrtResourceWrapper<OrtTypeInfo*> typeinfo_wrapper(
-        typeinfo, &OrtReleaseTypeInfo);
+        typeinfo, ort_api->ReleaseTypeInfo);
     const OrtTensorTypeAndShapeInfo* tensor_info;
-    RETURN_IF_ORT_ERROR(OrtCastTypeInfoToTensorInfo(typeinfo, &tensor_info));
+    RETURN_IF_ORT_ERROR(
+        ort_api->CastTypeInfoToTensorInfo(typeinfo, &tensor_info));
 
     ONNXTensorElementDataType type;
-    RETURN_IF_ORT_ERROR(OrtGetTensorElementType(tensor_info, &type));
+    RETURN_IF_ORT_ERROR(ort_api->GetTensorElementType(tensor_info, &type));
 
     size_t num_dims;
-    RETURN_IF_ORT_ERROR(OrtGetDimensionsCount(tensor_info, &num_dims));
+    RETURN_IF_ORT_ERROR(ort_api->GetDimensionsCount(tensor_info, &num_dims));
 
     std::vector<int64_t> dims(num_dims);
     RETURN_IF_ORT_ERROR(
-        OrtGetDimensions(tensor_info, (int64_t*)dims.data(), num_dims));
+        ort_api->GetDimensions(tensor_info, (int64_t*)dims.data(), num_dims));
 
     infos.emplace(name, OnnxTensorInfo(type, dims));
   }
@@ -239,6 +246,8 @@ ConvertToOnnxDataType(DataType data_type)
       return ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE;
     case TYPE_STRING:
       return ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING;
+    case TYPE_BOOL:
+      return ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
     default:
       break;
   }
@@ -281,50 +290,67 @@ CompareDimsSupported(
   // If the model configuration expects batching support in the model,
   // then the onnx shape first dimension must be -1.
   const bool supports_batching = (max_batch_size > 0);
-  if (supports_batching &&
-      ((model_shape.size() == 0) || (model_shape[0] != -1))) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name +
-            "', model configuration supports batching but first dimension of "
-            "tensor '" +
-            tensor_name +
-            "' expected by framework is not a variable-size batch dimension: " +
-            DimsListToString(model_shape) +
-            " whereas model configuration shape is: " + DimsListToString(dims));
-  }
-
-  const int nonbatch_start_idx = (supports_batching ? 1 : 0);
-  std::vector<int64_t> debatched_model_shape;
-  for (size_t i = nonbatch_start_idx; i < model_shape.size(); i++) {
-    debatched_model_shape.push_back(model_shape[i]);
-  }
-
-  // Tensor rank in configuration must match what framework expects.
-  if (debatched_model_shape.size() != (size_t)dims.size()) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name + "', tensor '" + tensor_name +
-            "' shape expected by framework " +
-            DimsListToString(debatched_model_shape) +
-            " doesn't match model configuration shape " +
-            DimsListToString(dims));
-  }
-
-  for (int i = 0; i < dims.size(); ++i) {
-    int64_t model_dim = debatched_model_shape[i];
-    if (model_dim == -1) {
-      continue;
-    }
-
-    if (model_dim != dims[i]) {
+  if (supports_batching) {
+    if ((model_shape.size() == 0) || (model_shape[0] != -1)) {
       return Status(
           RequestStatusCode::INVALID_ARG,
-          "unable to load model '" + model_name + "', tensor '" + tensor_name +
-              "' shape expected by framework " +
-              DimsListToString(debatched_model_shape) +
-              " doesn't match model configuration shape " +
-              DimsListToString(dims));
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': for the model to support batching the shape should have at "
+              "least 1 dimension and the first dimension must be -1; but shape "
+              "expected by the model is " +
+              DimsListToString(model_shape));
+    }
+
+    DimsList full_dims;
+    full_dims.Add(-1);
+    for (int i = 0; i < dims.size(); ++i) {
+      full_dims.Add(dims[i]);
+    }
+
+    bool succ = (model_shape.size() == (size_t)full_dims.size());
+    if (succ) {
+      for (int i = 0; i < full_dims.size(); ++i) {
+        const int64_t model_dim = model_shape[i];
+        if (model_dim != -1) {
+          succ &= (model_dim == full_dims[i]);
+        }
+      }
+    }
+
+    if (!succ) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': the model expects " + std::to_string(model_shape.size()) +
+              " dimensions (shape " + DimsListToString(model_shape) +
+              ") but the model configuration specifies " +
+              std::to_string(full_dims.size()) +
+              " dimensions (an initial batch dimension because max_batch_size "
+              "> 0 followed by the explicit tensor shape, making complete "
+              "shape " +
+              DimsListToString(full_dims) + ")");
+    }
+  } else {
+    // ! supports_batching
+    bool succ = (model_shape.size() == (size_t)dims.size());
+    if (succ) {
+      for (int i = 0; i < dims.size(); ++i) {
+        const int64_t model_dim = model_shape[i];
+        if (model_dim != -1) {
+          succ &= (model_dim == dims[i]);
+        }
+      }
+    }
+
+    if (!succ) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "model '" + model_name + "', tensor '" + tensor_name +
+              "': the model expects " + std::to_string(model_shape.size()) +
+              " dimensions (shape " + DimsListToString(model_shape) +
+              ") but the model configuration specifies " +
+              std::to_string(dims.size()) + " dimensions (shape " +
+              DimsListToString(dims) + ")");
     }
   }
 

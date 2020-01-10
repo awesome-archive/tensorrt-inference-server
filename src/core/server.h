@@ -28,62 +28,97 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <atomic>
+#include <map>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <vector>
 
 #include "src/core/api.pb.h"
 #include "src/core/model_config.pb.h"
+#include "src/core/model_repository_manager.h"
 #include "src/core/provider.h"
-#include "src/core/request_status.pb.h"
 #include "src/core/server_status.h"
 #include "src/core/server_status.pb.h"
+#include "src/core/shared_memory_manager.h"
 #include "src/core/status.h"
 
 namespace nvidia { namespace inferenceserver {
 
+class InferenceBackend;
+
+enum ModelControlMode { MODE_NONE, MODE_POLL, MODE_EXPLICIT };
+
 // Inference server information.
 class InferenceServer {
  public:
-  class InferBackendHandle;
-
   // Construct an inference server.
   InferenceServer();
 
   // Initialize the server. Return true on success, false otherwise.
-  bool Init();
+  Status Init();
 
   // Stop the server.  Return true if all models are unloaded, false
   // if exit timeout occurs.
-  bool Stop();
+  Status Stop();
 
   // Check the model repository for changes and update server state
   // based on those changes.
   Status PollModelRepository();
 
-  // Run health check indicated by 'mode'
-  void HandleHealth(
-      RequestStatus* request_status, bool* health, const std::string& mode);
+  // Run health check
+  Status IsLive(bool* live);
+  Status IsReady(bool* ready);
 
-  // Run profile 'cmd' for profiling all the all GPU devices
-  void HandleProfile(RequestStatus* request_status, const std::string& cmd);
+  // Perform inference on the given input for specified model. Status
+  // is returned in the OnCompleteInfer callback.
+  void InferAsync(
+      const std::shared_ptr<InferenceBackend>& backend,
+      const std::shared_ptr<InferRequestProvider>& request_provider,
+      const std::shared_ptr<InferResponseProvider>& response_provider,
+      const std::shared_ptr<ModelInferStats>& infer_stats,
+      std::function<void(const Status&)> OnCompleteInfer);
 
-  // Perform inference on the given input for specified model and
-  // update RequestStatus object with the status of the inference.
-  void HandleInfer(
-      RequestStatus* request_status,
-      const std::shared_ptr<InferBackendHandle>& backend,
-      std::shared_ptr<InferRequestProvider> request_provider,
-      std::shared_ptr<InferResponseProvider> response_provider,
-      std::shared_ptr<ModelInferStats> infer_stats,
-      std::function<void()> OnCompleteInferRPC);
+  // Update the ServerStatus object with the status of the model. If
+  // 'model_name' is empty, update with the status of all models.
+  Status GetStatus(ServerStatus* server_status, const std::string& model_name);
 
-  // Update the RequestStatus object and ServerStatus object with the
-  // status of the model. If 'model_name' is empty, update with the
-  // status of all models.
-  void HandleStatus(
-      RequestStatus* request_status, ServerStatus* server_status,
-      const std::string& model_name);
+  // Update the ModelRepositoryIndex object with the index of the model
+  // repository.
+  Status GetModelRepositoryIndex(ModelRepositoryIndex* repository_index);
+
+  // Load the corresponding model. Reload the model if it has been loaded.
+  Status LoadModel(const std::string& model_name);
+
+  // Unload the corresponding model.
+  Status UnloadModel(const std::string& model_name);
+
+  // Register the corresponding system shared memory region. If already
+  // registered return an ALREADY_EXISTS error.
+  Status RegisterSharedMemory(
+      const std::string& name, const std::string& shm_key, const size_t offset,
+      const size_t byte_size);
+
+  // Register the corresponding CUDA shared memory region. If already
+  // registered return an ALREADY_EXISTS error.
+#ifdef TRTIS_ENABLE_GPU
+  Status RegisterCudaSharedMemory(
+      const std::string& name, const cudaIpcMemHandle_t* cuda_shm_handle,
+      const size_t byte_size, const int device_id);
+#endif  // TRTIS_ENABLE_GPU
+
+  // Unregister the corresponding shared memory region.
+  Status UnregisterSharedMemory(const std::string& name);
+
+  // Unregister all active shared memory regions.
+  Status UnregisterAllSharedMemory();
+
+  // Get the address at 'offset' within a shared memory region.
+  Status SharedMemoryAddress(
+      const std::string& name, size_t offset, size_t byte_size,
+      void** shm_mapped_addr);
+
+  // Get list of active shared memory regions.
+  Status GetSharedMemoryStatus(SharedMemoryStatus* shm_status);
 
   // Return the ready state for the server.
   ServerReadyState ReadyState() const { return ready_state_; }
@@ -96,25 +131,38 @@ class InferenceServer {
   void SetId(const std::string& id) { id_ = id; }
 
   // Get / set the model repository path
-  const std::string& ModelStorePath() const { return model_store_path_; }
-  void SetModelStorePath(const std::string& p) { model_store_path_ = p; }
+  const std::set<std::string>& ModelRepositoryPaths() const
+  {
+    return model_repository_paths_;
+  }
+
+  void SetModelRepositoryPaths(const std::set<std::string>& p)
+  {
+    model_repository_paths_ = p;
+  }
+
+  // Get / set model control mode.
+  ModelControlMode GetModelControlMode() const { return model_control_mode_; }
+  void SetModelControlMode(ModelControlMode m) { model_control_mode_ = m; }
+
+  // Get / set the startup models
+  const std::set<std::string>& StartupModels() const { return startup_models_; }
+  void SetStartupModels(const std::set<std::string>& m) { startup_models_ = m; }
 
   // Get / set strict model configuration enable.
   bool StrictModelConfigEnabled() const { return strict_model_config_; }
   void SetStrictModelConfigEnabled(bool e) { strict_model_config_ = e; }
 
+  // Get / set the pinned memory pool byte size.
+  int64_t PinnedMemoryPoolByteSize() const { return pinned_memory_pool_size_; }
+  void SetPinnedMemoryPoolByteSize(int64_t s)
+  {
+    pinned_memory_pool_size_ = std::max((int64_t)0, s);
+  }
+
   // Get / set strict readiness enable.
   bool StrictReadinessEnabled() const { return strict_readiness_; }
   void SetStrictReadinessEnabled(bool e) { strict_readiness_ = e; }
-
-  // Get / set profiling enable.
-  bool ProfilingEnabled() const { return profiling_enabled_; }
-  void SetProfilingEnabled(bool e) { profiling_enabled_ = e; }
-
-  // Get / set the rate of repository polling, in seconds. A value of
-  // 0 indicates no polling.
-  uint32_t RepositoryPollSeconds() const { return repository_poll_secs_; }
-  void SetRepositoryPollSeconds(uint32_t s) { repository_poll_secs_ = s; }
 
   // Get / set the server exit timeout, in seconds.
   int32_t ExitTimeoutSeconds() const { return exit_timeout_secs_; }
@@ -134,55 +182,57 @@ class InferenceServer {
   float TensorFlowGPUMemoryFraction() const { return tf_gpu_memory_fraction_; }
   void SetTensorFlowGPUMemoryFraction(float f) { tf_gpu_memory_fraction_ = f; }
 
+  // Get / set Tensorflow vGPU memory limits
+  const std::map<int, std::pair<int, uint64_t>>& TensorFlowVGPUMemoryLimits()
+      const
+  {
+    return tf_vgpu_memory_limits_;
+  }
+
+  void SetTensorFlowVGPUMemoryLimits(
+      const std::map<int, std::pair<int, uint64_t>>& memory_limits)
+  {
+    tf_vgpu_memory_limits_ = memory_limits;
+  }
+
   // Return the status manager for this server.
   std::shared_ptr<ServerStatusManager> StatusManager() const
   {
     return status_manager_;
   }
 
-  // Return the model repository manager for this server.
-  ModelRepositoryManager* ModelManager() const
+  // Return the requested InferenceBackend object.
+  Status GetInferenceBackend(
+      const std::string& model_name, const int64_t model_version,
+      std::shared_ptr<InferenceBackend>* backend)
   {
-    return model_repository_manager_.get();
+    return model_repository_manager_->GetInferenceBackend(
+        model_name, model_version, backend);
   }
-
-  // A handle to a backend.
-  class InferBackendHandle {
-   public:
-    static Status Create(
-        const InferenceServer* server, const std::string& model_name,
-        const int64_t model_version,
-        std::shared_ptr<InferBackendHandle>* handle);
-
-    virtual InferenceBackend* GetInferenceBackend() = 0;
-  };
 
  private:
   // Return the uptime of the server in nanoseconds.
   uint64_t UptimeNs() const;
 
-  // Return the next request ID for this server.
-  uint64_t NextRequestId() { return next_request_id_++; }
-
   std::string version_;
   std::string id_;
   uint64_t start_time_ns_;
 
-  std::string model_store_path_;
+  std::set<std::string> model_repository_paths_;
+  std::set<std::string> startup_models_;
+  ModelControlMode model_control_mode_;
   bool strict_model_config_;
   bool strict_readiness_;
-  bool profiling_enabled_;
-  uint32_t repository_poll_secs_;
   uint32_t exit_timeout_secs_;
+  uint64_t pinned_memory_pool_size_;
 
+  // Tensorflow options
   bool tf_soft_placement_enabled_;
   float tf_gpu_memory_fraction_;
+  std::map<int, std::pair<int, uint64_t>> tf_vgpu_memory_limits_;
 
   // Current state of the inference server.
   ServerReadyState ready_state_;
-
-  // Each request is assigned a unique id.
-  std::atomic<uint64_t> next_request_id_;
 
   // Number of in-flight requests. During shutdown we attempt to wait
   // for all in-flight requests to complete before exiting.
@@ -190,6 +240,7 @@ class InferenceServer {
 
   std::shared_ptr<ServerStatusManager> status_manager_;
   std::unique_ptr<ModelRepositoryManager> model_repository_manager_;
+  std::unique_ptr<SharedMemoryManager> shared_memory_manager_;
 };
 
 }}  // namespace nvidia::inferenceserver

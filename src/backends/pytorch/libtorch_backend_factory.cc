@@ -58,7 +58,8 @@ LibTorchBackendFactory::CreateBackend(
 {
   // Read all the *.pt files in 'path'.
   std::set<std::string> torch_files;
-  RETURN_IF_ERROR(GetDirectoryFiles(path, &torch_files));
+  RETURN_IF_ERROR(
+      GetDirectoryFiles(path, true /* skip_hidden_files */, &torch_files));
 
   std::unordered_map<std::string, std::string> torch_models;
   for (const auto& filename : torch_files) {
@@ -71,7 +72,8 @@ LibTorchBackendFactory::CreateBackend(
   // Create the backend for the model and all the execution contexts
   // requested for this model.
   std::unique_ptr<LibTorchBackend> local_backend(new LibTorchBackend);
-  RETURN_IF_ERROR(local_backend->Init(path, model_config));
+  RETURN_IF_ERROR(
+      local_backend->Init(path, model_config, kPyTorchLibTorchPlatform));
   RETURN_IF_ERROR(local_backend->CreateExecutionContexts(torch_models));
 
   *backend = std::move(local_backend);

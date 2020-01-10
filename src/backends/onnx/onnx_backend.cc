@@ -31,6 +31,7 @@
 #include "src/backends/onnx/loader.h"
 #include "src/backends/onnx/onnx_utils.h"
 #include "src/core/constants.h"
+#include "src/core/cuda_utils.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_cuda.h"
 #include "src/core/model_config_utils.h"
@@ -38,16 +39,21 @@
 #include "src/core/server_status.h"
 
 #ifdef TRTIS_ENABLE_GPU
-#include <core/providers/cuda/cuda_provider_factory.h>
+#include <cuda_provider_factory.h>
 #include <cuda_runtime_api.h>
+#include <tensorrt_provider_factory.h>
 #endif  // TRTIS_ENABLE_GPU
+
+#ifdef TRTIS_ENABLE_ONNXRUNTIME_OPENVINO
+#include <openvino_provider_factory.h>
+#endif  // TRTIS_ENABLE_ONNXRUNTIME_OPENVINO
 
 namespace nvidia { namespace inferenceserver {
 
 OnnxBackend::Context::Context(
     const std::string& name, const int gpu_device, const int max_batch_size)
-    : name_(name), gpu_device_(gpu_device), max_batch_size_(max_batch_size),
-      session_(nullptr), allocator_(nullptr)
+    : BackendContext(name, gpu_device, max_batch_size), session_(nullptr),
+      allocator_(nullptr)
 {
 }
 
@@ -59,18 +65,7 @@ OnnxBackend::Context::~Context()
   if (session_ != nullptr) {
     OnnxLoader::UnloadSession(session_);
   }
-  if (allocator_ != nullptr) {
-    OrtReleaseAllocator(allocator_);
-  }
-}
-
-Status
-OnnxBackend::Init(const std::string& path, const ModelConfig& config)
-{
-  RETURN_IF_ERROR(ValidateModelConfig(config, kOnnxRuntimeOnnxPlatform));
-  RETURN_IF_ERROR(SetModelConfig(path, config));
-
-  return Status::Success;
+  // 'allocator_' is default allocator which is managed by ONNX Runtime
 }
 
 Status
@@ -81,17 +76,16 @@ OnnxBackend::CreateExecutionContexts(
   // Create a "prototype" session option, which will be cloned and set
   // context-specific option on context creation.
   OrtSessionOptions* session_options;
-  RETURN_IF_ORT_ERROR(OrtCreateSessionOptions(&session_options));
+  RETURN_IF_ORT_ERROR(ort_api->CreateSessionOptions(&session_options));
 
   OrtResourceWrapper<OrtSessionOptions*> options_wrapper(
-      session_options, &OrtReleaseSessionOptions);
-  RETURN_IF_ORT_ERROR(OrtSetSessionThreadPoolSize(session_options, 1));
+      session_options, ort_api->ReleaseSessionOptions);
+  RETURN_IF_ORT_ERROR(ort_api->SetIntraOpNumThreads(session_options, 1));
   // disable graph optimization
-  RETURN_IF_ORT_ERROR(OrtSetSessionGraphOptimizationLevel(session_options, 0));
+  RETURN_IF_ORT_ERROR(ort_api->SetSessionGraphOptimizationLevel(
+      session_options, ORT_DISABLE_ALL));
 
-  Status status = CreateExecutionContextsHelper(session_options, models);
-
-  RETURN_IF_ERROR(status);
+  RETURN_IF_ERROR(CreateExecutionContextsHelper(session_options, models));
 
   LOG_VERBOSE(1) << "onnx backend for " << Name() << std::endl << *this;
 
@@ -194,42 +188,126 @@ OnnxBackend::CreateExecutionContext(
                                                    : Config().max_batch_size();
 
   contexts_.emplace_back(new Context(instance_name, gpu_device, mbs));
-  Context* context = contexts_.back().get();
+  Context* context = static_cast<Context*>(contexts_.back().get());
+
+  RETURN_IF_ERROR(context->CreateCudaStream());
 
   // Set Onnx session option with proper device
   OrtSessionOptions* session_options;
   RETURN_IF_ORT_ERROR(
-      OrtCloneSessionOptions(base_session_options, &session_options));
+      ort_api->CloneSessionOptions(base_session_options, &session_options));
 
   OrtResourceWrapper<OrtSessionOptions*> options_wrapper(
-      session_options, &OrtReleaseSessionOptions);
+      session_options, ort_api->ReleaseSessionOptions);
 
+  // Set execution execution_accelerators (execution providers in ONNX Runtime)
   if (gpu_device != Context::NO_GPU_DEVICE) {
 #ifdef TRTIS_ENABLE_GPU
+    if (Config().optimization().has_execution_accelerators()) {
+      // Don't need to ensure uniqueness of the providers,
+      // ONNX Runtime will check it.
+      for (const auto& execution_accelerator :
+           Config()
+               .optimization()
+               .execution_accelerators()
+               .gpu_execution_accelerator()) {
+        if (execution_accelerator.name() == kTensorRTExecutionAccelerator) {
+          RETURN_IF_ORT_ERROR(OrtSessionOptionsAppendExecutionProvider_Tensorrt(
+              session_options, gpu_device));
+          LOG_VERBOSE(1) << "TensorRT Execution Accelerator is set for "
+                         << instance_name << " on device " << gpu_device;
+        } else {
+          return Status(
+              RequestStatusCode::INVALID_ARG,
+              "unknown Execution Accelerator '" + execution_accelerator.name() +
+                  "' is requested");
+        }
+      }
+    }
     RETURN_IF_ORT_ERROR(OrtSessionOptionsAppendExecutionProvider_CUDA(
         session_options, gpu_device));
+    LOG_VERBOSE(1) << "CUDA Execution Accelerator is set for " << instance_name
+                   << " on device " << gpu_device;
 #else
     return Status(RequestStatusCode::INTERNAL, "GPU instances not supported");
 #endif  // TRTIS_ENABLE_GPU
   }
 
-  // Create Onnx session
+  bool need_lock = false;
+  if (Config().optimization().has_execution_accelerators()) {
+    for (const auto& execution_accelerator : Config()
+                                                 .optimization()
+                                                 .execution_accelerators()
+                                                 .cpu_execution_accelerator()) {
+      if (execution_accelerator.name() == kOpenVINOExecutionAccelerator) {
+#ifdef TRTIS_ENABLE_ONNXRUNTIME_OPENVINO
+        need_lock = true;
+        RETURN_IF_ORT_ERROR(OrtSessionOptionsAppendExecutionProvider_OpenVINO(
+            session_options, "CPU"));
+        LOG_VERBOSE(1) << "OpenVINO Execution Accelerator is set for "
+                       << instance_name << " on device CPU";
+#else
+        return Status(
+            RequestStatusCode::INVALID_ARG,
+            "OpenVINO Execution Accelerator is not enabled");
+#endif  // TRTIS_ENABLE_ONNXRUNTIME_OPENVINO
+      } else {
+        return Status(
+            RequestStatusCode::INVALID_ARG, "unknown Execution Accelerator '" +
+                                                execution_accelerator.name() +
+                                                "' is requested");
+      }
+    }
+  }
+
+  // ONNX session creation with OpenVINO is not thread-safe,
+  // so multiple creations are serialized with a global lock.
+  static std::mutex global_context_mu;
+  std::unique_lock<std::mutex> glock(global_context_mu, std::defer_lock);
+  if (need_lock) {
+    glock.lock();
+  }
+
   RETURN_IF_ERROR(OnnxLoader::LoadSession(
       op_itr->second, session_options, &context->session_));
-  RETURN_IF_ORT_ERROR(OrtCreateDefaultAllocator(&context->allocator_));
+  RETURN_IF_ORT_ERROR(
+      ort_api->GetAllocatorWithDefaultOptions(&context->allocator_));
+
+  size_t expected_input_cnt = (size_t)Config().input().size();
 
   // If this is a sequence model then make sure that the required
   // inputs are present in the model and have the correct shape and
   // datatype.
-  size_t expected_input_cnt = (size_t)Config().input().size();
   if (Config().has_sequence_batching()) {
-    RETURN_IF_ERROR(context->ValidateSequenceControl(
+    bool have_start, have_end, have_ready, have_corrid;
+    RETURN_IF_ERROR(context->ValidateBooleanSequenceControl(
         Config().name(), Config().sequence_batching(),
-        ModelSequenceBatching::Control::CONTROL_SEQUENCE_START));
-    RETURN_IF_ERROR(context->ValidateSequenceControl(
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_START,
+        false /* required */, &have_start));
+    RETURN_IF_ERROR(context->ValidateBooleanSequenceControl(
         Config().name(), Config().sequence_batching(),
-        ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY));
-    expected_input_cnt += 2;
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_END,
+        false /* required */, &have_end));
+    RETURN_IF_ERROR(context->ValidateBooleanSequenceControl(
+        Config().name(), Config().sequence_batching(),
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_READY,
+        false /* required */, &have_ready));
+    RETURN_IF_ERROR(context->ValidateTypedSequenceControl(
+        Config().name(), Config().sequence_batching(),
+        ModelSequenceBatching::Control::CONTROL_SEQUENCE_CORRID,
+        false /* required */, &have_corrid));
+    if (have_start) {
+      expected_input_cnt += 1;
+    }
+    if (have_end) {
+      expected_input_cnt += 1;
+    }
+    if (have_ready) {
+      expected_input_cnt += 1;
+    }
+    if (have_corrid) {
+      expected_input_cnt += 1;
+    }
   }
 
   RETURN_IF_ERROR(context->ValidateInputs(
@@ -240,51 +318,104 @@ OnnxBackend::CreateExecutionContext(
 }
 
 Status
-OnnxBackend::Context::ValidateSequenceControl(
+OnnxBackend::Context::ValidateBooleanSequenceControl(
     const std::string& model_name, const ModelSequenceBatching& batcher,
-    const ModelSequenceBatching::Control::Kind control_kind)
+    const ModelSequenceBatching::Control::Kind control_kind, bool required,
+    bool* have_control)
 {
   std::string tensor_name;
   DataType tensor_datatype;
-  RETURN_IF_ERROR(GetSequenceControlProperties(
-      batcher, model_name, control_kind, true /* required */, &tensor_name,
+  RETURN_IF_ERROR(GetBooleanSequenceControlProperties(
+      batcher, model_name, control_kind, required, &tensor_name,
       &tensor_datatype, nullptr, nullptr, nullptr, nullptr));
+  *have_control = !tensor_name.empty();
+  if (*have_control) {
+    OnnxTensorInfoMap input_tensor_infos;
+    RETURN_IF_ERROR(InputInfos(session_, allocator_, input_tensor_infos));
+    const auto& iit = input_tensor_infos.find(tensor_name);
+    if (iit == input_tensor_infos.end()) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "configuration specified sequence control '" + tensor_name +
+              "', but model does not provide that input");
+    }
 
-  OnnxTensorInfoMap input_tensor_infos;
-  RETURN_IF_ERROR(InputInfos(session_, allocator_, input_tensor_infos));
-  const auto& iit = input_tensor_infos.find(tensor_name);
-  if (iit == input_tensor_infos.end()) {
-    return Status(
-        RequestStatusCode::INTERNAL,
-        "configuration specified sequence control '" + tensor_name +
-            "', but model does not provide that input");
+    // Control tensors must have shape [1].
+    const int nonbatch_start_idx = (max_batch_size_ > 0) ? 1 : 0;
+    std::vector<int64_t> debatched_dims;
+    for (size_t i = nonbatch_start_idx; i < iit->second.dims_.size(); i++) {
+      debatched_dims.push_back(iit->second.dims_[i]);
+    }
+
+    if ((debatched_dims.size() != 1) || (debatched_dims[0] != 1)) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "unable to load model '" + model_name + "', sequence control '" +
+              tensor_name + "' in model has dims " +
+              DimsListToString(debatched_dims) + " but dims [1] is expected");
+    }
+
+    if (ConvertToOnnxDataType(tensor_datatype) != iit->second.type_) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "unable to load model '" + model_name + "', sequence control '" +
+              tensor_name + "', the model expects data-type " +
+              OnnxDataTypeName(iit->second.type_) +
+              " but the model configuration specifies data-type " +
+              DataType_Name(tensor_datatype));
+    }
   }
 
-  // Control tensors must have shape [1].
-  DimsList dims;
-  dims.Add(1);
+  return Status::Success;
+}
 
-  const int nonbatch_start_idx = (max_batch_size_ > 0) ? 1 : 0;
-  std::vector<int64_t> debatched_dims;
-  for (size_t i = nonbatch_start_idx; i < iit->second.dims_.size(); i++) {
-    debatched_dims.push_back(iit->second.dims_[i]);
-  }
+Status
+OnnxBackend::Context::ValidateTypedSequenceControl(
+    const std::string& model_name, const ModelSequenceBatching& batcher,
+    const ModelSequenceBatching::Control::Kind control_kind, bool required,
+    bool* have_control)
+{
+  std::string tensor_name;
+  DataType tensor_datatype;
+  RETURN_IF_ERROR(GetTypedSequenceControlProperties(
+      batcher, model_name, control_kind, required, &tensor_name,
+      &tensor_datatype));
+  *have_control = !tensor_name.empty();
+  if (*have_control) {
+    OnnxTensorInfoMap input_tensor_infos;
+    RETURN_IF_ERROR(InputInfos(session_, allocator_, input_tensor_infos));
+    const auto& iit = input_tensor_infos.find(tensor_name);
+    if (iit == input_tensor_infos.end()) {
+      return Status(
+          RequestStatusCode::INTERNAL,
+          "configuration specified sequence control '" + tensor_name +
+              "', but model does not provide that input");
+    }
 
-  if ((debatched_dims.size() != 1) || (debatched_dims[0] != 1)) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name + "', sequence control '" +
-            tensor_name + "' dims " + DimsListToString(debatched_dims) +
-            " don't match expected dims [1]");
-  }
+    // Control tensors must have shape [1].
+    const int nonbatch_start_idx = (max_batch_size_ > 0) ? 1 : 0;
+    std::vector<int64_t> debatched_dims;
+    for (size_t i = nonbatch_start_idx; i < iit->second.dims_.size(); i++) {
+      debatched_dims.push_back(iit->second.dims_[i]);
+    }
 
-  if (ConvertToOnnxDataType(tensor_datatype) != iit->second.type_) {
-    return Status(
-        RequestStatusCode::INVALID_ARG,
-        "unable to load model '" + model_name + "', sequence control '" +
-            tensor_name + "' datatype " + OnnxDataTypeName(iit->second.type_) +
-            " doesn't match required data-type " +
-            DataType_Name(tensor_datatype));
+    if ((debatched_dims.size() != 1) || (debatched_dims[0] != 1)) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "unable to load model '" + model_name + "', sequence control '" +
+              tensor_name + "' in model has dims " +
+              DimsListToString(debatched_dims) + " but dims [1] is expected");
+    }
+
+    if (ConvertToOnnxDataType(tensor_datatype) != iit->second.type_) {
+      return Status(
+          RequestStatusCode::INVALID_ARG,
+          "unable to load model '" + model_name + "', sequence control '" +
+              tensor_name + "', the model expects data-type " +
+              OnnxDataTypeName(iit->second.type_) +
+              " but the model configuration specifies data-type " +
+              DataType_Name(tensor_datatype));
+    }
   }
 
   return Status::Success;
@@ -385,43 +516,9 @@ OnnxBackend::Context::ValidateOutputs(
   return Status::Success;
 }
 
-void
-OnnxBackend::Run(
-    uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-    std::function<void(Status)> OnCompleteQueuedPayloads)
-{
-  // Each runner executes using the corresponding context...
-  if (runner_idx >= contexts_.size()) {
-    OnCompleteQueuedPayloads(Status(
-        RequestStatusCode::INTERNAL,
-        "unexpected runner index" + std::to_string(runner_idx) +
-            ", max allowed " + std::to_string(contexts_.size())));
-    return;
-  }
-
-  std::vector<ModelInferStats::ScopedTimer> compute_timers;
-  for (auto& payload : *payloads) {
-    // Stop queue timer when the payload is scheduled to run
-    if (payload.queue_timer_ != nullptr) {
-      payload.queue_timer_.reset();
-    }
-
-    if (payload.stats_ != nullptr) {
-      compute_timers.emplace_back();
-      payload.stats_->StartComputeTimer(&compute_timers.back());
-      payload.stats_->SetGPUDevice(contexts_[runner_idx]->gpu_device_);
-    }
-  }
-
-  Status status = contexts_[runner_idx]->Run(this, payloads);
-  // Release all run related resources regardless of the run status
-  contexts_[runner_idx]->ReleaseOrtRunResources();
-  OnCompleteQueuedPayloads(status);
-}
-
 Status
 OnnxBackend::Context::Run(
-    const OnnxBackend* base, std::vector<Scheduler::Payload>* payloads)
+    const InferenceBackend* base, std::vector<Scheduler::Payload>* payloads)
 {
   LOG_VERBOSE(1) << "Running " << name_ << " with " << payloads->size()
                  << " request payloads";
@@ -464,6 +561,14 @@ OnnxBackend::Context::Run(
             name_ + "', max allowed is " + std::to_string(max_batch_size_));
   }
 
+  // use Scoped wrapper to clean up Ort tensors when Run() returns
+  static auto io_tensor_deleter = [](Context* ctx) {
+    if (ctx != nullptr) {
+      ctx->ReleaseOrtRunResources();
+    }
+  };
+  OrtResourceWrapper<Context*> io_tensor_wrapper(this, io_tensor_deleter);
+
   // Hold reference to each buffer of input data so that it stays
   // until the inference has completed.
   std::vector<std::unique_ptr<char[]>> input_buffers;
@@ -485,17 +590,16 @@ OnnxBackend::Context::Run(
   }
 
   // Additional inputs added to the provider...
-  const std::shared_ptr<InferRequestProvider::InputOverrideMap>&
-      input_override_map = input_request_provider->GetInputOverride();
-  if (input_override_map != nullptr) {
-    for (const auto& pr : *input_override_map) {
+  const InferRequestProvider::InputOverrideMapVec& input_override_maps =
+      input_request_provider->GetInputOverrides();
+  for (const auto& ovr_map : input_override_maps) {
+    for (const auto& pr : *ovr_map) {
       const std::string& name = pr.first;
-      const std::shared_ptr<InferRequestProvider::InputOverride>& override =
-          pr.second;
+      const InferRequestProvider::InputOverride& override = pr.second;
 
       RETURN_IF_ERROR(SetInputTensor(
-          name, override->datatype_, override->dims_, total_batch_size,
-          payloads, &input_buffers, &input_names));
+          name, override.datatype_, override.dims_, total_batch_size, payloads,
+          &input_buffers, &input_names));
     }
   }
 
@@ -507,11 +611,29 @@ OnnxBackend::Context::Run(
     output_tensors_.emplace_back(nullptr);
   }
 
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeInputEnd);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
+
   // Run...
-  RETURN_IF_ORT_ERROR(OrtRun(
+  RETURN_IF_ORT_ERROR(ort_api->Run(
       session_, NULL /* run options */, input_names.data(),
       (const OrtValue* const*)input_tensors_.data(), input_tensors_.size(),
       output_names.data(), output_names.size(), output_tensors_.data()));
+
+#ifdef TRTIS_ENABLE_STATS
+  for (auto& payload : *payloads) {
+    if (payload.stats_ != nullptr) {
+      payload.stats_->CaptureTimestamp(
+          ModelInferStats::TimestampKind::kComputeOutputStart);
+    }
+  }
+#endif  // TRTIS_ENABLE_STATS
 
   // Make sure each output is of the expected size and copy it into
   // the payload responses.
@@ -577,12 +699,13 @@ OnnxBackend::Context::SetInputTensor(
   char* buffer = input_buffers->back().get();
 
   // Store data into input buffer
-  SetInputBuffer(name, expected_byte_sizes, payloads, buffer);
+  SetInputBuffer(
+      name, expected_byte_sizes, payloads, TRTSERVER_MEMORY_CPU, 0, buffer);
 
   if (data_type != TYPE_STRING) {
-    const OrtAllocatorInfo* allocator_info;
-    RETURN_IF_ORT_ERROR(OrtAllocatorGetInfo(allocator_, &allocator_info));
-    RETURN_IF_ORT_ERROR(OrtCreateTensorWithDataAsOrtValue(
+    const OrtMemoryInfo* allocator_info;
+    RETURN_IF_ORT_ERROR(ort_api->AllocatorGetInfo(allocator_, &allocator_info));
+    RETURN_IF_ORT_ERROR(ort_api->CreateTensorWithDataAsOrtValue(
         allocator_info, (void*)input_buffers->back().get(), total_byte_size,
         input_dims.data(), input_dims.size(), ConvertToOnnxDataType(data_type),
         &input_tensors_.back()));
@@ -596,69 +719,14 @@ OnnxBackend::Context::SetInputTensor(
     // Make sure to make the last string data valid C string
     buffer[total_byte_size] = 0;
 
-    RETURN_IF_ORT_ERROR(OrtCreateTensorAsOrtValue(
+    RETURN_IF_ORT_ERROR(ort_api->CreateTensorAsOrtValue(
         allocator_, input_dims.data(), input_dims.size(),
         ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING, &input_tensors_.back()));
-    RETURN_IF_ORT_ERROR(OrtFillStringTensor(
+    RETURN_IF_ORT_ERROR(ort_api->FillStringTensor(
         input_tensors_.back(), string_data.data(), string_data.size()));
   }
 
   return Status::Success;
-}
-
-void
-OnnxBackend::Context::SetInputBuffer(
-    const std::string& name, const std::vector<size_t>& expected_byte_sizes,
-    std::vector<Scheduler::Payload>* payloads, char* input_buffer)
-{
-  // Visit the payloads in order and copy the input tensors to
-  // 'buffer'.
-  size_t buffer_copy_offset = 0;
-  for (size_t idx = 0; idx < expected_byte_sizes.size(); idx++) {
-    auto& payload = (*payloads)[idx];
-    const size_t expected_byte_size = expected_byte_sizes[idx];
-
-    size_t copied_byte_size = 0;
-    while (payload.status_.IsOk()) {
-      const void* content;
-      size_t content_byte_size = expected_byte_size - copied_byte_size;
-      payload.status_ = payload.request_provider_->GetNextInputContent(
-          name, &content, &content_byte_size, false);
-      if (!payload.status_.IsOk()) {
-        break;
-      }
-
-      // No more input content available then done with copying...
-      if (content == nullptr) {
-        break;
-      }
-
-      if ((copied_byte_size + content_byte_size) > expected_byte_size) {
-        payload.status_ = Status(
-            RequestStatusCode::INVALID_ARG,
-            "unexpected size " +
-                std::to_string(copied_byte_size + content_byte_size) +
-                " for inference input '" + name + "', expecting " +
-                std::to_string(expected_byte_size));
-        break;
-      }
-
-      memcpy(
-          input_buffer + buffer_copy_offset + copied_byte_size, content,
-          content_byte_size);
-      copied_byte_size += content_byte_size;
-    }
-
-    if (payload.status_.IsOk() && (copied_byte_size != expected_byte_size)) {
-      payload.status_ = Status(
-          RequestStatusCode::INTERNAL,
-          "expected " + std::to_string(expected_byte_size) +
-              " bytes of data for inference input '" + name + "', got " +
-              std::to_string(copied_byte_size));
-    }
-
-    buffer_copy_offset += expected_byte_size;
-  }
 }
 
 void
@@ -732,10 +800,11 @@ OnnxBackend::Context::FillStringData(
 
 Status
 OnnxBackend::Context::ReadOutputTensors(
-    const OnnxBackend* base, size_t total_batch_size,
+    const InferenceBackend* base, size_t total_batch_size,
     const std::vector<const char*>& output_names,
     std::vector<Scheduler::Payload>* payloads)
 {
+  bool cuda_copy = false;
   for (size_t idx = 0; idx < output_names.size(); idx++) {
     std::string name = std::string(output_names[idx]);
 
@@ -751,40 +820,41 @@ OnnxBackend::Context::ReadOutputTensors(
 
     // Get output type and shape
     OrtTypeInfo* typeinfo;
-    RETURN_IF_ORT_ERROR(OrtGetTypeInfo(output_tensor, &typeinfo));
+    RETURN_IF_ORT_ERROR(ort_api->GetTypeInfo(output_tensor, &typeinfo));
     OrtResourceWrapper<OrtTypeInfo*> typeinfo_wrapper(
-        typeinfo, &OrtReleaseTypeInfo);
+        typeinfo, ort_api->ReleaseTypeInfo);
 
     const OrtTensorTypeAndShapeInfo* type_and_shape;
-    RETURN_IF_ORT_ERROR(OrtCastTypeInfoToTensorInfo(typeinfo, &type_and_shape));
+    RETURN_IF_ORT_ERROR(
+        ort_api->CastTypeInfoToTensorInfo(typeinfo, &type_and_shape));
 
     std::vector<int64_t> content_shape;
 
     size_t num_dims;
-    RETURN_IF_ORT_ERROR(OrtGetDimensionsCount(type_and_shape, &num_dims));
+    RETURN_IF_ORT_ERROR(ort_api->GetDimensionsCount(type_and_shape, &num_dims));
 
     content_shape.resize(num_dims);
-    RETURN_IF_ORT_ERROR(OrtGetDimensions(
+    RETURN_IF_ORT_ERROR(ort_api->GetDimensions(
         type_and_shape, content_shape.data(), content_shape.size()));
     const size_t element_count = GetElementCount(content_shape);
 
     ONNXTensorElementDataType type;
-    RETURN_IF_ORT_ERROR(OrtGetTensorElementType(type_and_shape, &type));
+    RETURN_IF_ORT_ERROR(ort_api->GetTensorElementType(type_and_shape, &type));
 
     if (type == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
       const size_t batch1_element_cnt = element_count / total_batch_size;
       size_t total_length = 0;
       RETURN_IF_ORT_ERROR(
-          OrtGetStringTensorDataLength(output_tensor, &total_length));
+          ort_api->GetStringTensorDataLength(output_tensor, &total_length));
 
       char content[total_length];
       size_t offsets[element_count + 1];
-      RETURN_IF_ORT_ERROR(OrtGetStringTensorContent(
+      RETURN_IF_ORT_ERROR(ort_api->GetStringTensorContent(
           output_tensor, content, total_length, offsets, element_count));
       // Mark "passed end byte offset"
       offsets[element_count] = total_length;
 
-      SetStringOutputBuffer(
+      cuda_copy |= SetStringOutputBuffer(
           name, batch1_element_cnt, content, content_shape, offsets, payloads);
     } else {
       // Fixed size data type...
@@ -804,54 +874,35 @@ OnnxBackend::Context::ReadOutputTensors(
 
       char* content = nullptr;
       RETURN_IF_ORT_ERROR(
-          OrtGetTensorMutableData(output_tensor, (void**)&content));
+          ort_api->GetTensorMutableData(output_tensor, (void**)&content));
 
-      SetFixedSizeOutputBuffer(
-          name, batch1_byte_size, content, content_shape, payloads);
+      // [TODO] currently ONNX output data are always on CPU
+      // https://github.com/microsoft/onnxruntime/issues/1621
+      auto content_memory_type = TRTSERVER_MEMORY_CPU;
+      int64_t memory_type_id = 0;
+      cuda_copy |= SetFixedSizeOutputBuffer(
+          name, batch1_byte_size, content, content_shape, content_memory_type,
+          memory_type_id, payloads);
     }
   }
+
+#ifdef TRTIS_ENABLE_GPU
+  if (cuda_copy) {
+    cudaStreamSynchronize(stream_);
+  }
+#endif  // TRTIS_ENABLE_GPU
+
   return Status::Success;
 }
 
-void
-OnnxBackend::Context::SetFixedSizeOutputBuffer(
-    const std::string& name, const size_t batch1_byte_size, const char* content,
-    const std::vector<int64_t>& content_shape,
-    std::vector<Scheduler::Payload>* payloads)
-{
-  size_t content_offset = 0;
-  for (auto& payload : *payloads) {
-    const InferRequestHeader& request_header =
-        payload.request_provider_->RequestHeader();
-    const size_t expected_byte_size =
-        request_header.batch_size() * batch1_byte_size;
-
-    // If 'payload' requested this output then copy it from
-    // 'content'. If it did not request this output then just
-    // skip it in the 'content'.
-    if ((payload.response_provider_ != nullptr) &&
-        payload.response_provider_->RequiresOutput(name)) {
-      void* buffer;
-      Status status = payload.response_provider_->AllocateOutputBuffer(
-          name, &buffer, expected_byte_size, content_shape);
-      if (status.IsOk()) {
-        memcpy(buffer, content + content_offset, expected_byte_size);
-      } else {
-        payload.status_ = status;
-      }
-    }
-
-    content_offset += expected_byte_size;
-  }
-}
-
-void
+bool
 OnnxBackend::Context::SetStringOutputBuffer(
     const std::string& name, const size_t batch1_element_cnt,
     const char* content, const std::vector<int64_t>& content_shape,
     const size_t* offsets, std::vector<Scheduler::Payload>* payloads)
 {
   size_t element_idx = 0;
+  bool cuda_copy = false;
   for (auto& payload : *payloads) {
     const InferRequestHeader& request_header =
         payload.request_provider_->RequestHeader();
@@ -870,21 +921,40 @@ OnnxBackend::Context::SetStringOutputBuffer(
           data_byte_size + sizeof(uint32_t) * expected_element_cnt;
 
       void* buffer;
+      TRTSERVER_Memory_Type preferred_memory_type = TRTSERVER_MEMORY_CPU;
+      TRTSERVER_Memory_Type actual_memory_type;
+      int64_t actual_memory_type_id;
       Status status = payload.response_provider_->AllocateOutputBuffer(
-          name, &buffer, expected_byte_size, content_shape);
+          name, &buffer, expected_byte_size, content_shape,
+          preferred_memory_type, 0 /* preferred_memory_type_id */,
+          &actual_memory_type, &actual_memory_type_id);
       if (status.IsOk()) {
+        bool cuda_used = false;
         size_t copied_byte_size = 0;
         for (size_t e = 0; e < expected_element_cnt; ++e) {
           const uint32_t len =
               offsets[element_idx + e + 1] - offsets[element_idx + e];
-          memcpy(
-              static_cast<char*>(buffer) + copied_byte_size,
-              static_cast<const void*>(&len), sizeof(uint32_t));
+          // Prepend size of the string
+          payload.status_ = CopyBuffer(
+              name, TRTSERVER_MEMORY_CPU /* src_memory_type */,
+              0 /* src_memory_type_id */, actual_memory_type,
+              actual_memory_type_id, sizeof(uint32_t),
+              static_cast<const void*>(&len),
+              static_cast<char*>(buffer) + copied_byte_size, stream_,
+              &cuda_used);
+
+          cuda_copy |= cuda_used;
           copied_byte_size += sizeof(uint32_t);
 
-          memcpy(
-              static_cast<char*>(buffer) + copied_byte_size,
-              content + offsets[element_idx + e], len);
+          // Copy raw string content
+          payload.status_ = CopyBuffer(
+              name, TRTSERVER_MEMORY_CPU /* src_memory_type */,
+              0 /* src_memory_type_id */, actual_memory_type,
+              actual_memory_type_id, len, content + offsets[element_idx + e],
+              static_cast<char*>(buffer) + copied_byte_size, stream_,
+              &cuda_used);
+
+          cuda_copy |= cuda_used;
           copied_byte_size += len;
         }
       } else {
@@ -894,6 +964,8 @@ OnnxBackend::Context::SetStringOutputBuffer(
 
     element_idx += expected_element_cnt;
   }
+
+  return cuda_copy;
 }
 
 void
@@ -902,7 +974,7 @@ OnnxBackend::Context::ReleaseOrtRunResources()
   // Release input tensor if set
   for (auto& tensor : input_tensors_) {
     if (tensor != nullptr) {
-      OrtReleaseValue(tensor);
+      ort_api->ReleaseValue(tensor);
     }
   }
   input_tensors_.clear();
@@ -910,7 +982,7 @@ OnnxBackend::Context::ReleaseOrtRunResources()
   // Release output tensor if set
   for (auto& tensor : output_tensors_) {
     if (tensor != nullptr) {
-      OrtReleaseValue(tensor);
+      ort_api->ReleaseValue(tensor);
     }
   }
   output_tensors_.clear();

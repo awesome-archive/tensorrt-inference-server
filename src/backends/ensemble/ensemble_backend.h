@@ -32,21 +32,23 @@
 
 namespace nvidia { namespace inferenceserver {
 
+class InferenceServer;
+
 class EnsembleBackend : public InferenceBackend {
  public:
   EnsembleBackend() = default;
   EnsembleBackend(EnsembleBackend&&) = default;
 
-  Status Init(const std::string& path, const ModelConfig& config);
-
-  Status SetInferenceServer(void* inference_server) override;
+  Status Init(
+      InferenceServer* const server, const std::string& path,
+      const ModelConfig& config);
 
  private:
-  // Run model on the context associated with 'runner_idx' to
-  // execute for one or more requests.
+  // Override InferenceBackend::Run() to return proper error if
+  // Run() is called for ensemble model.
   void Run(
       uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
-      std::function<void(Status)> OnCompleteQueuedPayloads);
+      std::function<void(Status)> OnCompleteQueuedPayloads) override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(EnsembleBackend);

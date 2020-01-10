@@ -25,8 +25,11 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include "src/core/api.pb.h"
+#include "src/core/backend_context.h"
 #include "src/core/label_provider.h"
 #include "src/core/model_config.pb.h"
+#include "src/core/provider.h"
 #include "src/core/scheduler.h"
 #include "src/core/status.h"
 
@@ -43,9 +46,6 @@ class InferenceBackend {
  public:
   InferenceBackend() = default;
   virtual ~InferenceBackend() {}
-
-  // Set reference to the inference server.
-  virtual Status SetInferenceServer(void* inference_server);
 
   // Get the name of model being served.
   const std::string& Name() const { return config_.name(); }
@@ -74,16 +74,26 @@ class InferenceBackend {
     return label_provider_;
   }
 
+  Status Init(
+      const std::string& path, const ModelConfig& config,
+      const std::string& platform);
+
   // Run inference using the provided request to produce outputs in the provide
   // response. The inference will run asynchronously and "OnCompleteHandleInfer"
   // callback will be called once the inference is completed
   void Run(
-      std::shared_ptr<ModelInferStats> stats,
-      std::shared_ptr<InferRequestProvider> request_provider,
-      std::shared_ptr<InferResponseProvider> response_provider,
-      std::function<void(Status)> OnCompleteHandleInfer);
+      const std::shared_ptr<ModelInferStats>& stats,
+      const std::shared_ptr<InferRequestProvider>& request_provider,
+      const std::shared_ptr<InferResponseProvider>& response_provider,
+      std::function<void(const Status&)> OnCompleteHandleInfer);
 
  protected:
+  // Run model on the context associated with 'runner_idx' to
+  // execute for one or more requests.
+  virtual void Run(
+      uint32_t runner_idx, std::vector<Scheduler::Payload>* payloads,
+      std::function<void(Status)> OnCompleteQueuedPayloads);
+
   // Set the configuration of the model being served.
   Status SetModelConfig(const std::string& path, const ModelConfig& config);
 
@@ -100,7 +110,30 @@ class InferenceBackend {
   // Get the raw pointer to the scheduler of this backend.
   Scheduler* BackendScheduler() { return scheduler_.get(); }
 
+  std::vector<std::unique_ptr<BackendContext>> contexts_;
+
  private:
+  struct WarmupData {
+    WarmupData(const std::string& sample_name, size_t batch_size)
+        : sample_name_(sample_name), batch_size_(batch_size)
+    {
+    }
+
+    std::string sample_name_;
+    size_t batch_size_;
+    InferRequestHeader request_header_;
+    std::unordered_map<std::string, std::shared_ptr<Memory>> input_buffer_;
+    std::shared_ptr<InferRequestProvider::InputOverrideMap> input_override_;
+
+    // Placeholder for input data
+    std::unique_ptr<AllocatedSystemMemory> zero_data_;
+    std::unique_ptr<AllocatedSystemMemory> random_data_;
+    std::vector<std::string> provided_data_;
+  };
+
+  // Generate warmup data
+  Status GenerateWarmupData(std::vector<WarmupData>* samples);
+
   // Configuration of the model that this backend represents.
   ModelConfig config_;
 
@@ -121,6 +154,9 @@ class InferenceBackend {
 
   // Map from output name to the model configuration for that output.
   std::unordered_map<std::string, ModelOutput> output_map_;
+
+  // Path to model
+  std::string model_dir_;
 };
 
 }}  // namespace nvidia::inferenceserver
